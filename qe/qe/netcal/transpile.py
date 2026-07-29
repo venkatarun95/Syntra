@@ -1,36 +1,21 @@
 import os
 import subprocess
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Tuple, Type
 
 import z3  # type: ignore
 import numpy as np
-from qe.environment.cbr_delay_nc import CBRDelayNC
-from qe.environment.cbr_delay import CBRDelay
-from dataclasses import dataclass
 
+from qe.environment import Ideal
+from qe.netcal.common import OUTPUT_DIR as DEFAULT_INPUT_DIR
+from qe.netcal.common import OUTPUT_PATH as DEFAULT_OUTPUT_PATH
+from qe.netcal.common import (
+    QEQuery,
+    get_function_name,
+    get_output_filename,
+    get_string_list,
+)
+from qe.netcal.query_config import get_query_config
 from qe.util import get_name_for_list, get_names, try_except_wrapper
-
-
-# NetworkModel = CBRDelayNC
-NetworkModel = CBRDelay
-
-
-# Common utils between transpile and qe output
-THIS_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(os.path.dirname(THIS_SCRIPT_DIR))
-OUTPUT_DIR = os.path.join(REPO_ROOT, "outputs/qe/cbrdelay_l0_t6/")
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, "lib.rs")
-
-
-def get_string_list(eliminate: List[z3.ExprRef] = []):
-    return [str(e) for e in eliminate]
-
-
-def get_output_filename(T: int, eliminate: List[str], lhs: str, ideal: bool, prior_l_obs: int):
-    lhs_tag = f",lhs={lhs}"
-    ideal_tag = ",ideal" if ideal else ""
-    prior_l_obs_tag = f",pl={prior_l_obs}" if prior_l_obs >= 0 else ""
-    return f'T={T},eliminate=[{",".join(eliminate)}{lhs_tag}{ideal_tag}]{prior_l_obs_tag}.smt2'
 
 
 # Transpile only utils
@@ -340,7 +325,7 @@ rename_dict = {
 }
 
 
-def rename_vars(c: NetworkModel.Config, v: NetworkModel.Variables, cnf: z3.BoolRef):
+def rename_vars(c: Ideal.Config, v: Ideal.Variables, cnf: z3.BoolRef):
     # Convert all vector variable names
     substitutions = []
     for _, val in v.__dict__.items():
@@ -378,7 +363,7 @@ def update_fn_ptr_dict(fn_tag: str, T: int, n_losses_observed: int, newly_obs_l:
     fn_ptr_dict[fn_tag][(T, n_losses_observed)] = fn_name
 
 
-def transpile_fn_ptr_dict() -> List[str]:
+def transpile_fn_ptr_dict(output_path: str) -> List[str]:
     """
     lazy_static! {
     pub static ref COMPUTE_C: HashMap<(i32, i32), QeFun> = HashMap::from([
@@ -410,32 +395,26 @@ def transpile_fn_ptr_dict() -> List[str]:
     ret.append("}\n")
     out_str = "\n".join(ret)
 
-    with open(OUTPUT_PATH, "a") as f:
+    with open(output_path, "a") as f:
         f.write(out_str)
 
     return ret
 
 
-def get_function_name(lhs: str, T: int, n_losses_observed: int, sim: bool, ideal: bool, newly_obs_l: int) -> (str, str):
-    sim_tag = "sim_" if sim else ""
-    ideal_tag = "ideal_" if ideal else ""
-    fn_prefix = f"compute_{sim_tag}{ideal_tag}{lhs.lower()}"
-    newly_obs_l_tag = f"_nl_{newly_obs_l}" if newly_obs_l >= 0 else ""
-    return fn_prefix, f"{fn_prefix}_t_{T}_l_{n_losses_observed}{newly_obs_l_tag}"
-
-
 # @try_except_wrapper
 def transpile(
+    network_model: Type[Ideal],
+    input_dir: str, output_path: str,
     T: int, lhs: str, eliminate: List[str], n_losses_observed: int,
     sim: bool, ideal: bool,
     newly_obs_l: int
 ) -> Optional[str]:
     # The interface of this function needs to be Send + Sync. As this may be
     # called in a new thread.
-    c = NetworkModel.Config(T=T)
-    v = NetworkModel.Variables("", c)
+    c = network_model.Config(T=T)
+    v = network_model(name="", c=c).v
     fname = get_output_filename(T, eliminate, lhs, ideal, -2 if newly_obs_l == -2 else n_losses_observed)
-    fpath = os.path.join(OUTPUT_DIR, fname)
+    fpath = os.path.join(input_dir, fname)
 
     if not os.path.exists(fpath):
         print("Skipping as file not found: ", T, eliminate, fpath)
@@ -514,27 +493,21 @@ def transpile(
     out_str = "\n".join([x for x in ret_str_list if x is not None])
     # print(out_str)
 
-    with open(OUTPUT_PATH, "a") as f:
+    with open(output_path, "a") as f:
         f.write(out_str)
 
     return out_str
 
 
-@dataclass
-class QEQuery:
-    lhs: str
-    eliminate: List[z3.ExprRef]
-    n_losses_observed: int
-    last_observed_s: int
-    sim: bool = False
-    ideal: bool = False
-    newly_obs_s: int = -1  # -1 means unspecified.
-    newly_obs_l: int = -2  # -2 means unspecified, -1 means specified and no new losses.
-
-
 @try_except_wrapper
-def transpile_all(T: int, queries: List[QEQuery]):
-    with open(OUTPUT_PATH, "w") as f:
+def transpile_all(
+    network_model: Type[Ideal],
+    input_dir: str,
+    output_path: str,
+    T: int,
+    queries: List[QEQuery],
+):
+    with open(output_path, "w") as f:
         f.write("""
 // Computer generated. Do not edit by hand.
 #![allow(clippy::all)]
@@ -585,16 +558,17 @@ pub type QeFunSim = fn(
         lhs = qe_query.lhs
         eliminate = qe_query.eliminate
         n_losses_observed = qe_query.n_losses_observed
-        ret = transpile(T, lhs, get_string_list(eliminate), n_losses_observed, qe_query.sim, qe_query.ideal, qe_query.newly_obs_l)
+        ret = transpile(network_model, input_dir, output_path, T, lhs, get_string_list(eliminate), n_losses_observed, qe_query.sim, qe_query.ideal, qe_query.newly_obs_l)
         # print(ret)
         # import ipdb; ipdb.set_trace()
 
-    transpile_fn_ptr_dict()
-    subprocess.run(["rustfmt", f"{OUTPUT_PATH}"])
+    transpile_fn_ptr_dict(output_path)
+    subprocess.run(["rustfmt", f"{output_path}"])
 
 
 # Tests
 if __name__ == "__main__":
-    c = NetworkModel.Config(T=5)
-    v = NetworkModel.Variables("", c)
+    network_model = get_query_config("cbrdelay").network_model
+    c = network_model.Config(T=5)
+    v = network_model(name="", c=c).v
     print(transpile_ineq_interval(v.L[2], z3.Not(v.A[2] - v.L[2] <= v.S[3])))

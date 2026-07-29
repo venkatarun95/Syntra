@@ -1,96 +1,86 @@
-import z3
-from qe.environment import Ideal, CBRDelay
-from qe.util import flatten, get_raw_value
+import argparse
+
+from qe.netcal import qe_queries, transpile
+from qe.netcal.common import OUTPUT_DIR as DEFAULT_OUTPUT_DIR
+from qe.netcal.common import OUTPUT_PATH as DEFAULT_OUTPUT_PATH
+from qe.netcal.query_config import QUERY_CONFIGS, get_query_config
 
 
-# l = CBRDelay()
-# c = l.Config()
-# v = l.Variables('', c)
-# constrs = l.Constraints()
-# cl = constrs.all_constraints(c, v)
+class Main:
+    """
+    Entry point for the QE pipeline. Owns the query list for a given
+    T/config and dispatches to the solve stage (qe_queries), the codegen
+    stage (transpile), or both, depending on --mode.
+    """
 
-T = 3
-c = CBRDelay.Config(T=T)
+    def __init__(
+        self,
+        T: int,
+        queue_tol_bdp: int,
+        mode: str,
+        config_name: str,
+        output_dir: str,
+        input_dir: str,
+        output_path: str,
+    ):
+        self.T = T
+        self.queue_tol_bdp = queue_tol_bdp
+        self.mode = mode
+        # Where the solve stage writes solved SMT2 files.
+        self.output_dir = output_dir
+        # Where the transpile stage reads solved SMT2 files from.
+        self.input_dir = input_dir
+        # Where the transpile stage writes the generated Rust file.
+        self.output_path = output_path
+        self.config = get_query_config(config_name)
+        self.queries = self.config.generate_queries(T, queue_tol_bdp)
+        print("Total queries: ", len(self.queries))
 
-v1 = CBRDelay.Variables('x', c)
-cl1 = CBRDelay.Constraints().all_constraints(c, v1)
+    def solve(self):
+        qe_queries.solve_queries(self.config.network_model, self.output_dir, self.T, self.queries)
 
-v2 = CBRDelay.Variables('y', c)
-cl2 = CBRDelay.Constraints().all_constraints(c, v2)
+    def transpile(self):
+        transpile.transpile_all(self.config.network_model, self.input_dir, self.output_path, self.T, self.queries)
 
-v3 = CBRDelay.Variables('z', c)
-cl3 = CBRDelay.Constraints().all_constraints(c, v3)
+    def run(self):
+        if self.mode in ("solve", "all"):
+            self.solve()
+        if self.mode in ("transpile", "all"):
+            self.transpile()
 
-cl = cl1 + cl2
 
-for t in range(c.T):
-    cl.append(v1.A[t] == v2.A[t])
-    cl.append(v2.A[t] == v3.A[t])
-    cl.append(v1.S[t] == v2.S[t])
-    cl.append(v2.S[t] == v3.S[t])
-    # cl.append(v1.L[t] == v2.L[t])
-    # cl.append(v2.L[t] == v3.L[t])
-    cl.append(v1.Ld[t] == v2.Ld[t])
-    cl.append(v2.Ld[t] == v3.Ld[t])
+def get_args():
+    parser = argparse.ArgumentParser(description="QE pipeline: solve queries and/or transpile results to Rust")
+    parser.add_argument("-t", "--tsteps", action="store", type=int, default=5)
+    parser.add_argument("--queue-tol-bdp", action="store", type=int, default=3)
+    parser.add_argument(
+        "--mode", choices=["solve", "transpile", "all"], default="all",
+        help="solve: run the parallel QE queries only. "
+             "transpile: read already-solved results and generate Rust only. "
+             "all: solve then transpile (default).",
+    )
+    parser.add_argument(
+        "--config", choices=list(QUERY_CONFIGS), default="cbrdelay",
+        help="Which network model + query generation strategy to use.",
+    )
+    parser.add_argument(
+        "--output-dir", action="store", type=str, default=DEFAULT_OUTPUT_DIR,
+        help="Where the solve stage writes solved SMT2 query results.",
+    )
+    parser.add_argument(
+        "--input-dir", action="store", type=str, default=DEFAULT_OUTPUT_DIR,
+        help="Where the transpile stage reads solved SMT2 query results from.",
+    )
+    parser.add_argument(
+        "--output-path", action="store", type=str, default=DEFAULT_OUTPUT_PATH,
+        help="Where the transpile stage writes the generated Rust file.",
+    )
+    return parser.parse_args()
 
-cl.append(v1.a == v2.a)
-cl.append(v2.a == v3.a)
-cl.append(v3.C == (v1.C + v2.C)/2)
-cl.append(v3.B == (v1.B + v2.B)/2)
-cl.append(v3.C == 100)
-cl.append(v1.C == 50)
-cl.append(v1.B == 150)
-cl.append(v3.B == 250)
 
-# cl.append(v3.C == v1.C)
-# cl.append(v3.B == v1.B)
-
-# Is there trace1 and trace2 such that no mid point network that can produce
-# same observations as t1 and t2.
-cl.append(z3.Not(z3.Exists(flatten([v3.I, v3.L]), z3.And(cl3))))
-
-s = z3.Solver()
-s.add(cl)
-ret = s.check()
-print(ret)
-print("")
-if (str(ret) == "sat"):
-    m = s.model()
-    print(CBRDelay.get_str(c, v1, m))
-    print("")
-    print(CBRDelay.get_str(c, v2, m))
-    print("")
-    print(CBRDelay.get_str(c, v3, m))
-
-    # Compute belief set
-    vb = CBRDelay.Variables('', c)
-    clb = CBRDelay.Constraints().all_constraints(c, vb)
-    for t in range(c.T):
-        clb.append(vb.A[t] == get_raw_value(m.eval(v1.A[t])))
-        clb.append(vb.S[t] == get_raw_value(m.eval(v1.S[t])))
-        # clb.append(vb.L[t] == get_raw_value(m.eval(v1.L[t])))
-        clb.append(vb.Ld[t] == get_raw_value(m.eval(v1.Ld[t])))
-
-    g = z3.Goal()
-    # We need separate loss detection to be able to compute upper bounds.
-    # g.add(z3.Exists(flatten([vb.I, vb.Ld, vb.L]), z3.And(clb)))
-    g.add(z3.Exists(flatten([vb.I, vb.L]), z3.And(clb)))
-    tl = [z3.Tactic('qe2'),
-          z3.Tactic('solve-eqs'),
-          z3.Tactic('propagate-values'),
-          z3.Tactic('propagate-ineqs'),
-          z3.Tactic('purify-arith'),
-          z3.Tactic('simplify'),
-          z3.Tactic('unit-subsume-simplify'),
-          z3.Tactic('solver-subsumption'),
-          # z3.Tactic('aig'),
-          # z3.Tactic('sat-preprocess'),
-          # z3.Tactic('fm'),
-          # z3.Tactic('ctx-solver-simplify'),
-          # z3.Tactic('ctx-simplify')
-          # z3.With(z3.Tactic('add-bounds'), ),
-          ]
-    tactic = tl[0]
-    for tac in tl[1:]:
-        tactic = z3.Then(tactic, tac)
-    print(tactic(g))
+if __name__ == "__main__":
+    args = get_args()
+    Main(
+        args.tsteps, args.queue_tol_bdp, args.mode, args.config,
+        args.output_dir, args.input_dir, args.output_path,
+    ).run()
