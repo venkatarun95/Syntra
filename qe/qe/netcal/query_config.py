@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Type
 
-from qe.environment import CBRDelay, Ideal
+from qe.environment import BurstyCBRDelay, CBRDelay, Ideal
 from qe.netcal.common import QEQuery
 from qe.util import flatten
 
@@ -64,6 +64,52 @@ def _cbrdelay_generate_queries(T: int, queue_tol_bdp: int) -> List[QEQuery]:
 
     return queries
 
+def _bursty_cbrdelay_generate_queries(T: int, queue_tol_bdp: int) -> List[QEQuery]:
+    c = CBRDelay.Config(T=T)
+    v = CBRDelay(name="", c=c).v
+    # Each query is a list of variables to eliminate
+
+    queries: List[QEQuery] = []
+    for st in range(T + 1):
+        # st starts from 0, as no losses may have been observed
+        queries.append(QEQuery(
+            "C", flatten([v.P, v.I, v.L[st:], v.B]), st, T-1))
+
+        queries.append(QEQuery(
+            "B", flatten([v.P, v.I, v.L[st:]]), st, T-1))
+
+        queries.append(QEQuery(
+            f"Q_{T-1}", flatten([v.P, v.I, v.L[st:]]), st, T-1))
+
+        if st < T:
+            queries.append(QEQuery(
+                f"S_{T-1}", flatten([v.P, v.I, v.L[st:]]), st, T-2))
+            # We may be able to observe last L depending on the trace and
+            # actions choices. So explore the case where none of the losses
+            # are eliminated.
+]
+    for total_prior_obs_losses in range(T):
+        # starts from 0, as no losses may have been observed
+        for newly_obs_losses in range(0, total_prior_obs_losses + 1):
+            # All the observed losses may be new.
+            total_loss_vars = total_prior_obs_losses + 1  # +1 for the lhs
+            non_newly_obs_losses = total_prior_obs_losses - newly_obs_losses
+
+            newly_obs_l_idx = total_loss_vars - 1 - 1  # -1 for lhs and -1 for 0-indexing
+            # This is basically idx of loss before the loss being computed.
+            # Since we are computing current loss, the previous one must have
+            # been observed. Think of this as the last observed loss including
+            # newly observed loss.
+
+            newly_obs_s_idx = T - 1
+
+            queries.append(
+                QEQuery(f"L_{total_loss_vars-1}", flatten([v.P, v.I, v.L[total_loss_vars:]]),
+                        non_newly_obs_losses, T-2, False, False, newly_obs_s_idx,
+                        newly_obs_l_idx,))
+
+    return queries
+
 
 CBRDELAY = QueryConfig(
     name="cbrdelay",
@@ -71,9 +117,16 @@ CBRDELAY = QueryConfig(
     generate_queries=_cbrdelay_generate_queries,
 )
 
+BURSTYCBRDELAY = QueryConfig(
+    name="bursty_cbrdelay",
+    network_model=CBRDelay,
+    generate_queries=_cbrdelay_generate_queries,
+)
+
 
 QUERY_CONFIGS: Dict[str, QueryConfig] = {
     CBRDELAY.name: CBRDELAY,
+    BURSTYCBRDELAY.name: BURSTYCBRDELAY,
 }
 
 
