@@ -65,8 +65,8 @@ def _cbrdelay_generate_queries(T: int, queue_tol_bdp: int) -> List[QEQuery]:
     return queries
 
 def _bursty_cbrdelay_generate_queries(T: int, queue_tol_bdp: int) -> List[QEQuery]:
-    c = CBRDelay.Config(T=T)
-    v = CBRDelay(name="", c=c).v
+    c = BurstyCBRDelay.Config(T=T)
+    v = BurstyCBRDelay(name="", c=c).v
     # Each query is a list of variables to eliminate
 
     queries: List[QEQuery] = []
@@ -87,7 +87,7 @@ def _bursty_cbrdelay_generate_queries(T: int, queue_tol_bdp: int) -> List[QEQuer
             # We may be able to observe last L depending on the trace and
             # actions choices. So explore the case where none of the losses
             # are eliminated.
-]
+
     for total_prior_obs_losses in range(T):
         # starts from 0, as no losses may have been observed
         for newly_obs_losses in range(0, total_prior_obs_losses + 1):
@@ -120,12 +120,12 @@ CBRDELAY = QueryConfig(
 BURSTYCBRDELAY = QueryConfig(
     name="bursty_cbrdelay",
     network_model=CBRDelay,
-    generate_queries=_cbrdelay_generate_queries,
+    generate_queries=_bursty_cbrdelay_generate_queries,
 )
 
 
 QUERY_CONFIGS: Dict[str, QueryConfig] = {
-    CBRDELAY.name: CBRDELAY,
+    #CBRDELAY.name: CBRDELAY,
     BURSTYCBRDELAY.name: BURSTYCBRDELAY,
 }
 

@@ -17,7 +17,7 @@ class BurstyCBRDelay(Ideal):
             # self.S = z3.RealVarVector(c.T)
 
             # Maximum burstiness of the sender in bytes
-            self.K = z3.Real(f'{name}C')
+            self.K = z3.Real(f'{name}K')
             # Packets after initial perturbation from bursty sending
             self.P = [z3.Real(f'{name}P_{t}') for t in range(c.T)]  # service curve of ideal link
             # I think using RealVarVector just makes those vars have a forall quantifier.
@@ -60,6 +60,7 @@ class BurstyCBRDelay(Ideal):
             c, v = self.c, self.v
 
             cl = []
+            cl.append(v.K > 0)
             for t in range(0, c.T):
                 cl.append(v.P[t] >= v.A[t] - v.K)
                 cl.append(v.P[t] <= v.A[t])
