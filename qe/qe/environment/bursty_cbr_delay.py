@@ -1,6 +1,7 @@
 import z3
 from dataclasses import dataclass
 from qe.environment.ideal import Ideal
+from qe.util import z3_min
 
 
 class BurstyCBRDelay(Ideal):
@@ -18,6 +19,8 @@ class BurstyCBRDelay(Ideal):
 
             # Maximum burstiness of the sender in bytes
             self.K = z3.Real(f'{name}K')
+            # Caller-supplied fraction bounding K relative to buffer size.
+            self.pert = z3.Real(f'{name}pert')
             # Packets after initial perturbation from bursty sending
             self.P = [z3.Real(f'{name}P_{t}') for t in range(c.T)]  # service curve of ideal link
             # I think using RealVarVector just makes those vars have a forall quantifier.
@@ -61,6 +64,10 @@ class BurstyCBRDelay(Ideal):
 
             cl = []
             cl.append(v.K > 0)
+            cl.append(v.pert > 0)
+            # Bound burstiness relative to the fixed buffer size.  B > 0 is
+            # already guaranteed by Ideal.non_det_initial().
+            cl.append(v.K < v.pert * v.B)
             for t in range(0, c.T):
                 cl.append(v.P[t] >= v.A[t] - v.K)
                 cl.append(v.P[t] <= v.A[t])
