@@ -94,27 +94,45 @@ impl Display for BeliefBounds {
 
 #[derive(Clone, PartialEq, Debug, Copy, PartialOrd, Serialize)]
 pub struct Metrics {
+    /// Loss above the configured tolerance; smaller is better.
     #[serde(with = "serde_real")]
     pub loss: RealNumRep,
+    /// Negative delivered service, so smaller means more data was delivered.
     #[serde(with = "serde_real")]
     pub neg_delivered: RealNumRep,
+    /// Worst queueing delay above the one-RTT baseline; smaller is better.
     #[serde(with = "serde_real")]
     pub qdel: RealNumRep,
+    /// Whether the capacity belief interval shrank at all.
     pub shrink_c: bool,
+    /// Whether the buffer upper bound fell below its global maximum.
     pub shrink_b: bool,
+    /// Whether the capacity upper bound halved from its starting value.
     pub shrink_maxc_mul: bool,
+    /// Whether the capacity upper bound fell below the global maximum.
     pub shrink_maxc_add: bool,
+    /// Whether the capacity lower bound doubled from its starting value.
     pub shrink_minc_mul: bool,
+    /// Whether the capacity lower bound increased by two packets/RTT.
     pub shrink_minc_add: bool,
+    /// RTTs until the capacity interval first shrinks.
     pub time_to_shrink_c: RealNumInt,
+    /// Whether total loss remains within the configured tolerance.
     pub loss_tol: bool,
+    /// RTTs until the capacity lower bound rises by two packets/RTT.
     pub time_to_shrink_c_l: RealNumInt,
+    /// RTTs until the capacity upper bound falls.
     pub time_to_shrink_c_h: RealNumInt,
+    /// RTTs until the capacity belief reaches its final speculative bounds.
     pub time_to_c: RealNumInt,
+    /// Conservative combined lower bound, `min_c + min_b`; larger is better.
     #[serde(with = "serde_real")]
     pub minc_minb_sum: RealNumRep,
+    /// RTTs until that combined lower bound reaches its final value.
     pub time_to_c_b: RealNumInt,
+    /// RTTs until the combined lower bound gains roughly one tolerance unit.
     pub time_to_shrink_minc_minb_add: RealNumInt,
+    /// Whether the combined lower bound did not decrease from its initial value.
     pub shrink_minc_minb: bool,
 }
 

@@ -242,20 +242,17 @@ impl<S: State> Search<S> {
             }
             //let d = depth;
             state.reset_moves();
-            if d == depth {
-                self.deepen_tree(state, d, S::V::neg_inf(), S::V::inf(), stop_flag.clone(), false);
-                //self.deepen_tree(state, d, S::V::neg_inf(), S::V::inf(), stop_flag.clone(), true);
-            } else {
-                self.deepen_tree(state, d, S::V::neg_inf(), S::V::inf(), stop_flag.clone(), true);
-            }
+            // The caller obtains the result from the root transposition-table
+            // entry below, so every requested depth must store that entry.
+            // Previously the first (and only) iteration used `false`, which
+            // happened to work only when `deepen_tree` special-cased the old
+            // global depth of 10.
+            self.deepen_tree(state, d, S::V::neg_inf(), S::V::inf(), stop_flag.clone(), true);
 
-            if let Some((m, v, d)) = self.tt.get(&state.tt_state()) {
+            if let Some((_, v, _)) = self.tt.get(&state.tt_state()) {
                 if v.fully_known() {
                     break;
                 }
-
-                println!("Depth {d} move {m:?} value{v:?}");
-                println!("Depth {d} move {m:?}");
             }
 
             if stop_flag.load(Ordering::Relaxed) {

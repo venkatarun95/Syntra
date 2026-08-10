@@ -314,21 +314,43 @@ pub struct NetworkActionNC {
     #[serde(with = "serde_real")]
     pub s: RealNumRep,
     pub lo: Vec<LossObservation>,
+    pub app_send_fraction: AppSendFraction,
 }
 
 impl Display for NetworkActionNC {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "s={:.2}, lo={:?}", self.s.to_f64().unwrap(), self.lo,)
+        write!(f, "s={:.2}, app={}, lo={:?}", self.s.to_f64().unwrap(), self.app_send_fraction, self.lo,)
     }
 }
 
 impl NetworkAction for NetworkActionNC {}
+
+/// Amount of a CCA request actually supplied by the application.
+#[derive(Clone, Copy, PartialEq, Debug, Eq, Hash, Serialize)]
+pub enum AppSendFraction { Zero, Half, Full }
+
+impl AppSendFraction {
+    fn as_real(self) -> RealNumRep {
+        match self {
+            Self::Zero => 0.into(),
+            Self::Half => RealNumRep::new(1, 2),
+            Self::Full => 1.into(),
+        }
+    }
+}
+
+impl Display for AppSendFraction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", match self { Self::Zero => "0", Self::Half => "1/2", Self::Full => "1" })
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NetworkModelNC {
     sim_ideal: Option<bool>,
     sim_c: Option<RealNumRep>,
     sim_b: Option<RealNumRep>,
+    app_send_choices: Vec<AppSendFraction>,
 }
 
 impl NetworkModel for NetworkModelNC {
@@ -348,7 +370,13 @@ impl NetworkModel for NetworkModelNC {
             //print!("{:?}\n", path);
             let pos = 1 + relevant_history.len() - HISTORY_SIZE;
             let feasible_moves = self.compute_feasible_network_moves_given_path(&relevant_history[pos..], move_cca, c, b);
-            ret.extend(feasible_moves);
+            for move_ in feasible_moves {
+                for app_send_fraction in &self.app_send_choices {
+                    let mut move_ = move_.clone();
+                    move_.app_send_fraction = *app_send_fraction;
+                    ret.push(move_);
+                }
+            }
         }
 
         ret
@@ -622,7 +650,7 @@ impl NetworkModel for NetworkModelNC {
         } else {
             lo_ret
         };
-        return Some(NetworkActionNC { s: max_s, lo });
+        return Some(NetworkActionNC { s: max_s, lo, app_send_fraction: AppSendFraction::Full });
         // Worst-case behavior
         //if lo.last().unwrap().t == 2 && lo.last().unwrap().l == 0.into() {
         if lo.last().unwrap().t == 2  {
@@ -642,9 +670,9 @@ impl NetworkModel for NetworkModelNC {
             } else {
                 lo_ret
             };
-            Some(NetworkActionNC { s: max_s, lo })
+            Some(NetworkActionNC { s: max_s, lo, app_send_fraction: AppSendFraction::Full })
         } else {
-            Some(NetworkActionNC { s: min_s, lo })
+            Some(NetworkActionNC { s: min_s, lo, app_send_fraction: AppSendFraction::Full })
         }
     }
 
@@ -921,7 +949,7 @@ impl NetworkModel for NetworkModelNC {
         move_cca: &Option<CCAAction>,
     ) -> Self::O {
         ObservationNC {
-            a: last.a + move_cca.as_ref().unwrap().rate,
+            a: last.a + move_cca.as_ref().unwrap().rate * na.app_send_fraction.as_real(),
             s: na.s,
             lo: na.lo.clone(),
         }
@@ -940,7 +968,13 @@ impl NetworkModelNC {
             sim_ideal: None,
             sim_c: None,
             sim_b: None,
+            app_send_choices: vec![AppSendFraction::Full],
         }
+    }
+
+    pub fn new_with_app_send_choices(choices: &[AppSendFraction]) -> Self {
+        assert!(!choices.is_empty());
+        Self { app_send_choices: choices.to_vec(), ..Self::new() }
     }
 
     fn discretize_interval(interval_list: &IntervalList<RealNumRep>, n_points: usize) -> Vec<RealNumRep>{
@@ -1162,6 +1196,7 @@ impl NetworkModelNC {
                 ret.push(NetworkActionNC {
                     s: s_val,
                     lo: this_lo,
+                    app_send_fraction: AppSendFraction::Full,
                 });
             }
             trace!("Popping S[{}]", tsteps);

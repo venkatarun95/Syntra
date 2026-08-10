@@ -50,5 +50,9 @@ name = "cc"
 path = "src/cong_ctrl.rs"
 
 [[bin]]
+name = "cbrdelay-cca"
+path = "src/cbrdelay_cca.rs"
+
+[[bin]]
 name = "abr"
 path = "src/adaptive_bitrate.rs"

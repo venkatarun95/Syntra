@@ -1,8 +1,8 @@
 import argparse
+import os
 
 from qe.netcal import qe_queries, transpile
 from qe.netcal.common import OUTPUT_DIR as DEFAULT_OUTPUT_DIR
-from qe.netcal.common import OUTPUT_PATH as DEFAULT_OUTPUT_PATH
 from qe.netcal.query_config import QUERY_CONFIGS, get_query_config
 
 
@@ -20,8 +20,8 @@ class Main:
         mode: str,
         config_name: str,
         output_dir: str,
-        input_dir: str,
-        output_path: str,
+        input_dir: str | None,
+        output_path: str | None,
     ):
         self.T = T
         self.queue_tol_bdp = queue_tol_bdp
@@ -29,9 +29,15 @@ class Main:
         # Where the solve stage writes solved SMT2 files.
         self.output_dir = output_dir
         # Where the transpile stage reads solved SMT2 files from.
-        self.input_dir = input_dir
+        # A normal `--mode all --output-dir X` run should consume precisely
+        # the SMT files it just produced.  The old independent defaults made
+        # that surprisingly easy to get wrong.
+        self.input_dir = input_dir if input_dir is not None else output_dir
         # Where the transpile stage writes the generated Rust file.
-        self.output_path = output_path
+        self.output_path = (
+            output_path if output_path is not None else os.path.join(self.input_dir, "lib.rs")
+        )
+        os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
         self.config = get_query_config(config_name)
         self.queries = self.config.generate_queries(T, queue_tol_bdp)
         print("Total queries: ", len(self.queries))
@@ -68,12 +74,14 @@ def get_args():
         help="Where the solve stage writes solved SMT2 query results.",
     )
     parser.add_argument(
-        "--input-dir", action="store", type=str, default=DEFAULT_OUTPUT_DIR,
-        help="Where the transpile stage reads solved SMT2 query results from.",
+        "--input-dir", action="store", type=str,
+        help="Where the transpile stage reads solved SMT2 query results from. "
+             "Defaults to --output-dir.",
     )
     parser.add_argument(
-        "--output-path", action="store", type=str, default=DEFAULT_OUTPUT_PATH,
-        help="Where the transpile stage writes the generated Rust file.",
+        "--output-path", action="store", type=str,
+        help="Where the transpile stage writes the generated Rust file. "
+             "Defaults to <input-dir>/lib.rs.",
     )
     return parser.parse_args()
 

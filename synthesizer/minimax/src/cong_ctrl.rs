@@ -20,6 +20,9 @@ use network_model_nc::NetworkModelNC;
 use ds::tree::Tree;
 use ds::*;
 
+mod cbrdelay_cca_config;
+use cbrdelay_cca_config::{CandidateAction, APP_IS_BACKLOGGED, APP_SEND_CHOICES, CANDIDATE_ACTIONS, OBJECTIVE_ORDER, SEARCH_DEPTH};
+
 // ------------------------------------------------------------------------------------------
 // Minimax move
 #[derive(Clone, PartialEq, Debug, Eq, Hash, Serialize)]
@@ -77,18 +80,12 @@ enum CCValue {
 // const DEFAULT_PERMUTATION: &[&str] = &[
 //     "c", "b", "ld", "s", "qdel", "sc", "sb", "sclmul", "scladd", "schmul", "schadd", "ttsc",
 // ];
-const DEFAULT_PERMUTATION: &[&str] = &[
-    //"lt", "schadd", "scladd", "ttsc",
-    //"lt", "schadd", "cb", "ttcb",
-    "lt", "schadd", "ttscbadd", "scb", "c",
-    //"schadd", "cb", "ttcb",
-];
 lazy_static! {
     static ref OBJ_PERMUTATION: Vec<String> = {
         let args = Args::parse();
         let mut ret: Vec<String> = args.obj_perm.clone();
         let set: HashSet<String> = ret.iter().map(|x| x.into()).collect();
-        for p in DEFAULT_PERMUTATION.iter() {
+        for p in OBJECTIVE_ORDER.iter() {
             if !set.contains(*p) {
                 ret.push(p.to_string());
             }
@@ -537,20 +534,21 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let minc_minb_sum = self.network_model.compute_min_c_b_sum(&self.get_relevant_history(Some(HISTORY_SIZE)), &None).unwrap();
         let mut time_to_c_b = (HISTORY_SIZE + SPECULATION_SIZE + 1) as RealNumInt;
         let relevant_history = &self.get_relevant_history(Some(HISTORY_SIZE + self.history_stack.len()));
-        for ptr in 0..relevant_history.len() - HISTORY_SIZE + 1 {
+        for ptr in 0..=relevant_history.len().saturating_sub(HISTORY_SIZE) {
             let rh = &relevant_history[ptr .. (ptr + HISTORY_SIZE)];
             if self.network_model.compute_min_c_b_sum(rh, &None).unwrap() >= minc_minb_sum {
-                time_to_c_b = (ptr - 1) as RealNumInt;
+                // `ptr == 0` is the current history, i.e. zero RTTs away.
+                time_to_c_b = ptr as RealNumInt;
                 break;
             }
         }
         let start_minc_minb_sum = self.network_model.compute_min_c_b_sum(&relevant_history[0 .. HISTORY_SIZE], &None).unwrap();
         let mut time_to_shrink_minc_minb_add = (HISTORY_SIZE + SPECULATION_SIZE + 1) as RealNumInt;
-        for ptr in 0..relevant_history.len() - HISTORY_SIZE + 1 {
+        for ptr in 0..=relevant_history.len().saturating_sub(HISTORY_SIZE) {
             let rh = &relevant_history[ptr .. (ptr + HISTORY_SIZE)];
             // Account for unsoundness during QE 
             if self.network_model.compute_min_c_b_sum(rh, &None).unwrap() >= start_minc_minb_sum + self.loss_tolerance_abs * 1 - RealNumRep::new_raw(1, 1 << 4){
-                time_to_shrink_minc_minb_add = (ptr - 1) as RealNumInt;
+                time_to_shrink_minc_minb_add = ptr as RealNumInt;
                 break;
             }
         }
@@ -676,21 +674,15 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         // );
         let min_c = belief_bounds.min_c;
         let max_q = belief_bounds.max_q;
-        let ret: Vec<CCMove<NM::NA>> = [
-            max_allowed_rate.unwrap(),
-            std::cmp::max(0.into(), min_c - max_q),
-            max_allowed_rate.unwrap() + self.loss_tolerance_abs, 
-            // max_allowed_rate2.unwrap(),
-            // std::cmp::max(min_c - RealNumRep::from(ALPHA), ALPHA.into()),
-            //min_c,
-            //min_c * 2,
-            //min_c + ALPHA,
-            //belief_bounds.max_c,
-            // min_c / 2,
-        ]
+        let ret: Vec<CCMove<NM::NA>> = CANDIDATE_ACTIONS
         .iter()
-        .filter(|x| **x >= 0.into())
-        .map(|r| CCMove::CCA(CCAAction { rate: *r }))
+        .map(|candidate| match candidate {
+            CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
+            CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
+            CandidateAction::ProbeAboveLimit => max_allowed_rate.unwrap() + self.loss_tolerance_abs,
+        })
+        .filter(|x| *x >= 0.into())
+        .map(|rate| CCMove::CCA(CCAAction { rate }))
         .collect();
         let ret = ret.into_iter().unique().collect();
         // https://stackoverflow.com/questions/47636618/vecdedup-does-not-work-how-do-i-deduplicate-a-vector-of-strings
@@ -786,6 +778,11 @@ struct Args {
 
     #[arg(long)]
     parallel: bool,
+
+    /// Number of control intervals to execute. Keep this small while
+    /// iterating on objectives/actions; the minimax search grows quickly.
+    #[arg(long, default_value_t = 4)]
+    steps: u32,
 }
 
 fn get_sim_tag(args: &Args) -> String {
@@ -814,7 +811,6 @@ fn get_obj_tag() -> String {
 struct SimStrategy<'a> {
     sim_state: u32,
     args: &'a Args,
-    loss_fraction: RealNumRep,
 }
 
 impl SimStrategy<'_> {
@@ -822,7 +818,6 @@ impl SimStrategy<'_> {
         SimStrategy {
             sim_state: 1,
             args,
-            loss_fraction: 1.into(),
         }
     }
 
@@ -830,11 +825,6 @@ impl SimStrategy<'_> {
         let bb = ccs.get_latest_belief_bounds();
         let history = ccs.get_relevant_history(Some(HISTORY_SIZE));
         let move_cca = ccs.move_cca;
-        let n = history.len();
-
-        if n >= 2 && history[n - 1].get_ld() > history[n - 2].get_ld() {
-            self.loss_fraction = self.loss_fraction / 2;
-        }
 
         if bb.max_q <= 1.into() {
             self.sim_state = self.args.probe_duration;
@@ -847,7 +837,6 @@ impl SimStrategy<'_> {
         } else {
         //unimplemented!("Need to re-implement max allowed rate computation");
             let this_loss_abs = self.args.loss_tolerance_abs;
-            //std::cmp::max(self.args.loss_tolerance_abs, bb.min_c * self.loss_fraction);
             let ret = ccs.network_model.compute_max_allowed_rate(
                 &history,
                 &move_cca,
@@ -868,7 +857,11 @@ impl SimStrategy<'_> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(Env::default().default_filter_or("cc=info")).init();
+    // This source is built as both `cc` and `cbrdelay-cca`; filtering only
+    // `cc=info` hid every progress line from the latter binary.  Use a
+    // program-specific variable so an unrelated shell RUST_LOG=warn does not
+    // hide the CCA's progress.  Set SYNTRA_LOG=debug or =trace when needed.
+    env_logger::Builder::from_env(Env::new().filter_or("SYNTRA_LOG", "info")).init();
     // env_logger::Builder::from_env(Env::default().default_filter_or("cc=info,network_model_nc=info")).init();
 
     let args = Args::parse();
@@ -910,7 +903,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let ctx = z3::Context::new(&z3::Config::new());
     // let mut network_model = NetworkModelZ3::new(&ctx, args.parallel);
 
-    let mut network_model = NetworkModelNC::new();
+    let mut network_model = if APP_IS_BACKLOGGED {
+        NetworkModelNC::new()
+    } else {
+        NetworkModelNC::new_with_app_send_choices(APP_SEND_CHOICES)
+    };
 
     network_model.init();
     let mut ccs = CongCtrlState::new(network_model);
@@ -933,8 +930,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sim_strategy = Some(SimStrategy::new(&args));
     }
 
-    let tsteps = 150;
+    let tsteps = args.steps;
     for t in 0..tsteps {
+        info!("Step {}: searching...", t);
         let start = std::time::Instant::now();
         if args.tree {
             ccs.start_recording_tree();
@@ -943,7 +941,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let best_cc_move = if args.sim_max_rate {
             sim_strategy.as_mut().unwrap().get_rate(&ccs)
         } else {
-            let (ret, _, _) = search.best_move(&mut ccs, Some(SPECULATION_SIZE as u16), None);
+            let (ret, _, _) = search.best_move(&mut ccs, Some(SEARCH_DEPTH), None);
             ret
         };
 
