@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syntra QE Workbench</title>
+<style>
+  :root { color-scheme: dark; --bg:#101418; --panel:#182027; --line:#3d4a54; --ink:#e8edf2; --muted:#9db0bd; --a:#55d6be; --s:#7ca7ff; --l:#ff8d82; --accent:#ffd166; }
+  * { box-sizing:border-box } body { margin:0; font:14px ui-sans-serif,system-ui,sans-serif; background:var(--bg); color:var(--ink) }
+  header { padding:16px 22px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:center; flex-wrap:wrap }
+  h1 { margin:0; font-size:18px } label { color:var(--muted) } select,input,button { background:#0e1317; color:var(--ink); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font:inherit } button { cursor:pointer } button:hover { border-color:var(--accent) }
+  main { display:grid; grid-template-columns:minmax(470px,2fr) minmax(290px,1fr); min-height:calc(100vh - 68px) }
+  section { padding:20px; border-right:1px solid var(--line) } section:last-child { border:0 } h2 { font-size:15px; margin:0 0 12px } .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px }.hint{color:var(--muted);font-size:12px;margin:0 0 10px}
+  svg { width:100%; height:420px; background:#12191f; border:1px solid var(--line); border-radius:8px; touch-action:none } .grid { stroke:#27323b; stroke-width:1 }.axis { fill:var(--muted); font-size:11px }.series { fill:none; stroke-width:3; stroke-linejoin:round; stroke-linecap:round }.handle { stroke:#101418; stroke-width:2; cursor:grab }.handle:active { cursor:grabbing }.legend { display:flex; gap:15px; font-size:12px; color:var(--muted) }.dot { width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px }
+  .belief { border:1px solid var(--line); border-radius:8px; padding:12px; margin:10px 0; background:var(--panel) }.belief h3{margin:0 0 9px;font-size:13px}.range{display:grid;grid-template-columns:72px 1fr;gap:7px;color:var(--muted)}.range strong{color:var(--ink);font-weight:600}.status{font-size:12px;color:var(--accent)}
+  pre { white-space:pre-wrap; overflow:auto; max-height:220px; background:#0e1317; border:1px solid var(--line); border-radius:8px; padding:10px; color:var(--muted); font-size:12px }.network{height:170px;margin-top:10px}canvas{width:100%;height:auto;margin-top:10px;background:#12191f;border:1px solid var(--line);border-radius:8px}@media(max-width:800px){main{grid-template-columns:1fr}section{border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+<header>
+  <h1>Syntra QE Workbench</h1>
+  <label>Model <select id="model"></select></label>
+  <label>Capacity C <input id="capacity" type="number" min="0.001" step="1" value="10"></label>
+  <label>Buffer B <input id="buffer" type="number" min="0" step="1" value="20"></label>
+  <label id="k-control">Perturbation K <input id="k" type="number" min="0" step="0.1" value="2"></label>
+  <label>Load CCA trace <input id="file" type="file" accept="application/json,.json"></label>
+  <button id="add">Add timestep</button><button id="reset">Reset example</button>
+</header>
+<main>
+  <section>
+    <h2>Observed history</h2>
+    <p class="hint">Drag a large handle to edit it. The editor projects the current timestep back onto the selected model (and reports the constraint that bound the move). Double-click a line to add a timestep; double-click an interior handle to remove it.</p>
+    <div class="legend"><span><i class="dot" style="background:var(--a)"></i>arrival</span><span><i class="dot" style="background:var(--s)"></i>service</span><span><i class="dot" style="background:var(--l)"></i>loss</span></div>
+    <svg id="chart" viewBox="0 0 760 420" role="img" aria-label="Editable arrival, service, and loss history"></svg><p id="constraint" class="hint" aria-live="polite">Ready.</p><p id="reason" class="hint"></p>
+    <h2 style="margin-top:20px">Current network state</h2><svg id="network" class="network" viewBox="0 0 760 170" role="img" aria-label="Queue, service, and delay state"></svg>
+    <h2 style="margin-top:20px">Selected step</h2><pre id="event">No simulator event loaded.</pre>
+  </section>
+  <section>
+    <h2>QE belief state</h2>
+    <p class="hint">These bounds are keyed by model. Loading a CCA log selects its recorded QE result. Editing uses the lightweight JavaScript model below; QE is only needed to produce belief sets.</p>
+    <div id="belief"></div>
+    <h2 style="margin-top:22px">CBR delay belief geometry</h2>
+    <p class="hint">Sequential conditional QE samples of the CBR-delay belief set: C, then B conditioned on C, then final Q conditioned on C and B.</p>
+    <canvas id="belief-plot" width="620" height="330" aria-label="3D CBR delay belief set plot"></canvas>
+    <p id="belief-plot-note" class="hint"></p>
+  </section>
+</main>
+<script type="module">
+import { sampleCbrdelayBelief } from './cbrdelay-qe-wasm/wasm.js';
+const example={schema_version:1,models:['cbrdelay','bursty_cbrdelay','bursty_cbrdelay_elim_k'],steps:[{t:0,arrival:10,service:0,loss:0},{t:1,arrival:20,service:8,loss:0},{t:2,arrival:32,service:17,loss:0},{t:3,arrival:47,service:26,loss:1},{t:4,arrival:59,service:38,loss:1}],beliefs:{bursty_cbrdelay_elim_k:{capacity:[9,18],buffer:[5,30],queue:[0,12]}},events:[]};
+let trace=structuredClone(example), selected=0; const svg=document.querySelector('#chart'), model=document.querySelector('#model'), buffer=document.querySelector('#buffer'), capacity=document.querySelector('#capacity'), k=document.querySelector('#k'), beliefCanvas=document.querySelector('#belief-plot');
+const colors={arrival:'#55d6be',service:'#7ca7ff',loss:'#ff8d82'};
+const EPS=.001;
+function models(){ return [...new Set([...(trace.models||[]),...Object.keys(trace.beliefs||{})])]; }
+function refreshMenu(){ const old=model.value; model.innerHTML=models().map(m=>`<option>${m}</option>`).join(''); model.value=models().includes(old)?old:models()[0]; }
+function point(i,key,max){const n=trace.steps.length;return [52+i*(680/Math.max(1,n-1)),360-trace.steps[i][key]*300/max]}
+/*
+ * Small, deliberately model-local constraint projector.  Constraints are kept as
+ * named residuals so a richer QE-generated model can plug in here later.  A
+ * residual <= EPS is treated as satisfied.  This is also our deliberately
+ * relaxed implication policy: antecedent <= EPS implies consequent <= EPS.
+ */
+function localState(i){
+ const s=trace.steps[i],prev=i?trace.steps[i-1]:null,C=Math.max(EPS,+capacity.value||EPS),B=Math.max(0,+buffer.value||0);
+ let ideal=prev?.ideal??0,loss=s.loss;
+ // The loss/service recurrence has a small cycle through L[t].  Fixed-point
+ // iteration is ample for this three-variable local projection.
+ for(let n=0;n<12;n++){
+   // I[0] is nondeterministic in the model; the editor picks the least-service
+   // representative (zero) rather than inventing an extra visible handle.
+   ideal=i===0?0:Math.max(0,Math.min(prev.ideal+C,s.arrival-loss));
+   const carried=prev?.loss??0,overflow=s.arrival-carried-ideal-B;
+   loss=overflow>EPS ? Math.max(carried,s.arrival-ideal-B) : carried;
+ }
+ return {ideal,loss,queue:Math.max(0,s.arrival-loss-ideal),minService:i?(prev.ideal??0):0,maxService:ideal};
+}
+function project(i,key,wanted){
+ const s=trace.steps[i],prev=i?trace.steps[i-1]:null,next=i<trace.steps.length-1?trace.steps[i+1]:null;
+ const lower=prev?prev[key]:0, upper=next?next[key]:Infinity;
+ s[key]=Math.max(lower-EPS,Math.min(upper+EPS,wanted));
+ const before={arrival:s.arrival,service:s.service,loss:s.loss};
+ // First satisfy monotonic cumulative curves and the basic L <= A relation.
+ s.arrival=Math.max(0,s.arrival); s.loss=Math.max(0,Math.min(s.loss,s.arrival+EPS)); s.service=Math.max(0,s.service);
+ // Invert the deterministic loss recurrence when loss itself is being dragged.
+ // This makes a lower requested L[t] pull A[t] down, rather than silently
+ // discarding the user's drag.  Neighboring cumulative samples remain hard
+ // bounds on that same-timestep adjustment.
+ if(key==='loss'&&i){
+   const carried=prev.loss, serviceCeiling=(prev.ideal??0)+Math.max(EPS,+capacity.value||EPS), target=Math.max(carried,s.loss);
+   const desiredArrival=target<=carried+EPS ? Math.min(s.arrival,carried+serviceCeiling+Math.max(0,+buffer.value||0)) : target+serviceCeiling+Math.max(0,+buffer.value||0);
+   const aLo=prev.arrival-EPS,aHi=next?next.arrival+EPS:Infinity;
+   s.arrival=Math.max(aLo,Math.min(aHi,desiredArrival));
+ }
+ let st=localState(i); s.ideal=st.ideal;
+ // Loss is determined by the queue-overflow implication.  If the user's move
+ // made loss inconsistent, this is the coupled same-timestep adjustment.
+ s.loss=st.loss; st=localState(i); s.ideal=st.ideal;
+ // CBR delay with D=1 is an envelope: I[t-1] <= S[t] <= I[t].
+ s.service=Math.max(st.minService-EPS,Math.min(st.maxService+EPS,s.service));
+ const changed=[]; ['arrival','loss','service'].forEach(k=>{if(k!==key&&Math.abs(before[k]-s[k])>EPS)changed.push(k)});
+ const reasons=[];
+ if(wanted<lower-EPS||wanted>upper+EPS)reasons.push(`${key} is cumulative, so it must stay between its neighboring samples`);
+ if(key==='loss')reasons.push('loss drag is inverted through the buffer-overflow implication; arrival moves with it when feasible');
+ if(key==='service'&&Math.abs(before.service-s.service)>EPS)reasons.push('CBR delay envelope: previous ideal service ≤ observed service ≤ current ideal service');
+ return {changed,reasons:reasons.length?reasons:['all local constraints are satisfied within ε = 0.001'],state:st};
+}
+function bounds(i,key){const s=trace.steps;let lo=i? s[i-1][key]-EPS:0,hi=i<s.length-1?s[i+1][key]+EPS:Infinity;if(key==='loss')hi=Math.min(hi,s[i].arrival+EPS);const st=localState(i);if(key==='service'){lo=Math.max(lo,st.minService-EPS);hi=Math.min(hi,st.maxService+EPS)}return[lo,hi]}
+function syncModel(){for(let i=0;i<trace.steps.length;i++){const st=localState(i);trace.steps[i].ideal=st.ideal;}}
+function refreshPlot(){
+ const max=Math.max(1,...trace.steps.flatMap(s=>[s.arrival,s.service,s.loss]))*1.25;
+ ['arrival','service','loss'].forEach(key=>{let d='';trace.steps.forEach((_,i)=>{const[x,y]=point(i,key,max);d+=(i?'L':'M')+x+' '+y});svg.querySelector(`path[data-key="${key}"]`)?.setAttribute('d',d)});
+ svg.querySelectorAll('.handle').forEach(h=>{const i=+h.dataset.i,key=h.dataset.key,[x,y]=point(i,key,max),[lo,hi]=bounds(i,key);h.setAttribute('cx',x);h.setAttribute('cy',y);h.querySelector('title').textContent=`${key} at t=${trace.steps[i].t}; legal range [${lo.toFixed(1)}, ${hi===Infinity?'∞':hi.toFixed(1)}]`});
+ renderBelief();renderEvent();renderNetwork();
+}
+function draw(){ syncModel(); const max=Math.max(1,...trace.steps.flatMap(s=>[s.arrival,s.service,s.loss]))*1.25; svg.innerHTML=''; for(let i=0;i<6;i++){const y=60+i*60;svg.insertAdjacentHTML('beforeend',`<line class="grid" x1="52" x2="732" y1="${y}" y2="${y}"/><text class="axis" x="8" y="${y+4}">${Math.round((360-y)*max/300)}</text>`)}
+ ['arrival','service','loss'].forEach(key=>{let d='';trace.steps.forEach((_,i)=>{const [x,y]=point(i,key,max);d+=(i?'L':'M')+x+' '+y});const path=document.createElementNS('http://www.w3.org/2000/svg','path');path.setAttribute('class','series');path.setAttribute('stroke',colors[key]);path.setAttribute('d',d);path.dataset.key=key;path.addEventListener('dblclick',addAt);svg.append(path);trace.steps.forEach((_,i)=>{const[x,y]=point(i,key,max),[lo,hi]=bounds(i,key);const c=document.createElementNS('http://www.w3.org/2000/svg','circle');c.setAttribute('class','handle');c.setAttribute('cx',x);c.setAttribute('cy',y);c.setAttribute('r','10');c.setAttribute('fill',colors[key]);c.dataset.i=i;c.dataset.key=key;c.append(Object.assign(document.createElementNS('http://www.w3.org/2000/svg','title'),{textContent:`${key} at t=${trace.steps[i].t}; legal range [${lo}, ${hi===Infinity?'∞':hi}]`}));c.addEventListener('pointerdown',drag);c.addEventListener('mousedown',drag);c.addEventListener('dblclick',removeAt);svg.append(c)})});
+ trace.steps.forEach((s,i)=>svg.insertAdjacentHTML('beforeend',`<text class="axis" x="${point(i,'arrival',max)[0]-4}" y="390">${s.t}</text>`)); renderBelief(); renderEvent(); renderNetwork(); drawBeliefPlot(); }
+function drag(e){if(e.type==='mousedown'&&e.pointerType)return;const h=e.currentTarget,i=+h.dataset.i,key=h.dataset.key,pointer=e.type==='pointerdown';if(pointer)h.setPointerCapture(e.pointerId);const move=ev=>{const r=svg.getBoundingClientRect(),y=Math.max(60,Math.min(360,(ev.clientY-r.top)*420/r.height)),max=Math.max(1,...trace.steps.flatMap(s=>[s.arrival,s.service,s.loss]))*1.25,wanted=Math.round(((360-y)*max/300)*10)/10;
+ // A drag is a local edit: model projection may couple fields at t=i, but it
+ // never gets permission to alter any displayed field at another timestep.
+ const frozen=trace.steps.map(s=>({arrival:s.arrival,service:s.service,loss:s.loss})),result=project(i,key,wanted);
+ frozen.forEach((v,n)=>{if(n!==i)Object.assign(trace.steps[n],v)});selected=i;
+ document.querySelector('#constraint').textContent=`${key} requested ${wanted}; ${result.changed.length?'also adjusted '+result.changed.join(', '):'no coupled adjustment needed'}.`;document.querySelector('#reason').textContent=result.reasons.join(' · ');refreshPlot()};const up=ev=>{if(pointer)h.releasePointerCapture(e.pointerId);window.removeEventListener(pointer?'pointermove':'mousemove',move);window.removeEventListener(pointer?'pointerup':'mouseup',up);draw()};window.addEventListener(pointer?'pointermove':'mousemove',move);window.addEventListener(pointer?'pointerup':'mouseup',up)}
+function addAt(e){const r=svg.getBoundingClientRect(),x=(e.clientX-r.left)*760/r.width,slot=Math.max(1,Math.min(trace.steps.length-1,Math.round((x-52)/(680/(trace.steps.length-1)))));const a=trace.steps[slot-1],b=trace.steps[slot],mid=k=>(a[k]+b[k])/2;trace.steps.splice(slot,0,{t:(a.t+b.t)/2,arrival:mid('arrival'),service:mid('service'),loss:mid('loss')});selected=slot;document.querySelector('#constraint').textContent='Added an interpolated timestep.';draw()}
+function removeAt(e){e.stopPropagation();const i=+e.currentTarget.dataset.i;if(i===0||i===trace.steps.length-1){document.querySelector('#constraint').textContent='Endpoints stay fixed; only interior timesteps can be removed.';return}trace.steps.splice(i,1);selected=Math.max(0,i-1);document.querySelector('#constraint').textContent='Removed timestep.';draw()}
+async function evaluate(){return trace.beliefs?.[model.value]||null}
+async function renderBelief(){const out=document.querySelector('#belief'), name=model.value,b=await evaluate();out.innerHTML=`<div class="belief"><h3>${name||'No model selected'}</h3>${b?['capacity','buffer','queue'].filter(k=>b[k]).map(k=>`<div class="range"><span>${k}</span><strong>[${b[k][0]}, ${b[k][1]}]</strong></div>`).join(''):'<div class="status">No QE belief was recorded for this model in the loaded trace.</div>'}<p class="status">recorded QE belief</p></div>`}
+async function drawBeliefPlot(){
+ const ctx=beliefCanvas.getContext('2d'),w=beliefCanvas.width,h=beliefCanvas.height;
+ ctx.clearRect(0,0,w,h);ctx.fillStyle='#12191f';ctx.fillRect(0,0,w,h);
+ if(model.value!=='cbrdelay'){ctx.fillStyle='#9db0bd';ctx.font='14px system-ui';ctx.fillText('Select cbrdelay to inspect its belief geometry.',30,42);document.querySelector('#belief-plot-note').textContent='The first belief explorer intentionally supports only cbrdelay.';return}
+ let points;try{points=await sampleCbrdelayBelief(trace.steps,10)}catch(e){ctx.fillStyle='#ff8d82';ctx.font='14px system-ui';ctx.fillText(e.message,30,42);document.querySelector('#belief-plot-note').textContent='Start the separate CBR QE bridge to plot this belief set.';return}
+ const cRange=[Math.min(...points.map(p=>p[0])),Math.max(...points.map(p=>p[0]))],bRange=[Math.min(...points.map(p=>p[1])),Math.max(...points.map(p=>p[1]))],qRange=[Math.min(...points.map(p=>p[2])),Math.max(...points.map(p=>p[2]))];
+ const origin=[210,278],project=(C,B,Q)=>[origin[0]+270*(C-cRange[0])/Math.max(EPS,cRange[1]-cRange[0])-120*(B-bRange[0])/Math.max(EPS,bRange[1]-bRange[0]),origin[1]-105*(B-bRange[0])/Math.max(EPS,bRange[1]-bRange[0])-205*(Q-qRange[0])/Math.max(EPS,qRange[1]-qRange[0])];
+ const axis=(to,label)=>{ctx.strokeStyle='#60717e';ctx.lineWidth=1.5;ctx.beginPath();ctx.moveTo(...origin);ctx.lineTo(...to);ctx.stroke();ctx.fillStyle='#9db0bd';ctx.font='12px system-ui';ctx.fillText(label,to[0]+6,to[1]+4)};
+ axis(project(cRange[1],bRange[0],qRange[0]),'C');axis(project(cRange[0],bRange[1],qRange[0]),'B');axis(project(cRange[0],bRange[0],qRange[1]),'Q');
+ for(const [C,B,Q] of points){const[x,y]=project(C,B,Q);ctx.fillStyle=`hsla(${190+90*Q/Math.max(EPS,qRange[1])},75%,62%,.72)`;ctx.fillRect(x-2,y-2,4,4)}
+ ctx.fillStyle='#e8edf2';ctx.font='13px system-ui';ctx.fillText(`CBR delay QE samples (trace length ${trace.steps.length})`,18,24);document.querySelector('#belief-plot-note').textContent=`${points.length} sequential conditional-QE samples: C, then B | C, then Q | C,B.`;
+}
+function renderEvent(){const ev=(trace.events||[]).find(e=>e.t===trace.steps[selected]?.t);document.querySelector('#event').textContent=ev?JSON.stringify(ev,null,2):JSON.stringify(trace.steps[selected],null,2)}
+function renderNetwork(){
+ const s=trace.steps[selected],b=Math.max(0,+buffer.value||0),st=localState(selected),q=st.queue,ratio=b?Math.min(1,q/b):0,bursty=model.value.includes('bursty'),left=bursty?170:35,fill=ratio*112,linkX=left+210,delayX=linkX+62;
+ const pert=bursty?`<rect x="20" y="40" width="110" height="90" rx="8" fill="#28323b" stroke="#ffd166"/><text x="38" y="68" fill="#e8edf2">perturbation</text><text x="33" y="92" fill="#9db0bd">holds 0…K</text><text x="43" y="112" fill="#9db0bd">K=${(+k.value).toFixed(1)}</text><path d="M130 85H${left}" stroke="#9db0bd" stroke-width="2" marker-end="url(#arrow)"/>`:'';
+ document.querySelector('#network').innerHTML=`<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8" fill="#9db0bd"/></marker></defs>${pert}<text x="${left-2}" y="23" fill="#9db0bd">A=${s.arrival.toFixed(1)}</text><rect x="${left}" y="35" width="150" height="100" rx="8" fill="#28323b" stroke="#55d6be"/><rect x="${left+18}" y="106" width="112" height="14" rx="4" fill="#101418"/><rect x="${left+18}" y="106" width="${fill}" height="14" rx="4" fill="${q>b?'#ff8d82':'#55d6be'}"/><text x="${left+48}" y="64" fill="#e8edf2">queue</text><text x="${left+25}" y="87" fill="#e8edf2">${q.toFixed(1)} / B=${b.toFixed(1)}</text><text x="${left+20}" y="151" fill="${q>b?'#ff8d82':'#55d6be'}">${q>b?'overflow → loss':'fits in buffer'}</text><path d="M${left+150} 85H${linkX-45}" stroke="#9db0bd" stroke-width="2" marker-end="url(#arrow)"/><circle cx="${linkX}" cy="85" r="45" fill="#28323b" stroke="#7ca7ff" stroke-width="2"/><text x="${linkX-14}" y="80" fill="#e8edf2">Link</text><text x="${linkX-23}" y="101" fill="#9db0bd">C=${(+capacity.value).toFixed(1)}</text><path d="M${linkX+45} 85H${delayX}" stroke="#9db0bd" stroke-width="2" marker-end="url(#arrow)"/><rect x="${delayX}" y="40" width="190" height="90" rx="8" fill="#28323b" stroke="#ffd166"/><text x="${delayX+57}" y="73" fill="#e8edf2">Delay box</text><text x="${delayX+16}" y="103" fill="#9db0bd">Service must be within ${st.minService.toFixed(1)} and ${st.maxService.toFixed(1)}</text>`;
+ document.querySelector('#reason').textContent=`Queue residual: A − L − I = ${q.toFixed(1)}; B = ${b.toFixed(1)}. ${q>b+EPS?'The overflow implication requires loss.':'No overflow: the implication carries prior loss forward.'} Delay is nondeterministic within 0…1 RTT, not always exactly 1.`;
+}
+model.addEventListener('change',()=>{renderBelief();renderEvent();renderNetwork();drawBeliefPlot()});buffer.addEventListener('input',()=>{project(selected,'service',trace.steps[selected].service);draw()});capacity.addEventListener('input',()=>{project(selected,'service',trace.steps[selected].service);draw()});k.addEventListener('input',renderNetwork);document.querySelector('#add').onclick=()=>{const p=trace.steps.at(-1),t=p.t+1;trace.steps.push({t,arrival:p.arrival+10,service:p.service+8,loss:p.loss});selected=trace.steps.length-1;draw()};document.querySelector('#reset').onclick=()=>{trace=structuredClone(example);selected=0;refreshMenu();draw()};document.querySelector('#file').onchange=async e=>{try{trace=JSON.parse(await e.target.files[0].text());selected=0;refreshMenu();draw()}catch(err){alert('Could not parse Syntra trace JSON: '+err.message)}};refreshMenu();draw();
+</script>
+</html>
