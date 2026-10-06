@@ -72,8 +72,20 @@ where
         match (self.end, other.end) {
             (Bound::Included(e1), Bound::Included(e2)) => e1.cmp(&e2),
             (Bound::Excluded(e1), Bound::Excluded(e2)) => e1.cmp(&e2),
-            (Bound::Included(e1), Bound::Excluded(e2)) => if e1 == e2 {std::cmp::Ordering::Greater} else {e1.cmp(&e2)},
-            (Bound::Excluded(e1), Bound::Included(e2)) => if e1 == e2 {std::cmp::Ordering::Less} else {e1.cmp(&e2)},
+            (Bound::Included(e1), Bound::Excluded(e2)) => {
+                if e1 == e2 {
+                    std::cmp::Ordering::Greater
+                } else {
+                    e1.cmp(&e2)
+                }
+            }
+            (Bound::Excluded(e1), Bound::Included(e2)) => {
+                if e1 == e2 {
+                    std::cmp::Ordering::Less
+                } else {
+                    e1.cmp(&e2)
+                }
+            }
             (Bound::Unbounded, Bound::Unbounded) => std::cmp::Ordering::Equal,
             (Bound::Unbounded, _) => std::cmp::Ordering::Greater,
             (_, Bound::Unbounded) => std::cmp::Ordering::Less,
@@ -86,7 +98,8 @@ where
 
         // ^^ Effectively there should be a non-empty interval if we swap the
         // starts and ends between self and other.
-        Interval::is_non_empty(self.start, other.end) && Interval::is_non_empty(other.start, self.end)
+        Interval::is_non_empty(self.start, other.end)
+            && Interval::is_non_empty(other.start, self.end)
     }
 
     pub fn intersection(&self, other: &Self) -> Option<Self> {
@@ -98,8 +111,20 @@ where
         let start = match (self.start, other.start) {
             (Bound::Included(s1), Bound::Included(s2)) => Bound::Included(std::cmp::max(s1, s2)),
             (Bound::Excluded(s1), Bound::Excluded(s2)) => Bound::Excluded(std::cmp::max(s1, s2)),
-            (Bound::Included(s1), Bound::Excluded(s2)) => if s2 >= s1 {Bound::Excluded(s2)} else {Bound::Included(s1)},
-            (Bound::Excluded(s1), Bound::Included(s2)) => if s1 >= s2 {Bound::Excluded(s1)} else {Bound::Included(s2)},
+            (Bound::Included(s1), Bound::Excluded(s2)) => {
+                if s2 >= s1 {
+                    Bound::Excluded(s2)
+                } else {
+                    Bound::Included(s1)
+                }
+            }
+            (Bound::Excluded(s1), Bound::Included(s2)) => {
+                if s1 >= s2 {
+                    Bound::Excluded(s1)
+                } else {
+                    Bound::Included(s2)
+                }
+            }
             (Bound::Unbounded, _) => other.start,
             (_, Bound::Unbounded) => self.start,
         };
@@ -108,8 +133,20 @@ where
         let end = match (self.end, other.end) {
             (Bound::Included(e1), Bound::Included(e2)) => Bound::Included(std::cmp::min(e1, e2)),
             (Bound::Excluded(e1), Bound::Excluded(e2)) => Bound::Excluded(std::cmp::min(e1, e2)),
-            (Bound::Included(e1), Bound::Excluded(e2)) => if e2 <= e1 {Bound::Excluded(e2)} else {Bound::Included(e1)},
-            (Bound::Excluded(e1), Bound::Included(e2)) => if e1 <= e2 {Bound::Excluded(e1)} else {Bound::Included(e2)},
+            (Bound::Included(e1), Bound::Excluded(e2)) => {
+                if e2 <= e1 {
+                    Bound::Excluded(e2)
+                } else {
+                    Bound::Included(e1)
+                }
+            }
+            (Bound::Excluded(e1), Bound::Included(e2)) => {
+                if e1 <= e2 {
+                    Bound::Excluded(e1)
+                } else {
+                    Bound::Included(e2)
+                }
+            }
             (Bound::Unbounded, _) => other.end,
             (_, Bound::Unbounded) => self.end,
         };
@@ -119,22 +156,24 @@ where
     pub fn union_if_mergable(&self, other: &Self) -> Option<Self> {
         let mut mergable: bool = self.overlaps_with(other);
         // Can merge even if intervals don't overlap, e.g., (1, 2), [2, 3] -> (1, 3]
-        mergable = mergable || match (self.start, other.end) {
-            (Bound::Included(s1), Bound::Included(e2)) => s1 == e2,
-            (Bound::Excluded(s1), Bound::Included(e2)) => s1 == e2,
-            (Bound::Included(s1), Bound::Excluded(e2)) => s1 == e2,
-            (Bound::Excluded(_), Bound::Excluded(_)) => false,
-            (Bound::Unbounded, _) => false,
-            (_, Bound::Unbounded) => false,
-        };
-        mergable = mergable || match (other.start, self.end) {
-            (Bound::Included(s2), Bound::Included(e1)) => s2 == e1,
-            (Bound::Excluded(s2), Bound::Included(e1)) => s2 == e1,
-            (Bound::Included(s2), Bound::Excluded(e1)) => s2 == e1,
-            (Bound::Excluded(_), Bound::Excluded(_)) => false,
-            (Bound::Unbounded, _) => false,
-            (_, Bound::Unbounded) => false,
-        };
+        mergable = mergable
+            || match (self.start, other.end) {
+                (Bound::Included(s1), Bound::Included(e2)) => s1 == e2,
+                (Bound::Excluded(s1), Bound::Included(e2)) => s1 == e2,
+                (Bound::Included(s1), Bound::Excluded(e2)) => s1 == e2,
+                (Bound::Excluded(_), Bound::Excluded(_)) => false,
+                (Bound::Unbounded, _) => false,
+                (_, Bound::Unbounded) => false,
+            };
+        mergable = mergable
+            || match (other.start, self.end) {
+                (Bound::Included(s2), Bound::Included(e1)) => s2 == e1,
+                (Bound::Excluded(s2), Bound::Included(e1)) => s2 == e1,
+                (Bound::Included(s2), Bound::Excluded(e1)) => s2 == e1,
+                (Bound::Excluded(_), Bound::Excluded(_)) => false,
+                (Bound::Unbounded, _) => false,
+                (_, Bound::Unbounded) => false,
+            };
         if !mergable {
             return None;
         }
@@ -143,8 +182,20 @@ where
         let start = match (self.start, other.start) {
             (Bound::Included(s1), Bound::Included(s2)) => Bound::Included(std::cmp::min(s1, s2)),
             (Bound::Excluded(s1), Bound::Excluded(s2)) => Bound::Excluded(std::cmp::min(s1, s2)),
-            (Bound::Included(s1), Bound::Excluded(s2)) => if s1 <= s2 {Bound::Included(s1)} else {Bound::Excluded(s2)},
-            (Bound::Excluded(s1), Bound::Included(s2)) => if s2 <= s1 {Bound::Included(s2)} else {Bound::Excluded(s1)},
+            (Bound::Included(s1), Bound::Excluded(s2)) => {
+                if s1 <= s2 {
+                    Bound::Included(s1)
+                } else {
+                    Bound::Excluded(s2)
+                }
+            }
+            (Bound::Excluded(s1), Bound::Included(s2)) => {
+                if s2 <= s1 {
+                    Bound::Included(s2)
+                } else {
+                    Bound::Excluded(s1)
+                }
+            }
             (Bound::Unbounded, _) => Bound::Unbounded,
             (_, Bound::Unbounded) => Bound::Unbounded,
         };
@@ -153,8 +204,20 @@ where
         let end = match (self.end, other.end) {
             (Bound::Included(e1), Bound::Included(e2)) => Bound::Included(std::cmp::max(e1, e2)),
             (Bound::Excluded(e1), Bound::Excluded(e2)) => Bound::Excluded(std::cmp::max(e1, e2)),
-            (Bound::Included(e1), Bound::Excluded(e2)) => if e1 >= e2 {Bound::Included(e1)} else {Bound::Excluded(e2)},
-            (Bound::Excluded(e1), Bound::Included(e2)) => if e2 >= e1 {Bound::Included(e2)} else {Bound::Excluded(e1)},
+            (Bound::Included(e1), Bound::Excluded(e2)) => {
+                if e1 >= e2 {
+                    Bound::Included(e1)
+                } else {
+                    Bound::Excluded(e2)
+                }
+            }
+            (Bound::Excluded(e1), Bound::Included(e2)) => {
+                if e2 >= e1 {
+                    Bound::Included(e2)
+                } else {
+                    Bound::Excluded(e1)
+                }
+            }
             (Bound::Unbounded, _) => Bound::Unbounded,
             (_, Bound::Unbounded) => Bound::Unbounded,
         };
@@ -189,10 +252,34 @@ where
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         match (self.start, other.start) {
-            (Bound::Included(s1), Bound::Included(s2)) => if s1 == s2 {self.compare_ends(other)} else {s1.cmp(&s2)},
-            (Bound::Excluded(s1), Bound::Excluded(s2)) => if s1 == s2 {self.compare_ends(other)} else {s1.cmp(&s2)},
-            (Bound::Included(s1), Bound::Excluded(s2)) => if s1 == s2 {std::cmp::Ordering::Less} else {s1.cmp(&s2)},
-            (Bound::Excluded(s1), Bound::Included(s2)) => if s1 == s2 {std::cmp::Ordering::Greater} else {s1.cmp(&s2)},
+            (Bound::Included(s1), Bound::Included(s2)) => {
+                if s1 == s2 {
+                    self.compare_ends(other)
+                } else {
+                    s1.cmp(&s2)
+                }
+            }
+            (Bound::Excluded(s1), Bound::Excluded(s2)) => {
+                if s1 == s2 {
+                    self.compare_ends(other)
+                } else {
+                    s1.cmp(&s2)
+                }
+            }
+            (Bound::Included(s1), Bound::Excluded(s2)) => {
+                if s1 == s2 {
+                    std::cmp::Ordering::Less
+                } else {
+                    s1.cmp(&s2)
+                }
+            }
+            (Bound::Excluded(s1), Bound::Included(s2)) => {
+                if s1 == s2 {
+                    std::cmp::Ordering::Greater
+                } else {
+                    s1.cmp(&s2)
+                }
+            }
             (Bound::Unbounded, Bound::Unbounded) => self.compare_ends(other),
             (Bound::Unbounded, _) => std::cmp::Ordering::Less,
             (_, Bound::Unbounded) => std::cmp::Ordering::Greater,
@@ -206,7 +293,6 @@ where
     T: Ord + Clone + Copy,
 {
     intervals: Vec<Interval<T>>,
-
     // [(None, None)] is universal set.
     // [] is empty set.
 }
@@ -223,9 +309,7 @@ where
     }
 
     pub fn new_raw(intervals: Vec<Interval<T>>) -> Self {
-        IntervalList {
-            intervals,
-        }
+        IntervalList { intervals }
     }
 
     pub fn from_interval_lists(interval_lists: Vec<IntervalList<T>>) -> Self {
@@ -363,10 +447,26 @@ where
             // Increment the pointer that points to the interval having smaller
             // end.
             let min_end = match (interval1.end, interval2.end) {
-                (Bound::Included(e1), Bound::Included(e2)) => Bound::Included(std::cmp::min(e1, e2)),
-                (Bound::Excluded(e1), Bound::Excluded(e2)) => Bound::Excluded(std::cmp::min(e1, e2)),
-                (Bound::Included(e1), Bound::Excluded(e2)) => if e2 <= e1 {Bound::Excluded(e2)} else {Bound::Included(e1)},
-                (Bound::Excluded(e1), Bound::Included(e2)) => if e1 <= e2 {Bound::Excluded(e1)} else {Bound::Included(e2)},
+                (Bound::Included(e1), Bound::Included(e2)) => {
+                    Bound::Included(std::cmp::min(e1, e2))
+                }
+                (Bound::Excluded(e1), Bound::Excluded(e2)) => {
+                    Bound::Excluded(std::cmp::min(e1, e2))
+                }
+                (Bound::Included(e1), Bound::Excluded(e2)) => {
+                    if e2 <= e1 {
+                        Bound::Excluded(e2)
+                    } else {
+                        Bound::Included(e1)
+                    }
+                }
+                (Bound::Excluded(e1), Bound::Included(e2)) => {
+                    if e1 <= e2 {
+                        Bound::Excluded(e1)
+                    } else {
+                        Bound::Included(e2)
+                    }
+                }
                 (Bound::Unbounded, _) => interval2.end,
                 (_, Bound::Unbounded) => interval1.end,
             };
@@ -441,55 +541,60 @@ mod tests {
             Interval::interval_bounded(Bound::Included(2), Bound::Included(3)),
             Interval::interval_bounded(Bound::Excluded(5), Bound::Included(6)),
         ]);
-        let c = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Included(2), Bound::Included(2)),
-        ]);
+        let c = IntervalList::new(vec![Interval::interval_bounded(
+            Bound::Included(2),
+            Bound::Included(2),
+        )]);
         assert_eq!(a.intersection(&b), c);
         assert_eq!(b.intersection(&a), c);
     }
 
     #[test]
     fn test_intersection_2() {
-        let a = IntervalList::new(vec![
-            Interval::interval_upper(Bound::Included(Rational64::new(21, 4)))
-        ]);
+        let a = IntervalList::new(vec![Interval::interval_upper(Bound::Included(
+            Rational64::new(21, 4),
+        ))]);
         let b = IntervalList::new(vec![
             Interval::interval_upper(Bound::Excluded(Rational64::new(21, 4))),
-            Interval::interval_lower(Bound::Included(Rational64::new(23119, 4096)))
+            Interval::interval_lower(Bound::Included(Rational64::new(23119, 4096))),
         ]);
-        let c = IntervalList::new(vec![
-            Interval::interval_upper(Bound::Excluded(Rational64::new(21, 4)))
-        ]);
+        let c = IntervalList::new(vec![Interval::interval_upper(Bound::Excluded(
+            Rational64::new(21, 4),
+        ))]);
         assert_eq!(a.intersection(&b), c);
         assert_eq!(b.intersection(&a), c);
     }
 
     #[test]
     fn test_intersection_3() {
-        let a = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Included(Rational64::new(0, 1)), Bound::Excluded(Rational64::new(60, 7)))
-        ]);
-        let b = IntervalList::new(vec![
-            Interval::interval_upper(Bound::Included(Rational64::new(10, 1)))
-        ]);
-        let c = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Included(Rational64::new(0, 1)), Bound::Excluded(Rational64::new(60, 7)))
-        ]);
+        let a = IntervalList::new(vec![Interval::interval_bounded(
+            Bound::Included(Rational64::new(0, 1)),
+            Bound::Excluded(Rational64::new(60, 7)),
+        )]);
+        let b = IntervalList::new(vec![Interval::interval_upper(Bound::Included(
+            Rational64::new(10, 1),
+        ))]);
+        let c = IntervalList::new(vec![Interval::interval_bounded(
+            Bound::Included(Rational64::new(0, 1)),
+            Bound::Excluded(Rational64::new(60, 7)),
+        )]);
         assert_eq!(a.intersection(&b), c);
         assert_eq!(b.intersection(&a), c);
     }
 
     #[test]
     fn test_intersection_bounded_unbounded() {
-        let a = IntervalList::new(vec![
-            Interval::interval_lower(Bound::Included(Rational64::new(5, 1)))
-        ]);
-        let b = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Included(Rational64::new(0, 1)), Bound::Excluded(Rational64::new(1000, 1)))
-        ]);
-        let c = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Included(Rational64::new(5, 1)), Bound::Excluded(Rational64::new(1000, 1)))
-        ]);
+        let a = IntervalList::new(vec![Interval::interval_lower(Bound::Included(
+            Rational64::new(5, 1),
+        ))]);
+        let b = IntervalList::new(vec![Interval::interval_bounded(
+            Bound::Included(Rational64::new(0, 1)),
+            Bound::Excluded(Rational64::new(1000, 1)),
+        )]);
+        let c = IntervalList::new(vec![Interval::interval_bounded(
+            Bound::Included(Rational64::new(5, 1)),
+            Bound::Excluded(Rational64::new(1000, 1)),
+        )]);
         assert_eq!(a.intersection(&b), c);
         assert_eq!(b.intersection(&a), c);
     }
@@ -501,15 +606,24 @@ mod tests {
             Interval::interval_bounded(Bound::Included(4), Bound::Included(5)),
         ]);
         let b = Interval::interval_bounded(Bound::Included(2), Bound::Included(3));
-        let c = IntervalList::new(vec![Interval::interval_bounded(Bound::Included(2), Bound::Included(2))]);
+        let c = IntervalList::new(vec![Interval::interval_bounded(
+            Bound::Included(2),
+            Bound::Included(2),
+        )]);
         assert_eq!(a.intersect_interval(&b), c);
     }
 
     #[test]
     fn test_sort_merge() {
         let a = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Excluded(Rational64::new(1, 2)), Bound::Excluded(Rational64::new(5, 1))),
-            Interval::interval_bounded(Bound::Included(Rational64::new(0, 1)), Bound::Included(Rational64::new(3, 1))),
+            Interval::interval_bounded(
+                Bound::Excluded(Rational64::new(1, 2)),
+                Bound::Excluded(Rational64::new(5, 1)),
+            ),
+            Interval::interval_bounded(
+                Bound::Included(Rational64::new(0, 1)),
+                Bound::Included(Rational64::new(3, 1)),
+            ),
         ]);
         assert_eq!(
             a.intervals,
@@ -527,7 +641,10 @@ mod tests {
             Interval::interval_lower(Bound::Excluded(Rational64::new(5, 1))),
         ]);
         let b = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Excluded(Rational64::new(-1, 1)), Bound::Included(Rational64::new(2, 1))),
+            Interval::interval_bounded(
+                Bound::Excluded(Rational64::new(-1, 1)),
+                Bound::Included(Rational64::new(2, 1)),
+            ),
             Interval::interval_lower(Bound::Included(Rational64::new(6, 1))),
         ]);
         let c = IntervalList::new(vec![
@@ -546,11 +663,17 @@ mod tests {
             Interval::interval_lower(Bound::Excluded(Rational64::new(5, 1))),
         ]);
         let b = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Excluded(Rational64::new(-1, 1)), Bound::Included(Rational64::new(2, 1))),
+            Interval::interval_bounded(
+                Bound::Excluded(Rational64::new(-1, 1)),
+                Bound::Included(Rational64::new(2, 1)),
+            ),
             Interval::interval_lower(Bound::Included(Rational64::new(6, 1))),
         ]);
         let c = IntervalList::new(vec![
-            Interval::interval_bounded(Bound::Excluded(Rational64::new(-1, 1)), Bound::Included(Rational64::new(1, 2))),
+            Interval::interval_bounded(
+                Bound::Excluded(Rational64::new(-1, 1)),
+                Bound::Included(Rational64::new(1, 2)),
+            ),
             Interval::interval_lower(Bound::Included(Rational64::new(6, 1))),
         ]);
         assert_eq!(a.intersection(&b), c);
@@ -561,7 +684,10 @@ mod tests {
     fn test_sort_merge_unbounded() {
         let a = IntervalList::new(vec![
             Interval::interval_lower(Bound::Excluded(Rational64::new(10, 1))),
-            Interval::interval_bounded(Bound::Excluded(Rational64::new(3, 1)), Bound::Excluded(Rational64::new(6, 1))),
+            Interval::interval_bounded(
+                Bound::Excluded(Rational64::new(3, 1)),
+                Bound::Excluded(Rational64::new(6, 1)),
+            ),
             Interval::interval_upper(Bound::Excluded(Rational64::new(5, 1))),
             Interval::interval_upper(Bound::Excluded(Rational64::new(1, 2))),
         ]);

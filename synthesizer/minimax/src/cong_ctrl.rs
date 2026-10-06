@@ -1,27 +1,28 @@
-use circular_buffer::CircularBuffer;
 use clap::Parser;
 use env_logger::Env;
 use itertools::Itertools;
-use log::{debug, info};
+use log::{debug, info, warn};
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::path::Path;
 use std::rc::{Rc, Weak};
-use lazy_static::lazy_static;
 
 use cc_common::*;
 use minimax::State;
 // use network_model_z3::NetworkModelZ3;
-use network_model_nc::NetworkModelNC;
 use ds::tree::Tree;
 use ds::*;
+use network_model_nc::NetworkModelNC;
 
 mod cbrdelay_cca_config;
-use cbrdelay_cca_config::{CandidateAction, APP_IS_BACKLOGGED, APP_SEND_CHOICES, CANDIDATE_ACTIONS, OBJECTIVE_ORDER, SEARCH_DEPTH};
+use cbrdelay_cca_config::{
+    state_policy, CandidateAction, InconsistentQeWindows, StatePolicy, StateQuantities, APP_IS_BACKLOGGED,
+    APP_SEND_CHOICES, CANDIDATE_ACTIONS, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH,
+};
 
 // ------------------------------------------------------------------------------------------
 // Minimax move
@@ -74,24 +75,8 @@ enum CCValue {
     Value {
         belief_bounds: BeliefBounds,
         metrics: Metrics,
+        objective_order: u128,
     },
-}
-
-// const DEFAULT_PERMUTATION: &[&str] = &[
-//     "c", "b", "ld", "s", "qdel", "sc", "sb", "sclmul", "scladd", "schmul", "schadd", "ttsc",
-// ];
-lazy_static! {
-    static ref OBJ_PERMUTATION: Vec<String> = {
-        let args = Args::parse();
-        let mut ret: Vec<String> = args.obj_perm.clone();
-        let set: HashSet<String> = ret.iter().map(|x| x.into()).collect();
-        for p in OBJECTIVE_ORDER.iter() {
-            if !set.contains(*p) {
-                ret.push(p.to_string());
-            }
-        }
-        ret
-    };
 }
 
 impl CCValue {
@@ -108,17 +93,19 @@ impl CCValue {
     // }
 
     fn cmp_entry_point(&self, other: &Self) -> Option<Ordering> {
-        let (b1, m1) = match self {
+        let (b1, m1, objective_order) = match self {
             CCValue::Value {
                 belief_bounds,
                 metrics,
-            } => (belief_bounds, metrics),
+                objective_order,
+            } => (belief_bounds, metrics, objective_order),
             _ => panic!("Should not be here"),
         };
         let (b2, m2) = match other {
             CCValue::Value {
                 belief_bounds,
                 metrics,
+                ..
             } => (belief_bounds, metrics),
             _ => panic!("Should not be here"),
         };
@@ -138,6 +125,7 @@ impl CCValue {
 
         let s = m1.neg_delivered.partial_cmp(&m2.neg_delivered);
         let ld = m1.loss.partial_cmp(&m2.loss);
+        let l = m1.total_loss.partial_cmp(&m2.total_loss);
         let qdel = m1.qdel.partial_cmp(&m2.qdel);
         let ttsc = m1.time_to_shrink_c.partial_cmp(&m2.time_to_shrink_c);
         let ttscl = m1.time_to_shrink_c_l.partial_cmp(&m2.time_to_shrink_c_l);
@@ -145,38 +133,51 @@ impl CCValue {
         let ttc = m1.time_to_c.partial_cmp(&m2.time_to_c);
         let cb = m2.minc_minb_sum.partial_cmp(&m1.minc_minb_sum);
         let ttcb = m1.time_to_c_b.partial_cmp(&m2.time_to_c_b);
-        let ttscbadd = m1.time_to_shrink_minc_minb_add.partial_cmp(&m2.time_to_shrink_minc_minb_add);
+        let ttscbadd = m1
+            .time_to_shrink_minc_minb_add
+            .partial_cmp(&m2.time_to_shrink_minc_minb_add);
         let scb = m2.shrink_minc_minb.partial_cmp(&m1.shrink_minc_minb);
 
-        let mut dict = HashMap::new();
-        dict.insert("c", c);
-        dict.insert("b", b);
-        dict.insert("sc", sc);
-        dict.insert("sb", sb);
-        dict.insert("s", s);
-        dict.insert("ld", ld);
-        dict.insert("qdel", qdel);
-        dict.insert("schmul", schmul);
-        dict.insert("schadd", schadd);
-        dict.insert("sclmul", sclmul);
-        dict.insert("scladd", scladd);
-        dict.insert("ttsc", ttsc);
-        dict.insert("lt", lt);
-        dict.insert("ttc", ttc);
-        dict.insert("ttscl", ttscl);
-        dict.insert("cb", cb);
-        dict.insert("ttcb", ttcb);
-        dict.insert("ttscbadd", ttscbadd);
-        dict.insert("scb", scb);
-
-        for p in OBJ_PERMUTATION.iter() {
-            let r = dict[p.as_str()];
+        let comparisons = [
+            c, b, sc, sb, s, ld, l, qdel, schmul, schadd, sclmul, scladd, ttsc, lt, ttc, ttscl,
+            cb, ttcb, ttscbadd, scb,
+        ];
+        for idx in decode_objective_order(*objective_order) {
+            let r = comparisons[idx];
             if r.is_some() && r.unwrap() != Ordering::Equal {
                 return r;
             }
         }
         None
     }
+}
+
+const OBJECTIVE_NAMES: [&str; 20] = [
+    "c", "b", "sc", "sb", "s", "ld", "l", "qdel", "schmul", "schadd", "sclmul", "scladd", "ttsc", "lt",
+    "ttc", "ttscl", "cb", "ttcb", "ttscbadd", "scb",
+];
+
+/// Compact, `Copy` representation required by the generic minimax value API.
+/// Each five-bit entry is an index into `OBJECTIVE_NAMES`; 31 terminates it.
+fn encode_objective_order(names: &[String]) -> u128 {
+    assert!(names.len() <= OBJECTIVE_NAMES.len());
+    names
+        .iter()
+        .enumerate()
+        .fold(0u128, |code, (position, name)| {
+            let index = OBJECTIVE_NAMES
+                .iter()
+                .position(|known| *known == name)
+                .unwrap_or_else(|| panic!("unknown CCA objective: {name}"));
+            code | ((index as u128) << (position * 5))
+        })
+        | (31u128 << (names.len() * 5))
+}
+
+fn decode_objective_order(code: u128) -> impl Iterator<Item = usize> {
+    (0..OBJECTIVE_NAMES.len())
+        .map(move |position| ((code >> (position * 5)) & 31) as usize)
+        .take_while(|index| *index != 31)
 }
 
 impl minimax::Value for CCValue {
@@ -224,7 +225,9 @@ struct CongCtrlState<NM: NetworkModel> {
     network_model: NM, // NetworkModelType<'a>,
 
     // Simulation
-    history: CircularBuffer<HISTORY_SIZE, NM::O>,
+    /// All committed observations.  QE calls below take bounded windows from
+    /// this sequence, so retaining it does not increase QE formula size.
+    history: Vec<NM::O>,
     belief_bounds: BeliefBounds, // at the end of ^^ history.
 
     // Speculation
@@ -250,8 +253,7 @@ struct CongCtrlState<NM: NetworkModel> {
     disable_pre_enumeration: bool,
 
     // Config
-    loss_tolerance_abs: RealNumRep,
-    delay_tolerance_frac: RealNumRep,
+    policy: StatePolicy,
 
     n_nodes_explored: u32,
 
@@ -296,6 +298,7 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
             metrics: self.compute_metrics(),
             // self.belief_bounds_stack.last().unwrap().clone(),
             belief_bounds: *latest,
+            objective_order: encode_objective_order(&self.policy.objective_order),
             // Deepen tree may query for a value after CCA move.
             // TODO: update it to only query on even moves.
             // Basically just explore even depths.
@@ -321,7 +324,9 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
             }
             CCMove::Network(n) => {
                 let last = self.get_last_history_item();
-                let observation = self.network_model.compute_observation(last, n, &self.move_cca);
+                let observation = self
+                    .network_model
+                    .compute_observation(last, n, &self.move_cca);
 
                 self.move_cca = None;
                 self.history_stack.push(observation);
@@ -383,7 +388,7 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
         if self.recording_tree {
             let this = self.current.upgrade().unwrap();
             this.borrow_data_mut().chosen_move = m.clone();
-            this.borrow_data_mut().chosen_value = Some(*v);
+            this.borrow_data_mut().chosen_value = Some(v.clone());
         }
     }
 }
@@ -391,7 +396,7 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
 impl<NM: NetworkModel> CongCtrlState<NM> {
     fn init(&mut self) {
         for obs in self.network_model.get_initial_history() {
-            self.history.push_back(obs);
+            self.history.push(obs);
         }
     }
 
@@ -468,7 +473,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         assert!(self.move_choices_network_stack.len() == 1);
         assert!(self.move_choices_cca_stack.len() == 2);
 
-        self.history.push_back(self.history_stack.pop().unwrap());
+        self.history.push(self.history_stack.pop().unwrap());
         self.belief_bounds_stack.pop();
         self.move_choices_network_stack.pop();
         self.move_choices_cca_stack.pop();
@@ -477,7 +482,11 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 
     fn compute_metrics(&self) -> Metrics {
         let last = self.get_last_history_item();
-        let first = self.history.get(HISTORY_SIZE - 1).unwrap();
+        let first = self
+            .get_relevant_history(Some(self.policy.belief_history_observations))
+            .into_iter()
+            .next()
+            .expect("QE history must not be empty");
 
         let qmax1: usize = self.history.iter().map(|o| o.get_qdel()).max().unwrap();
         let qmax2: usize = self
@@ -503,9 +512,9 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let mut time_to_shrink_c_l = (HISTORY_SIZE + SPECULATION_SIZE + 1) as RealNumInt;
         for (idx, bb) in self.belief_bounds_stack.iter().enumerate() {
             //if bb.c_add_gap() < start.c_add_gap() {
-            // Need to check min_c is gradually increasing 
+            // Need to check min_c is gradually increasing
             if bb.min_c >= start.min_c + one * 2 {
-            //if bb.min_c > start.min_c {
+                //if bb.min_c > start.min_c {
                 time_to_shrink_c_l = idx as RealNumInt;
                 break;
             }
@@ -514,9 +523,9 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let mut time_to_shrink_c_h = (HISTORY_SIZE + SPECULATION_SIZE + 1) as RealNumInt;
         for (idx, bb) in self.belief_bounds_stack.iter().enumerate() {
             //if bb.c_add_gap() < start.c_add_gap() {
-            // Need to check min_c is gradually increasing 
+            // Need to check min_c is gradually increasing
             if bb.max_c < start.max_c {
-            //if bb.min_c > start.min_c {
+                //if bb.min_c > start.min_c {
                 time_to_shrink_c_h = idx as RealNumInt;
                 break;
             }
@@ -531,40 +540,65 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         }
 
         // This should be true when speculation size is of even size
-        let minc_minb_sum = self.network_model.compute_min_c_b_sum(&self.get_relevant_history(Some(HISTORY_SIZE)), &None).unwrap();
+        let minc_minb_sum = self
+            .network_model
+            .compute_min_c_b_sum(&self.get_relevant_history(Some(HISTORY_SIZE)), &None)
+            .unwrap();
         let mut time_to_c_b = (HISTORY_SIZE + SPECULATION_SIZE + 1) as RealNumInt;
-        let relevant_history = &self.get_relevant_history(Some(HISTORY_SIZE + self.history_stack.len()));
+        let relevant_history =
+            &self.get_relevant_history(Some(HISTORY_SIZE + self.history_stack.len()));
         for ptr in 0..=relevant_history.len().saturating_sub(HISTORY_SIZE) {
-            let rh = &relevant_history[ptr .. (ptr + HISTORY_SIZE)];
+            let rh = &relevant_history[ptr..(ptr + HISTORY_SIZE)];
             if self.network_model.compute_min_c_b_sum(rh, &None).unwrap() >= minc_minb_sum {
                 // `ptr == 0` is the current history, i.e. zero RTTs away.
                 time_to_c_b = ptr as RealNumInt;
                 break;
             }
         }
-        let start_minc_minb_sum = self.network_model.compute_min_c_b_sum(&relevant_history[0 .. HISTORY_SIZE], &None).unwrap();
+        let start_minc_minb_sum = self
+            .network_model
+            .compute_min_c_b_sum(&relevant_history[0..HISTORY_SIZE], &None)
+            .unwrap();
         let mut time_to_shrink_minc_minb_add = (HISTORY_SIZE + SPECULATION_SIZE + 1) as RealNumInt;
         for ptr in 0..=relevant_history.len().saturating_sub(HISTORY_SIZE) {
-            let rh = &relevant_history[ptr .. (ptr + HISTORY_SIZE)];
-            // Account for unsoundness during QE 
-            if self.network_model.compute_min_c_b_sum(rh, &None).unwrap() >= start_minc_minb_sum + self.loss_tolerance_abs * 1 - RealNumRep::new_raw(1, 1 << 4){
+            let rh = &relevant_history[ptr..(ptr + HISTORY_SIZE)];
+            // Account for unsoundness during QE
+            if self.network_model.compute_min_c_b_sum(rh, &None).unwrap()
+                >= start_minc_minb_sum + self.policy.loss_tolerance_abs
+                    - RealNumRep::new_raw(1, 1 << 4)
+            {
                 time_to_shrink_minc_minb_add = ptr as RealNumInt;
                 break;
             }
         }
 
         let steps = self.history.len() as RealNumInt + self.history_stack.len() as RealNumInt - 1;
-        
+
         //let steady_state = self.history.get(HISTORY_SIZE - 1).unwrap().get_ld() > 0.into();
-        let steady_state = self.history.get(HISTORY_SIZE - 1).unwrap().get_lo().last().unwrap().0 >= 2;
+        let steady_state = self
+            .history
+            .get(HISTORY_SIZE - 1)
+            .unwrap()
+            .get_lo()
+            .last()
+            .unwrap()
+            .0
+            >= 2;
         //let steady_state = self.belief_bounds.max_c < LARGEST_BW.into();
-        let loss_tol = if steady_state { (last.get_ld() - first.get_ld()) <= self.loss_tolerance_abs * 2} 
-            else { (last.get_ld() - first.get_ld()) <= self.loss_tolerance_abs};
-            
+        let loss_tol = if steady_state {
+            (last.get_ld() - first.get_ld()) <= self.policy.loss_tolerance_abs * 2
+        } else {
+            (last.get_ld() - first.get_ld()) <= self.policy.loss_tolerance_abs
+        };
+
         Metrics {
             neg_delivered: (first.get_s()) - (last.get_s()),
             qdel: std::cmp::max(0.into(), (qmax as i32 - 1).into()),
-            loss: std::cmp::max(0.into(), last.get_ld() - first.get_ld() - self.loss_tolerance_abs),
+            loss: std::cmp::max(
+                0.into(),
+                last.get_ld() - first.get_ld() - self.policy.loss_tolerance_abs,
+            ),
+            total_loss: std::cmp::max(0.into(), last.get_ld() - first.get_ld()),
             // Basically is latest smaller than start:
             //shrink_c: latest.c_add_gap() < start.c_add_gap(),
             shrink_c: latest.min_c > start.min_c || latest.max_c < start.max_c,
@@ -576,8 +610,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             time_to_shrink_c,
             //loss_tol: last.get_ld() <= latest.min_c,
             //loss_tol,
-            loss_tol: (last.get_ld() - first.get_ld()) <= self.loss_tolerance_abs * 1,
-            time_to_shrink_c_l, 
+            loss_tol: (last.get_ld() - first.get_ld()) <= self.policy.loss_tolerance_abs * 1,
+            time_to_shrink_c_l,
             time_to_shrink_c_h,
             time_to_c,
             minc_minb_sum,
@@ -600,7 +634,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         if !self.history_stack.is_empty() {
             return self.history_stack.last().unwrap();
         } else {
-            return self.history.back().unwrap();
+            return self.history.last().unwrap();
         }
     }
 
@@ -613,7 +647,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 
         let mut ret: Vec<NM::O> = Vec::new();
 
-        let total = size.unwrap_or(FEASIBLE_SIZE-1);
+        let total = size.unwrap_or(FEASIBLE_SIZE - 1);
         let n_stack = self.history_stack.len();
         let n_committed = self.history.len();
 
@@ -624,8 +658,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             ret.push(self.history.get(i).unwrap().clone());
         }
 
-        let mut copy = std::cmp::min(n_stack, FEASIBLE_SIZE - 1);
-        copy = std::cmp::max(copy, 0);
+        let copy = std::cmp::min(n_stack, total);
         let start = n_stack - copy;
         // ret.extend(self.history_stack[start..].iter().copied());
         ret.extend(self.history_stack[start..].to_vec().clone());
@@ -634,16 +667,19 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 
     fn compute_feasible_network_moves(&self) -> Vec<CCMove<NM::NA>> {
         assert!(self.maximizer()); // only call when its network's turn.
-        // let ret = self
-        //     .network_model
-        //     .compute_feasible_network_moves(&self.get_relevant_history(None), &self.move_cca);
+                                   // let ret = self
+                                   //     .network_model
+                                   //     .compute_feasible_network_moves(&self.get_relevant_history(None), &self.move_cca);
 
         // Sending full history to be able to compute belief paths, the compute
         // feasible moves then pops the oldest observation.
         let ret = self
             .network_model
             //.compute_feasible_network_moves(&self.get_relevant_history(Some(FEASIBLE_SIZE + self.history_stack.len())), &self.move_cca);
-            .compute_feasible_network_moves(&self.get_relevant_history(Some(HISTORY_SIZE + self.history_stack.len())), &self.move_cca);
+            .compute_feasible_network_moves(
+                &self.get_relevant_history(Some(HISTORY_SIZE + self.history_stack.len())),
+                &self.move_cca,
+            );
         //ret.into_iter().map(CCMove::Network).unique().collect()
         ret.into_iter().map(CCMove::Network).collect()
     }
@@ -653,14 +689,14 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let start = std::time::Instant::now();
         let belief_bounds = self.get_latest_belief_bounds();
 
-        let rh = self.get_relevant_history(Some(FEASIBLE_SIZE + 1));
+        let rh = self.get_relevant_history(Some(QE_WINDOW_OBSERVATIONS));
         let mc = self.move_cca;
 
         let max_allowed_rate = self.network_model.compute_max_allowed_rate(
             &rh,
             &mc,
             0.into(),
-            self.delay_tolerance_frac,
+            self.policy.delay_tolerance_frac,
             1,
         );
         // debug!("Got max_allowed_rate: {:?}", max_allowed_rate);
@@ -675,29 +711,111 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let min_c = belief_bounds.min_c;
         let max_q = belief_bounds.max_q;
         let ret: Vec<CCMove<NM::NA>> = CANDIDATE_ACTIONS
-        .iter()
-        .map(|candidate| match candidate {
-            CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
-            CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
-            CandidateAction::ProbeAboveLimit => max_allowed_rate.unwrap() + self.loss_tolerance_abs,
-        })
-        .filter(|x| *x >= 0.into())
-        .map(|rate| CCMove::CCA(CCAAction { rate }))
-        .collect();
+            .iter()
+            .map(|candidate| match candidate {
+                CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
+                CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
+                CandidateAction::ProbeAboveLimit => {
+                    max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
+                }
+            })
+            .filter(|x| *x >= 0.into())
+            .map(|rate| CCMove::CCA(CCAAction { rate }))
+            .collect();
         let ret = ret.into_iter().unique().collect();
         // https://stackoverflow.com/questions/47636618/vecdedup-does-not-work-how-do-i-deduplicate-a-vector-of-strings
         debug!("CCA choices:\n{:?}\n in {:.2?} time.", ret, start.elapsed());
         ret
     }
 
+    fn try_compute_belief_bounds(&self, history_len: usize) -> Result<BeliefBounds, InconsistentQeWindows> {
+        let history = self.get_relevant_history(Some(history_len));
+        assert!(history.len() >= QE_WINDOW_OBSERVATIONS);
+
+        let window_count = history.len() - QE_WINDOW_OBSERVATIONS + 1;
+        let mut windows = history.windows(QE_WINDOW_OBSERVATIONS).enumerate();
+        let (first_idx, first) = windows.next().unwrap();
+        let first_action = if first_idx + 1 == window_count {
+            &self.move_cca
+        } else {
+            &None
+        };
+        let mut bounds = self
+            .network_model
+            .compute_belief_bounds(first, first_action);
+        for (idx, window) in windows {
+            // An outstanding CCA action belongs only to the newest window.
+            let action = if idx + 1 == window_count {
+                &self.move_cca
+            } else {
+                &None
+            };
+            let next = self.network_model.compute_belief_bounds(window, action);
+            let min_c = std::cmp::max(bounds.min_c, next.min_c);
+            let max_c = std::cmp::min(bounds.max_c, next.max_c);
+            let min_b = std::cmp::max(bounds.min_b, next.min_b);
+            let max_b = std::cmp::min(bounds.max_b, next.max_b);
+
+            // C and B are persistent parameters, so intersect their bounds.
+            // Generated QE uses finite discretization, however, and individual
+            // windows can occasionally disagree by more than its numerical
+            // slack.  Do not turn that approximation artifact into a runtime
+            // crash or an empty belief: retain the prior consistent result and
+            // make the ignored window visible in the experiment log.
+            if min_c <= max_c && min_b <= max_b {
+                bounds.min_c = min_c;
+                bounds.max_c = max_c;
+                bounds.min_b = min_b;
+                bounds.max_b = max_b;
+            } else {
+                return Err(InconsistentQeWindows {
+                    history_observations: history.len(),
+                    window_index: idx,
+                    accumulated: bounds,
+                    next_window: next,
+                });
+            }
+
+            // Q and inflight are state variables at the end of a window, not
+            // persistent model parameters.  The newest window is the one
+            // aligned with the current state, so keep its values.
+            if idx + 1 == window_count {
+                bounds.min_q = next.min_q;
+                bounds.max_q = next.max_q;
+                bounds.min_if = next.min_if;
+                bounds.max_if = next.max_if;
+            }
+        }
+        Ok(bounds)
+    }
+
     fn compute_belief_bounds(&self) -> BeliefBounds {
-        self.network_model
-            .compute_belief_bounds(&self.get_relevant_history(Some(FEASIBLE_SIZE + 1)), &self.move_cca)
+        let history_len = self.policy.belief_history_observations + self.history_stack.len();
+        match self.try_compute_belief_bounds(history_len) {
+            Ok(bounds) => bounds,
+            Err(conflict) => {
+                // The root-state policy can preflight this condition and pick
+                // another length.  A speculative branch has no such callback,
+                // so use its newest valid QE window rather than crash.
+                warn!(
+                    "QE windows conflict at {} of {} (accumulated={}, next={}); using newest window for this speculative state",
+                    conflict.window_index + 1,
+                    conflict.history_observations - QE_WINDOW_OBSERVATIONS + 1,
+                    conflict.accumulated,
+                    conflict.next_window,
+                );
+                conflict.next_window
+            }
+        }
     }
 
     fn get_network_move_sim(&self, args: &Args) -> Option<CCMove<NM::NA>> {
         self.network_model
-            .get_network_move_sim(&self.get_relevant_history(Some(FEASIBLE_SIZE)), &self.move_cca, args.sim_ideal)
+            .get_network_move_sim(
+                &self.get_relevant_history(Some(FEASIBLE_SIZE)),
+                &self.move_cca,
+                args.sim_ideal,
+            )
             .map(CCMove::Network)
     }
 
@@ -710,7 +828,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     }
 
     pub fn new(network_model: NM) -> CongCtrlState<NM> {
-        let history = CircularBuffer::new();
+        let history = Vec::new();
         let belief_bounds = BeliefBounds::default();
         let move_cca = None;
         let history_stack = Vec::new();
@@ -730,8 +848,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             current: Weak::new(),
             recording_tree: false,
             disable_pre_enumeration: false,
-            loss_tolerance_abs: (2 * ALPHA).into(),
-            delay_tolerance_frac: 3.into(),
+            policy: StatePolicy::default(),
             n_nodes_explored: 0,
             parallel_binary_search: false,
             // pool: rayon::ThreadPoolBuilder::new()
@@ -742,6 +859,38 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     }
 }
 
+impl CongCtrlState<NetworkModelNC> {
+    /// Freeze the user-selected policy for the next minimax tree.  This is
+    /// intentionally called only between committed control intervals.
+    fn select_state_policy(&mut self, obj_perm: &[String]) {
+        let belief_bounds_for_history = |history_observations| {
+            self.try_compute_belief_bounds(history_observations)
+        };
+        let state = StateQuantities {
+            timestep: self.history.len().saturating_sub(QE_WINDOW_OBSERVATIONS),
+            history: &self.history,
+            previous_belief: self.belief_bounds,
+            belief_bounds_for_history: &belief_bounds_for_history,
+        };
+        let mut policy = state_policy(&state);
+        assert!(
+            policy.belief_history_observations >= QE_WINDOW_OBSERVATIONS,
+            "belief_history_observations must be at least QE_WINDOW_OBSERVATIONS"
+        );
+        let requested: HashSet<&str> = obj_perm.iter().map(String::as_str).collect();
+        let mut objective_order = obj_perm.to_vec();
+        objective_order.extend(
+            policy
+                .objective_order
+                .iter()
+                .filter(|name| !requested.contains(name.as_str()))
+                .cloned(),
+        );
+        policy.objective_order = objective_order;
+        self.policy = policy;
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -749,7 +898,7 @@ struct Args {
     #[arg(short, long)]
     csv: bool,
 
-    #[arg(long, default_value_t=true)]
+    #[arg(long, default_value_t = true)]
     sim: bool,
     #[arg(long, default_value_t=20.into())]
     sim_c: RealNumRep,
@@ -799,10 +948,12 @@ fn get_sim_tag(args: &Args) -> String {
     ret
 }
 
-fn get_obj_tag() -> String {
+fn get_obj_tag(args: &Args) -> String {
     let mut ret = String::new();
     ret.push_str("obj");
-    for obj in OBJ_PERMUTATION.iter() {
+    let mut objectives = args.obj_perm.clone();
+    objectives.extend(StatePolicy::default().objective_order);
+    for obj in objectives {
         ret.push_str(&format!("_{}", obj));
     }
     ret
@@ -815,10 +966,7 @@ struct SimStrategy<'a> {
 
 impl SimStrategy<'_> {
     fn new(args: &Args) -> SimStrategy {
-        SimStrategy {
-            sim_state: 1,
-            args,
-        }
+        SimStrategy { sim_state: 1, args }
     }
 
     fn get_rate<NM: NetworkModel>(&mut self, ccs: &CongCtrlState<NM>) -> Option<CCMove<NM::NA>> {
@@ -835,7 +983,7 @@ impl SimStrategy<'_> {
                 rate: std::cmp::max(bb.min_c - bb.max_q, 0.into()),
             }))
         } else {
-        //unimplemented!("Need to re-implement max allowed rate computation");
+            //unimplemented!("Need to re-implement max allowed rate computation");
             let this_loss_abs = self.args.loss_tolerance_abs;
             let ret = ccs.network_model.compute_max_allowed_rate(
                 &history,
@@ -846,14 +994,17 @@ impl SimStrategy<'_> {
             );
             if self.sim_state == self.args.probe_duration {
                 self.sim_state -= 1;
-                ret.map(|x| CCMove::CCA(CCAAction { rate: x + this_loss_abs}))
+                ret.map(|x| {
+                    CCMove::CCA(CCAAction {
+                        rate: x + this_loss_abs,
+                    })
+                })
             } else {
                 self.sim_state -= 1;
                 ret.map(|x| CCMove::CCA(CCAAction { rate: x }))
             }
         }
     }
-    
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -868,7 +1019,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Using {:?}", args);
 
     let sim_tag = get_sim_tag(&args);
-    let obj_tag = get_obj_tag();
+    let obj_tag = get_obj_tag(&args);
     info!("obj_tag: {}", obj_tag);
     info!("sim_tag: {}", sim_tag);
 
@@ -912,11 +1063,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     network_model.init();
     let mut ccs = CongCtrlState::new(network_model);
     ccs.init();
+    ccs.select_state_policy(&args.obj_perm);
     ccs.prepare_speculation();
     let mut search: minimax::Search<CongCtrlState<NetworkModelNC>> = minimax::Search::new();
     // cong_ctrl_state.best_move_guess(tt);
-    ccs.loss_tolerance_abs = args.loss_tolerance_abs;
-    ccs.delay_tolerance_frac = args.delay_tolerance_frac;
     ccs.parallel_binary_search = args.parallel;
 
     if args.sim {
@@ -964,9 +1114,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ccs.any_move_guess()
         };
         ccs.make_move(network_move.as_ref().unwrap());
-        ccs.commit_and_prepare();
+        ccs.commit_move();
+        ccs.select_state_policy(&args.obj_perm);
+        ccs.prepare_speculation();
         let bb = ccs.belief_bounds;
-        let last_obs = ccs.history.back().unwrap();
+        let last_obs = ccs.history.last().unwrap();
         info!(
             "Step {} ({:.2?}): {}. {}. {}. nodes={}.",
             t,

@@ -1,10 +1,10 @@
-use core::hash::Hash;
 use core::fmt::Debug;
+use core::hash::Hash;
+use ds::*;
+use num_traits::ToPrimitive;
+use serde::Serialize;
 use static_assertions::const_assert;
 use std::fmt::{Display, Formatter};
-use ds::*;
-use serde::Serialize;
-use num_traits::ToPrimitive;
 
 // The minimum bandwidth is 5 pkts per rtprop = 600 Kbps.
 pub const ALPHA: RealNumInt = 1; // pkt size equivalent in Z3 encoding
@@ -21,9 +21,9 @@ pub const N_THREADS: usize = 8;
 pub const ERR: RealNumRep = RealNumRep::new_raw(1, 1 << 4);
 // const LARGEST_BW: u64 = 100_000; // pkts per rtprop. For rtprop of 100ms, this is ~1.2 Gbps.
 // const LARGEST_SEQ: u64 = 100_000_000; // 1000 rtprop worth of service at LARGEST_BW. 100 seconds at 100 ms.
-pub const SMALLEST_BW: RealNumInt = 5; 
+pub const SMALLEST_BW: RealNumInt = 5;
 pub const LARGEST_BW: RealNumInt = 1000; // pkts per rtprop. For rtprop of 100ms, this is ~120 Mbps.
-// pub const LARGEST_BW: RealNumInt = 120; // pkts per rtprop. For rtprop of 100ms, this is ~14.4 Mbps.
+                                         // pub const LARGEST_BW: RealNumInt = 120; // pkts per rtprop. For rtprop of 100ms, this is ~14.4 Mbps.
 
 // ------------------------------------------------------------------------------------------
 // Beliefs and metrics for defining objectives
@@ -97,6 +97,9 @@ pub struct Metrics {
     /// Loss above the configured tolerance; smaller is better.
     #[serde(with = "serde_real")]
     pub loss: RealNumRep,
+    /// Total observed loss over the evaluated horizon; smaller is better.
+    #[serde(with = "serde_real")]
+    pub total_loss: RealNumRep,
     /// Negative delivered service, so smaller means more data was delivered.
     #[serde(with = "serde_real")]
     pub neg_delivered: RealNumRep,
@@ -144,7 +147,10 @@ pub struct CCAAction {
     pub rate: RealNumRep,
 }
 
-pub trait NetworkAction: Clone + Eq + PartialEq + Hash + Display + Debug + Send + Serialize {}
+pub trait NetworkAction:
+    Clone + Eq + PartialEq + Hash + Display + Debug + Send + Serialize
+{
+}
 
 pub trait Observation: Clone + Eq + PartialEq + Hash + Debug + Send + Serialize + Display {
     fn get_s(&self) -> RealNumRep;
@@ -163,7 +169,7 @@ pub trait NetworkModel: Debug + Sized {
         move_cca: &Option<CCAAction>,
     ) -> Vec<Self::NA>;
 
-    fn compute_min_c_b_sum (
+    fn compute_min_c_b_sum(
         &self,
         relevant_history: &[Self::O],
         move_cca: &Option<CCAAction>,
@@ -195,9 +201,18 @@ pub trait NetworkModel: Debug + Sized {
 
     fn init(&mut self);
 
-    fn compute_observation(&self, last: &Self::O, na: &Self::NA, move_cca: &Option<CCAAction>) -> Self::O;
+    fn compute_observation(
+        &self,
+        last: &Self::O,
+        na: &Self::NA,
+        move_cca: &Option<CCAAction>,
+    ) -> Self::O;
 
     fn get_initial_history(&self) -> Vec<Self::O>;
 
-    fn compute_queue_delay(&self, relevant_history: &[Self::O], move_cca: &Option<CCAAction>) -> Vec<(RealNumRep, RealNumRep, RealNumRep, RealNumRep)>;
+    fn compute_queue_delay(
+        &self,
+        relevant_history: &[Self::O],
+        move_cca: &Option<CCAAction>,
+    ) -> Vec<(RealNumRep, RealNumRep, RealNumRep, RealNumRep)>;
 }

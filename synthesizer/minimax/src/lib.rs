@@ -39,7 +39,7 @@ pub trait State: Debug + Sized {
     /// table. When called repeatedly, it must return `None` after finitely
     /// many calls. The finiteness must hold even across `make_move` and `pop_move`
     fn best_move_guess(&mut self, tt: &TranspositionTable<Self>) -> Option<Self::M>;
-    fn best_move_sort(&mut self, tt: &TranspositionTable<Self>, tt_state: Self::T) ;
+    fn best_move_sort(&mut self, tt: &TranspositionTable<Self>, tt_state: Self::T);
 
     fn make_move(&mut self, m: &Self::M);
     fn make_move_depth(&mut self, m: &Self::M, depth: u16);
@@ -154,7 +154,8 @@ impl<S: State> Search<S> {
             // Recurse
             //state.make_move(&next_move);
             state.make_move_depth(&next_move, depth);
-            let new_value = self.deepen_tree(state, depth - 1, alpha, beta, stop_flag.clone(), enable_tt);
+            let new_value =
+                self.deepen_tree(state, depth - 1, alpha, beta, stop_flag.clone(), enable_tt);
             state.pop_move();
 
             // We ran out of time. Bail
@@ -199,8 +200,9 @@ impl<S: State> Search<S> {
                 tt_state,
                 (
                     Some(
-                        best_move
-                            .expect("Error because state.best_move_guess() did not return any moves."),
+                        best_move.expect(
+                            "Error because state.best_move_guess() did not return any moves.",
+                        ),
                     ),
                     value,
                 ),
@@ -235,8 +237,7 @@ impl<S: State> Search<S> {
         };
 
         // Do the actual computation. This is the main loop
-        for d in depth..depth + 1
-        {
+        for d in depth..depth + 1 {
             if d % 2 == 1 {
                 continue;
             }
@@ -247,7 +248,14 @@ impl<S: State> Search<S> {
             // Previously the first (and only) iteration used `false`, which
             // happened to work only when `deepen_tree` special-cased the old
             // global depth of 10.
-            self.deepen_tree(state, d, S::V::neg_inf(), S::V::inf(), stop_flag.clone(), true);
+            self.deepen_tree(
+                state,
+                d,
+                S::V::neg_inf(),
+                S::V::inf(),
+                stop_flag.clone(),
+                true,
+            );
 
             if let Some((_, v, _)) = self.tt.get(&state.tt_state()) {
                 if v.fully_known() {
@@ -283,6 +291,6 @@ mod tests {
 
     #[test]
     fn it_works() {
-        assert!(vec![1,2,3] == vec![1,2,]);
+        assert!(vec![1, 2, 3] == vec![1, 2,]);
     }
 }

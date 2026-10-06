@@ -7,8 +7,8 @@ use ds::interval::{Interval, IntervalList};
 use ds::*;
 use network_model_nc::*;
 
-use std::time::{Duration, Instant};
 use std::thread::sleep;
+use std::time::{Duration, Instant};
 
 #[repr(C)]
 pub struct ExternalLossObservation {
@@ -17,34 +17,33 @@ pub struct ExternalLossObservation {
     pub l: f64,
 }
 
-
 #[repr(C)]
 pub struct ExternalObservationNoLossDetection {
-    pub a: f64, 
-    pub s: f64, 
-    pub l: f64, 
+    pub a: f64,
+    pub s: f64,
+    pub l: f64,
 }
 
 #[repr(C)]
 pub struct ExternalObservation {
-    pub a: f64, 
-    pub s: f64, 
-    pub lo: *const ExternalLossObservation, 
+    pub a: f64,
+    pub s: f64,
+    pub lo: *const ExternalLossObservation,
     pub lo_len: i32, // length of ExternalLossObservation array
 }
 
 #[repr(C)]
 pub struct ExternalBeliefBound {
-    pub min_c: f64, 
-    pub max_c: f64, 
-    pub min_b: f64, 
-    pub max_b: f64, 
-    pub min_q: f64, 
-    pub max_q: f64, 
+    pub min_c: f64,
+    pub max_c: f64,
+    pub min_b: f64,
+    pub max_b: f64,
+    pub min_q: f64,
+    pub max_q: f64,
     pub max_rate: f64,
 }
 
-/* 
+/*
 #[no_mangle]
 pub fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n: i32) -> ExternalBeliefBound {
     assert!(n >= 7);
@@ -87,8 +86,8 @@ pub fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n: i32) -> E
         let res1 = std::panic::catch_unwind(|| network_model.compute_belief_bounds(obs_ref, &None));
         let res2 = std::panic::catch_unwind(|| network_model.compute_max_allowed_rate(obs_ref, &None, 0.into(), 0.into(), 1));
         match (res1, res2) {
-            (Ok(bb), Ok(max_rate)) => 
-                {return     
+            (Ok(bb), Ok(max_rate)) =>
+                {return
                 ExternalBeliefBound {
                     min_c: bb.min_c.to_f64().unwrap(),
                     max_c: bb.max_c.to_f64().unwrap(),
@@ -116,7 +115,11 @@ pub fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n: i32) -> E
 }*/
 
 #[no_mangle]
-pub extern "C" fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n: i32, bb_raw: *mut ExternalBeliefBound) {
+pub extern "C" fn compute_belief_bounds_c(
+    obs_raw: *const ExternalObservation,
+    n: i32,
+    bb_raw: *mut ExternalBeliefBound,
+) {
     assert!(n >= 7);
     //let _ = std::panic::catch_unwind(|| assert!(false));
     //let mut obs = vec![];
@@ -134,22 +137,16 @@ pub extern "C" fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n
                 if j != 0 {
                     inner_pos = inner_pos.offset(1);
                 }
-                loss_vec.push(
-                    LossObservation {
-                        t: (*inner_pos).t as usize,
-                        l: ((*inner_pos).l as i32).into(), // it is in discretization unit of packet
-                    }
-
-                );
+                loss_vec.push(LossObservation {
+                    t: (*inner_pos).t as usize,
+                    l: ((*inner_pos).l as i32).into(), // it is in discretization unit of packet
+                });
             }
-            obs.push(
-                ObservationNC {
-                    a: ((*pos).a as i32).into(),
-                    s: ((*pos).s as i32).into(),
-                    lo: loss_vec.clone(),
-
-                }
-            );
+            obs.push(ObservationNC {
+                a: ((*pos).a as i32).into(),
+                s: ((*pos).s as i32).into(),
+                lo: loss_vec.clone(),
+            });
         }
     }
 
@@ -159,26 +156,30 @@ pub extern "C" fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n
     for i in [7, 6, 5, 4, 3] {
         let obs_ref = &obs[obs.len() - i..];
         let res1 = std::panic::catch_unwind(|| network_model.compute_belief_bounds(obs_ref, &None));
-        let res2 = std::panic::catch_unwind(|| network_model.compute_max_allowed_rate(obs_ref, &None, 0.into(), 0.into(), 1));
+        let res2 = std::panic::catch_unwind(|| {
+            network_model.compute_max_allowed_rate(obs_ref, &None, 0.into(), 0.into(), 1)
+        });
         match (res1, res2) {
-            (Ok(bb), Ok(max_rate)) => 
-                {
-                    unsafe {
-                        (*bb_raw).min_c = bb.min_c.to_f64().unwrap();
-                        (*bb_raw).max_c = bb.max_c.to_f64().unwrap();
-                        (*bb_raw).min_b = bb.min_b.to_f64().unwrap();
-                        (*bb_raw).max_b = bb.max_b.to_f64().unwrap();
-                        (*bb_raw).min_q = bb.min_q.to_f64().unwrap();
-                        (*bb_raw).max_q = bb.max_q.to_f64().unwrap();
-                        (*bb_raw).max_rate = max_rate.unwrap().to_f64().unwrap();
-                    }   
-                    return     
-                },
-            (_, _) => {println!("Link rate changes");continue}
+            (Ok(bb), Ok(max_rate)) => {
+                unsafe {
+                    (*bb_raw).min_c = bb.min_c.to_f64().unwrap();
+                    (*bb_raw).max_c = bb.max_c.to_f64().unwrap();
+                    (*bb_raw).min_b = bb.min_b.to_f64().unwrap();
+                    (*bb_raw).max_b = bb.max_b.to_f64().unwrap();
+                    (*bb_raw).min_q = bb.min_q.to_f64().unwrap();
+                    (*bb_raw).max_q = bb.max_q.to_f64().unwrap();
+                    (*bb_raw).max_rate = max_rate.unwrap().to_f64().unwrap();
+                }
+                return;
+            }
+            (_, _) => {
+                println!("Link rate changes");
+                continue;
+            }
         }
     }
     //assert!(false);
-    /* 
+    /*
     ExternalBeliefBound {
         min_c: SMALLEST_BW.into(),
         max_c: LARGEST_BW.into(),
@@ -197,59 +198,59 @@ pub extern "C" fn compute_belief_bounds_c(obs_raw: *const ExternalObservation, n
         (*bb_raw).min_q = 0.into();
         (*bb_raw).max_q = LARGEST_BW.into();
         (*bb_raw).max_rate = 0.into();
-    }   
-    return    
+    }
+    return;
 }
-/* 
+/*
 #[no_mangle]
 pub fn compute_belief_bounds_c_test() -> ExternalBeliefBound {
     let n = 6;
-        
+
     let loss_raw_1 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
     let ob_1 = ExternalObservation {
-        a: 0.0, 
+        a: 0.0,
         s: 0.0,
-        lo: loss_raw_1, 
+        lo: loss_raw_1,
         lo_len: 1,
     };
 
     let loss_raw_2 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
     let ob_2 = ExternalObservation {
-        a: 0.0, 
+        a: 0.0,
         s: 0.0,
-        lo: loss_raw_2, 
+        lo: loss_raw_2,
         lo_len: 1,
     };
 
     let loss_raw_3 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
     let ob_3 = ExternalObservation {
-        a: 0.0, 
+        a: 0.0,
         s: 0.0,
-        lo: loss_raw_3, 
+        lo: loss_raw_3,
         lo_len: 1,
     };
 
     let loss_raw_4 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
     let ob_4 = ExternalObservation {
-        a: 0.0, 
+        a: 0.0,
         s: 0.0,
-        lo: loss_raw_4, 
+        lo: loss_raw_4,
         lo_len: 1,
     };
 
     let loss_raw_5 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
     let ob_5 = ExternalObservation {
-        a: 0.0, 
+        a: 0.0,
         s: 0.0,
-        lo: loss_raw_5, 
+        lo: loss_raw_5,
         lo_len: 1,
     };
 
     let loss_raw_6 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
     let ob_6 = ExternalObservation {
-        a: 0.0, 
+        a: 0.0,
         s: 0.0,
-        lo: loss_raw_6, 
+        lo: loss_raw_6,
         lo_len: 1,
     };
 
@@ -260,7 +261,6 @@ pub fn compute_belief_bounds_c_test() -> ExternalBeliefBound {
     bb
 } */
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,73 +269,79 @@ mod tests {
     fn it_works() {
         let now = Instant::now();
         let n = 7;
-        
-        let loss_raw_1 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+
+        let loss_raw_1 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_1 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_1, 
+            lo: loss_raw_1,
             lo_len: 1,
         };
 
-        let loss_raw_2 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+        let loss_raw_2 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_2 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_2, 
+            lo: loss_raw_2,
             lo_len: 1,
         };
 
-        let loss_raw_3 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+        let loss_raw_3 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_3 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_3, 
+            lo: loss_raw_3,
             lo_len: 1,
         };
 
-        let loss_raw_4 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+        let loss_raw_4 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_4 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_4, 
+            lo: loss_raw_4,
             lo_len: 1,
         };
 
-        let loss_raw_5 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+        let loss_raw_5 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_5 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_5, 
+            lo: loss_raw_5,
             lo_len: 1,
         };
 
-        let loss_raw_6 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+        let loss_raw_6 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_6 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_6, 
+            lo: loss_raw_6,
             lo_len: 1,
         };
 
-        let loss_raw_7 = &ExternalLossObservation { t: 0, l: 0.0} as *const ExternalLossObservation;
+        let loss_raw_7 =
+            &ExternalLossObservation { t: 0, l: 0.0 } as *const ExternalLossObservation;
         let ob_7 = ExternalObservation {
-            a: 0.0, 
+            a: 0.0,
             s: 0.0,
-            lo: loss_raw_7, 
+            lo: loss_raw_7,
             lo_len: 1,
         };
 
-        let obs: [ExternalObservation;7] = [ob_1, ob_2, ob_3, ob_4, ob_5, ob_6, ob_7];
+        let obs: [ExternalObservation; 7] = [ob_1, ob_2, ob_3, ob_4, ob_5, ob_6, ob_7];
         let obs_raw = &obs as *const ExternalObservation;
 
-
         let mut raw_bb = ExternalBeliefBound {
-            min_c: 5.into(), 
-            max_c: 1000.into(), 
-            min_b: 5.into(), 
+            min_c: 5.into(),
+            max_c: 1000.into(),
+            min_b: 5.into(),
             max_b: 1000.into(),
-            min_q: 5.into(), 
+            min_q: 5.into(),
             max_q: 1000.into(),
             max_rate: 0.into(),
         };

@@ -268,8 +268,7 @@ pub struct ObservationNC {
     #[serde(with = "serde_real")]
     pub s: RealNumRep, // cum. bytes serviced
     pub lo: Vec<LossObservation>, // This vector should always be non-empty as it describes the rtt, and the loss sequence an rtt ago.
-    // new fields for abr
-    
+                                  // new fields for abr
 }
 
 impl Display for ObservationNC {
@@ -305,7 +304,7 @@ impl Observation for ObservationNC {
     }
 
     fn get_lo(&self) -> Vec<(usize, RealNumRep)> {
-        self.lo.clone().into_iter().map(|l| (l.t, l.l)).collect()   
+        self.lo.clone().into_iter().map(|l| (l.t, l.l)).collect()
     }
 }
 
@@ -319,7 +318,13 @@ pub struct NetworkActionNC {
 
 impl Display for NetworkActionNC {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "s={:.2}, app={}, lo={:?}", self.s.to_f64().unwrap(), self.app_send_fraction, self.lo,)
+        write!(
+            f,
+            "s={:.2}, app={}, lo={:?}",
+            self.s.to_f64().unwrap(),
+            self.app_send_fraction,
+            self.lo,
+        )
     }
 }
 
@@ -327,7 +332,11 @@ impl NetworkAction for NetworkActionNC {}
 
 /// Amount of a CCA request actually supplied by the application.
 #[derive(Clone, Copy, PartialEq, Debug, Eq, Hash, Serialize)]
-pub enum AppSendFraction { Zero, Half, Full }
+pub enum AppSendFraction {
+    Zero,
+    Half,
+    Full,
+}
 
 impl AppSendFraction {
     fn as_real(self) -> RealNumRep {
@@ -341,7 +350,15 @@ impl AppSendFraction {
 
 impl Display for AppSendFraction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", match self { Self::Zero => "0", Self::Half => "1/2", Self::Full => "1" })
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Zero => "0",
+                Self::Half => "1/2",
+                Self::Full => "1",
+            }
+        )
     }
 }
 
@@ -369,7 +386,12 @@ impl NetworkModel for NetworkModelNC {
             let (c, b) = path;
             //print!("{:?}\n", path);
             let pos = 1 + relevant_history.len() - HISTORY_SIZE;
-            let feasible_moves = self.compute_feasible_network_moves_given_path(&relevant_history[pos..], move_cca, c, b);
+            let feasible_moves = self.compute_feasible_network_moves_given_path(
+                &relevant_history[pos..],
+                move_cca,
+                c,
+                b,
+            );
             for move_ in feasible_moves {
                 for app_send_fraction in &self.app_send_choices {
                     let mut move_ = move_.clone();
@@ -382,7 +404,7 @@ impl NetworkModel for NetworkModelNC {
         ret
     }
 
-    fn compute_min_c_b_sum (
+    fn compute_min_c_b_sum(
         &self,
         relevant_history: &[Self::O],
         move_cca: &Option<CCAAction>,
@@ -393,7 +415,6 @@ impl NetworkModel for NetworkModelNC {
         }
         Some(std::cmp::max(min_sum, ALPHA.into()))
     }
-    
 
     fn compute_max_allowed_rate(
         &self,
@@ -413,7 +434,7 @@ impl NetworkModel for NetworkModelNC {
         }
         Some(std::cmp::max(max_rate, ALPHA.into()))
 
-        /* 
+        /*
         assert!(*move_cca == None);
         let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(&relevant_history[1..], &Some(CCAAction{rate: 0.into()}));
         let tsteps = a.len() as i32;
@@ -440,7 +461,6 @@ impl NetworkModel for NetworkModelNC {
 
         // assert_eq!(measurement_interval, 1);
         // assert_eq!(delay_tolerance_frac, 3.into());
-
 
         // let a_interval =
         //     COMPUTE_A_4_3[&(tsteps, n_losses_observed)](&a, &l, &s, loss_tolerance_abs);
@@ -515,15 +535,15 @@ impl NetworkModel for NetworkModelNC {
         //    } else {
         //        COMPUTE_Q_5[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c, b)
         //    };
-            //COMPUTE_Q_5[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c, b);
-            //assert!(!q_interval.is_empty());
-            //if n_losses_observed == tsteps {
-                // In this case, due to our simplification process in QE, we remove
-                // the Q=0 constraint.
+        //COMPUTE_Q_5[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c, b);
+        //assert!(!q_interval.is_empty());
+        //if n_losses_observed == tsteps {
+        // In this case, due to our simplification process in QE, we remove
+        // the Q=0 constraint.
 
-                // TODO: Verify if this affects other QE outputs semantically.
-                //q_interval = IntervalList::interval_point(Bound::Included(0.into()));
-            //}
+        // TODO: Verify if this affects other QE outputs semantically.
+        //q_interval = IntervalList::interval_point(Bound::Included(0.into()));
+        //}
         //    assert!(!q_interval.is_empty());
         //    min_q = std::cmp::min(min_q, my_min(&q_interval));
         //    max_q = std::cmp::max(max_q, my_max(&q_interval));
@@ -533,7 +553,7 @@ impl NetworkModel for NetworkModelNC {
         let qdels = self.compute_queue_delay(relevant_history, move_cca);
         for (_, _, local_min_q, local_max_q) in qdels {
             min_q = std::cmp::min(min_q, local_min_q);
-            max_q = std::cmp::max(max_q,local_max_q);
+            max_q = std::cmp::max(max_q, local_max_q);
         }
         // let l_interval = if n_losses_observed as usize == FEASIBLE_SIZE {
         //     IntervalList::interval_bounded(l[4], l[4])
@@ -565,14 +585,18 @@ impl NetworkModel for NetworkModelNC {
         }
     }
 
-    fn compute_queue_delay(&self, relevant_history: &[Self::O], move_cca: &Option<CCAAction>) -> Vec<(RealNumRep, RealNumRep, RealNumRep, RealNumRep)> {
+    fn compute_queue_delay(
+        &self,
+        relevant_history: &[Self::O],
+        move_cca: &Option<CCAAction>,
+    ) -> Vec<(RealNumRep, RealNumRep, RealNumRep, RealNumRep)> {
         let paths = self.get_discretized_paths(relevant_history, move_cca);
         assert!(HISTORY_SIZE == FEASIBLE_SIZE + 1);
         let mut new_history = vec![];
         for i in relevant_history {
             new_history.push(i.clone());
         }
-        let dummy = &Some(CCAAction{rate: 0.into()});
+        let dummy = &Some(CCAAction { rate: 0.into() });
 
         //let mut min_q: RealNumRep = RealNumInt::max_value().into();
         //let mut max_q: RealNumRep = 0.into();
@@ -580,11 +604,24 @@ impl NetworkModel for NetworkModelNC {
         for path in paths {
             let (c, b) = path;
             //print!("{:?}\n", path);
-            let pos = if relevant_history.len() < HISTORY_SIZE {1} else {1 + relevant_history.len() - HISTORY_SIZE};
-            let feasible_moves = self.compute_feasible_network_moves_given_path(&relevant_history[pos..], &dummy, c, b);
+            let pos = if relevant_history.len() < HISTORY_SIZE {
+                1
+            } else {
+                1 + relevant_history.len() - HISTORY_SIZE
+            };
+            let feasible_moves = self.compute_feasible_network_moves_given_path(
+                &relevant_history[pos..],
+                &dummy,
+                c,
+                b,
+            );
             for feasible_move in feasible_moves {
-                new_history.push(self.compute_observation(new_history.last().unwrap(), &feasible_move, &dummy));
-                let (a, l, s, l0) = 
+                new_history.push(self.compute_observation(
+                    new_history.last().unwrap(),
+                    &feasible_move,
+                    &dummy,
+                ));
+                let (a, l, s, l0) =
                     NetworkModelNC::get_observation_vectors(&new_history[pos..], &None);
                 let tsteps = a.len() as i32;
                 let n_losses_observed = l.len() as i32;
@@ -599,7 +636,7 @@ impl NetworkModel for NetworkModelNC {
                     q_interval = IntervalList::interval_point(Bound::Included(0.into()));
                 }
                 assert!(!q_interval.is_empty());
-                ret.push((c,b,my_min(&q_interval), my_max(&q_interval)));
+                ret.push((c, b, my_min(&q_interval), my_max(&q_interval)));
                 //min_q = std::cmp::min(min_q, my_min(&q_interval));
                 //max_q = std::cmp::max(max_q, my_max(&q_interval));
                 new_history.pop();
@@ -650,10 +687,14 @@ impl NetworkModel for NetworkModelNC {
         } else {
             lo_ret
         };
-        return Some(NetworkActionNC { s: max_s, lo, app_send_fraction: AppSendFraction::Full });
+        return Some(NetworkActionNC {
+            s: max_s,
+            lo,
+            app_send_fraction: AppSendFraction::Full,
+        });
         // Worst-case behavior
         //if lo.last().unwrap().t == 2 && lo.last().unwrap().l == 0.into() {
-        if lo.last().unwrap().t == 2  {
+        if lo.last().unwrap().t == 2 {
             let max_s = my_max(&s_interval);
             let mut s_clone = s.clone();
             s_clone.push(max_s);
@@ -670,9 +711,17 @@ impl NetworkModel for NetworkModelNC {
             } else {
                 lo_ret
             };
-            Some(NetworkActionNC { s: max_s, lo, app_send_fraction: AppSendFraction::Full })
+            Some(NetworkActionNC {
+                s: max_s,
+                lo,
+                app_send_fraction: AppSendFraction::Full,
+            })
         } else {
-            Some(NetworkActionNC { s: min_s, lo, app_send_fraction: AppSendFraction::Full })
+            Some(NetworkActionNC {
+                s: min_s,
+                lo,
+                app_send_fraction: AppSendFraction::Full,
+            })
         }
     }
 
@@ -686,7 +735,6 @@ impl NetworkModel for NetworkModelNC {
     fn init(&mut self) {}
 
     fn get_initial_history(&self) -> Vec<Self::O> {
-        
         let mut ret = Vec::new();
         for t in 0..HISTORY_SIZE {
             // Since I started adding C >= 5, don't need to add history that
@@ -706,239 +754,207 @@ impl NetworkModel for NetworkModelNC {
         }
         return ret;
         let mut obs = vec![];
-        obs.push(
-            ObservationNC {
-                a: 60.into(),
-                s: 42.into(),
-                lo: vec![LossObservation {
+        obs.push(ObservationNC {
+            a: 60.into(),
+            s: 42.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 60.into(),
+            s: 60.into(),
+            lo: vec![
+                LossObservation {
                     t: 1,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 60.into(),
-                s: 60.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }, LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 80.into(),
-                s: 60.into(),
-                lo: vec![LossObservation {
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 80.into(),
+            s: 60.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 80.into(),
+            s: 80.into(),
+            lo: vec![
+                LossObservation {
                     t: 1,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 80.into(),
-                s: 80.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }, LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 102.into(),
-                s: 80.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 102.into(),
-                s: 100.into(),
-                lo: vec![LossObservation {
-                    t: 2,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 102.into(),
+            s: 80.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 102.into(),
+            s: 100.into(),
+            lo: vec![LossObservation {
+                t: 2,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
 
         //return obs;
         let mut obs = vec![];
-        obs.push(
-            ObservationNC {
-                a: 230.into(),
-                s: 200.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 230.into(),
-                s: 220.into(),
-                lo: vec![LossObservation {
+        obs.push(ObservationNC {
+            a: 230.into(),
+            s: 200.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 230.into(),
+            s: 220.into(),
+            lo: vec![LossObservation {
+                t: 2,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 230.into(),
+            s: 230.into(),
+            lo: vec![
+                LossObservation {
                     t: 2,
                     l: 0.into(), // it is in discretization unit of packet
-                }, ],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 230.into(),
-                s: 230.into(),
-                lo: vec![LossObservation {
-                    t: 2,
-                    l: 0.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 1,
                     l: 0.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 262.into(),
-                s: 230.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 262.into(),
-                s: 250.into(),
-                lo: vec![LossObservation {
-                    t: 2,
-                    l: 0.into(), // it is in discretization unit of packet
-                }, ],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 262.into(),
-                s: 260.into(),
-                lo: vec![LossObservation {
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 262.into(),
+            s: 230.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 262.into(),
+            s: 250.into(),
+            lo: vec![LossObservation {
+                t: 2,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 262.into(),
+            s: 260.into(),
+            lo: vec![
+                LossObservation {
                     t: 2,
                     l: 2.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 1,
                     l: 2.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 2.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
+                },
+            ],
+        });
         return obs;
         let mut obs = vec![];
-        obs.push(
-            ObservationNC {
-                a: 230.into(),
-                s: 230.into(),
-                lo: vec![LossObservation {
+        obs.push(ObservationNC {
+            a: 230.into(),
+            s: 230.into(),
+            lo: vec![
+                LossObservation {
                     t: 2,
                     l: 0.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 1,
                     l: 0.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 0.into(), // it is in discretization unit of packet
-                },],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 262.into(),
-                s: 230.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                },],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 262.into(),
-                s: 250.into(),
-                lo: vec![LossObservation {
-                    t: 2,
-                    l: 0.into(), // it is in discretization unit of packet
-                },],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 262.into(),
-                s: 260.into(),
-                lo: vec![LossObservation {
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 262.into(),
+            s: 230.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 262.into(),
+            s: 250.into(),
+            lo: vec![LossObservation {
+                t: 2,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 262.into(),
+            s: 260.into(),
+            lo: vec![
+                LossObservation {
                     t: 2,
                     l: 2.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 1,
                     l: 2.into(), // it is in discretization unit of packet
-                },LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 2.into(), // it is in discretization unit of packet
-                },],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 294.into(),
-                s: 260.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 2.into(), // it is in discretization unit of packet
-                },],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 306.into(),
-                s: 280.into(),
-                lo: vec![LossObservation {
-                    t: 2,
-                    l: 2.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 294.into(),
+            s: 260.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 2.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 306.into(),
+            s: 280.into(),
+            lo: vec![LossObservation {
+                t: 2,
+                l: 2.into(), // it is in discretization unit of packet
+            }],
+        });
         obs
     }
 
@@ -974,31 +990,37 @@ impl NetworkModelNC {
 
     pub fn new_with_app_send_choices(choices: &[AppSendFraction]) -> Self {
         assert!(!choices.is_empty());
-        Self { app_send_choices: choices.to_vec(), ..Self::new() }
+        Self {
+            app_send_choices: choices.to_vec(),
+            ..Self::new()
+        }
     }
 
-    fn discretize_interval(interval_list: &IntervalList<RealNumRep>, n_points: usize) -> Vec<RealNumRep>{
+    fn discretize_interval(
+        interval_list: &IntervalList<RealNumRep>,
+        n_points: usize,
+    ) -> Vec<RealNumRep> {
         //assert!(interval_list.is_contiguous_interval());
         let mut vals = Vec::new();
         // Get the total length
-        // Could there be overlapping? 
+        // Could there be overlapping?
         let mut length: RealNumRep = 0.into();
-        for interval in  interval_list.get_intervals() {
-            let singleton: IntervalList<RealNumRep>= IntervalList::new_interval(interval.clone());
+        for interval in interval_list.get_intervals() {
+            let singleton: IntervalList<RealNumRep> = IntervalList::new_interval(interval.clone());
             let min_v = my_min(&singleton);
             let max_v = my_max(&singleton);
             length = length + (max_v - min_v);
         }
 
-        for interval in  interval_list.get_intervals() {
-            let singleton: IntervalList<RealNumRep>= IntervalList::new_interval(interval.clone());
+        for interval in interval_list.get_intervals() {
+            let singleton: IntervalList<RealNumRep> = IntervalList::new_interval(interval.clone());
             let min_v = my_min(&singleton);
             let max_v = my_max(&singleton);
             if min_v == max_v {
                 vals.push(min_v);
             } else {
                 let n_points: RealNumRep = ((n_points) as i32).into();
-                let local_points: RealNumRep =  (n_points * (max_v - min_v) / length).ceil();
+                let local_points: RealNumRep = (n_points * (max_v - min_v) / length).ceil();
                 assert!(local_points.is_integer());
                 if local_points == 1.into() {
                     vals.push(min_v);
@@ -1022,17 +1044,17 @@ impl NetworkModelNC {
         move_cca: &Option<CCAAction>,
     ) -> Vec<(RealNumRep, RealNumRep)> {
         //return self.get_discretized_paths_original(&relevant_history[relevant_history.len() - FEASIBLE_SIZE..relevant_history.len()], move_cca);
-        let mut c_interval_all= IntervalList::interval_bounded(
+        let mut c_interval_all = IntervalList::interval_bounded(
             Bound::Included(SMALLEST_BW.into()),
             Bound::Included(LARGEST_BW.into()),
         );
-        // 0 corresponding to the real trace 
+        // 0 corresponding to the real trace
         assert!(HISTORY_SIZE == FEASIBLE_SIZE + 1);
         if relevant_history.len() < HISTORY_SIZE {
-            return self.get_discretized_paths_original(&relevant_history, move_cca)
+            return self.get_discretized_paths_original(&relevant_history, move_cca);
         }
-        for ptr in [0,relevant_history.len() - HISTORY_SIZE] {
-            let rh = &relevant_history[ptr .. (ptr + HISTORY_SIZE)];
+        for ptr in [0, relevant_history.len() - HISTORY_SIZE] {
+            let rh = &relevant_history[ptr..(ptr + HISTORY_SIZE)];
             // TODO: Can cache this or the whole function
             let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(rh, move_cca);
             // a.len() may not be equal to s.len() since we use this in belief
@@ -1044,19 +1066,23 @@ impl NetworkModelNC {
             c_interval_all = c_interval_all.intersection(&c_interval);
             //assert!(!c_interval_all.is_empty());
             if c_interval_all.is_empty() {
-                return self.get_discretized_paths_original(&relevant_history[relevant_history.len() - HISTORY_SIZE..relevant_history.len()], move_cca)
+                return self.get_discretized_paths_original(
+                    &relevant_history
+                        [relevant_history.len() - HISTORY_SIZE..relevant_history.len()],
+                    move_cca,
+                );
             }
         }
-        let c_vals = NetworkModelNC:: discretize_interval(&c_interval_all, N_DISCRETE_POINTS);
+        let c_vals = NetworkModelNC::discretize_interval(&c_interval_all, N_DISCRETE_POINTS);
 
         let mut ret = Vec::new();
         for c_val in c_vals.clone() {
-            let mut b_interval_all= IntervalList::interval_bounded(
+            let mut b_interval_all = IntervalList::interval_bounded(
                 Bound::Included(SMALLEST_BW.into()),
                 Bound::Included(LARGEST_BW.into()),
             );
-            for ptr in [0,relevant_history.len() - HISTORY_SIZE] {
-                let rh = &relevant_history[ptr .. (ptr + HISTORY_SIZE)];
+            for ptr in [0, relevant_history.len() - HISTORY_SIZE] {
+                let rh = &relevant_history[ptr..(ptr + HISTORY_SIZE)];
                 let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(rh, move_cca);
                 let tsteps = s.len() as i32;
                 let n_losses_observed = l.len() as i32;
@@ -1074,7 +1100,6 @@ impl NetworkModelNC {
                 }*/
 
                 //assert!(!b_interval_all.is_empty());
-
             }
             if !b_interval_all.is_empty() {
                 ret.push((c_val, my_min(&b_interval_all)));
@@ -1083,10 +1108,12 @@ impl NetworkModelNC {
         }
         //assert!(!ret.is_empty());
         if ret.is_empty() {
-            return self.get_discretized_paths_original(&relevant_history[relevant_history.len() - HISTORY_SIZE..relevant_history.len()], move_cca)
+            return self.get_discretized_paths_original(
+                &relevant_history[relevant_history.len() - HISTORY_SIZE..relevant_history.len()],
+                move_cca,
+            );
         }
         ret
-
     }
 
     fn get_discretized_paths_original(
@@ -1111,7 +1138,7 @@ impl NetworkModelNC {
 
         // TODO: Adapt N_DISCRETE_POINTS based on how close min_c and max_c are
         // (when both are divided by ALPHA).
-        let c_vals = NetworkModelNC:: discretize_interval(&c_interval, N_DISCRETE_POINTS);
+        let c_vals = NetworkModelNC::discretize_interval(&c_interval, N_DISCRETE_POINTS);
 
         let mut ret = Vec::new();
         for c_val in c_vals {
@@ -1123,10 +1150,9 @@ impl NetworkModelNC {
             assert!(!b_interval.is_empty());
             ret.push((c_val, my_min(&b_interval)));
             ret.push((c_val, my_max(&b_interval)));
-        }  
-        ret 
+        }
+        ret
     }
-
 
     fn compute_feasible_network_moves_given_path(
         &self,
@@ -1231,7 +1257,8 @@ impl NetworkModelNC {
 
         trace!("Computing losses after: L={:?}", l);
         let time_ago = (tsteps - 1 - n_losses_observed) as usize;
-        let l_intervals = COMPUTE_L_OBS[&(tsteps, prior_loss, n_losses_observed)](a, l, s, l0, c, b);
+        let l_intervals =
+            COMPUTE_L_OBS[&(tsteps, prior_loss, n_losses_observed)](a, l, s, l0, c, b);
         trace!("Got l_intervals={:?}", l_intervals);
 
         // Check if these losses will be observed
@@ -1286,15 +1313,20 @@ impl NetworkModelNC {
     fn get_observation_vectors(
         relevant_history: &[ObservationNC],
         move_cca: &Option<CCAAction>,
-    ) -> (Vec<RealNumRep>, Vec<RealNumRep>, Vec<RealNumRep>, RealNumRep) {
+    ) -> (
+        Vec<RealNumRep>,
+        Vec<RealNumRep>,
+        Vec<RealNumRep>,
+        RealNumRep,
+    ) {
         let mut a = Vec::new();
         let mut l = Vec::new();
         let mut s = Vec::new();
-        let mut l0: RealNumRep = 0.into();  // The last loss obs made.
+        let mut l0: RealNumRep = 0.into(); // The last loss obs made.
         for i in 1..relevant_history.len() {
             let obs = &relevant_history[i];
             // Use previous a
-            a.push(relevant_history[i-1].a);
+            a.push(relevant_history[i - 1].a);
             s.push(obs.s);
             for j in 0..obs.lo.len() {
                 l0 = std::cmp::max(l0, obs.lo[j].l);
@@ -1467,86 +1499,74 @@ mod tests {
             Bound::Included(RealNumRep::new_raw(34, 3)),
             Bound::Included(RealNumRep::new_raw(35, 2)),
         );
-        let c_vals = NetworkModelNC:: discretize_interval(&c_interval_all, N_DISCRETE_POINTS);
+        let c_vals = NetworkModelNC::discretize_interval(&c_interval_all, N_DISCRETE_POINTS);
         print!("{:?}", c_vals);
     }
 
     #[test]
     fn debug_test() {
         let mut obs = vec![];
-        obs.push(
-            ObservationNC {
-                a: 60.into(),
-                s: 42.into(),
-                lo: vec![LossObservation {
+        obs.push(ObservationNC {
+            a: 60.into(),
+            s: 42.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 60.into(),
+            s: 60.into(),
+            lo: vec![
+                LossObservation {
                     t: 1,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 60.into(),
-                s: 60.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }, LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 80.into(),
-                s: 60.into(),
-                lo: vec![LossObservation {
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 80.into(),
+            s: 60.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 80.into(),
+            s: 80.into(),
+            lo: vec![
+                LossObservation {
                     t: 1,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 80.into(),
-                s: 80.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }, LossObservation {
+                },
+                LossObservation {
                     t: 0,
                     l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 102.into(),
-                s: 80.into(),
-                lo: vec![LossObservation {
-                    t: 1,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 102.into(),
-                s: 100.into(),
-                lo: vec![LossObservation {
-                    t: 2,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        let move_cca = CCAAction {rate : 10.into()};
+                },
+            ],
+        });
+        obs.push(ObservationNC {
+            a: 102.into(),
+            s: 80.into(),
+            lo: vec![LossObservation {
+                t: 1,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 102.into(),
+            s: 100.into(),
+            lo: vec![LossObservation {
+                t: 2,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        let move_cca = CCAAction { rate: 10.into() };
 
         let network_model = NetworkModelNC::new();
         let len = obs.len();
@@ -1559,83 +1579,62 @@ mod tests {
     #[test]
     fn debug_max_rate() {
         let mut obs = vec![];
-        obs.push(
-            ObservationNC {
-                a: 0.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 0.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 0.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 0.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 0.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 0.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
-        obs.push(
-            ObservationNC {
-                a: 12.into(),
-                s: 0.into(),
-                lo: vec![LossObservation {
-                    t: 0,
-                    l: 0.into(), // it is in discretization unit of packet
-                }],
-
-            }
-        );
+        obs.push(ObservationNC {
+            a: 0.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 0.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 0.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 0.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 0.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 0.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
+        obs.push(ObservationNC {
+            a: 12.into(),
+            s: 0.into(),
+            lo: vec![LossObservation {
+                t: 0,
+                l: 0.into(), // it is in discretization unit of packet
+            }],
+        });
         //let move_cca = None;
 
         let network_model = NetworkModelNC::new();
