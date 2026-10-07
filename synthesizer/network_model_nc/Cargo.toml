@@ -17,3 +17,4 @@ lazy_static = "1.4.0"
 ds = {path = "../ds"}
 cc_common = {path = "../cc_common"}
 network_model_nc_qe_output = {path = "../network_model_nc_qe_output"}
+network_model_bursty_qe_output = {path = "../network_model_bursty_qe_output"}

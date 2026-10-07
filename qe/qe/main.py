@@ -1,5 +1,6 @@
 import argparse
 import os
+from typing import List, Tuple
 
 from qe.netcal import qe_queries, transpile
 from qe.netcal.common import OUTPUT_DIR as DEFAULT_OUTPUT_DIR
@@ -22,6 +23,8 @@ class Main:
         output_dir: str,
         input_dir: str | None,
         output_path: str | None,
+        only_lhs: List[str] | None = None,
+        extra_inputs: List[Tuple[int, str]] | None = None,
     ):
         self.T = T
         self.queue_tol_bdp = queue_tol_bdp
@@ -40,13 +43,24 @@ class Main:
         os.makedirs(os.path.dirname(self.output_path) or ".", exist_ok=True)
         self.config = get_query_config(config_name)
         self.queries = self.config.generate_queries(T, queue_tol_bdp)
+        if only_lhs:
+            # Lets an expensive quantity (e.g. C) be re-solved at a smaller T
+            # without also re-solving everything else.
+            self.queries = [q for q in self.queries if q.lhs in only_lhs]
         print("Total queries: ", len(self.queries))
+        # Additional (T, input_dir) pairs transpiled into the same lib.rs, so
+        # Rust can fall back to a smaller T where the main T is unsolved.
+        self.extra_inputs = extra_inputs or []
 
     def solve(self):
         qe_queries.solve_queries(self.config.network_model, self.output_dir, self.T, self.queries)
 
     def transpile(self):
-        transpile.transpile_all(self.config.network_model, self.input_dir, self.output_path, self.T, self.queries)
+        runs = [(self.T, self.input_dir, self.queries)]
+        for T, input_dir in self.extra_inputs:
+            queries = self.config.generate_queries(T, self.queue_tol_bdp)
+            runs.append((T, input_dir, queries))
+        transpile.transpile_all_multi(self.config.network_model, runs, self.output_path)
 
     def run(self):
         if self.mode in ("solve", "all"):
@@ -83,12 +97,33 @@ def get_args():
         help="Where the transpile stage writes the generated Rust file. "
              "Defaults to <input-dir>/lib.rs.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--only-lhs", action="store", type=str, nargs="+",
+        help="Only solve/transpile queries whose left-hand side is one of these "
+             "(e.g. --only-lhs C).",
+    )
+    parser.add_argument(
+        "--extra-input", action="append", default=[], metavar="T=DIR",
+        help="Transpile only: also include results solved at trace length T "
+             "from DIR in the same output file.  May be repeated.",
+    )
+    args = parser.parse_args()
+    extra = []
+    for spec in args.extra_input:
+        T, _, input_dir = spec.partition("=")
+        if not input_dir:
+            parser.error(f"--extra-input expects T=DIR, got {spec!r}")
+        extra.append((int(T), input_dir))
+    args.extra_input = extra
+    if extra and args.mode != "transpile":
+        parser.error("--extra-input is only valid with --mode transpile")
+    return args
 
 
 if __name__ == "__main__":
     args = get_args()
     Main(
         args.tsteps, args.queue_tol_bdp, args.mode, args.config,
-        args.output_dir, args.input_dir, args.output_path,
+        args.output_dir, args.input_dir, args.output_path, args.only_lhs,
+        args.extra_input,
     ).run()

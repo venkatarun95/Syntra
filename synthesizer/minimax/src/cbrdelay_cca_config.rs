@@ -23,6 +23,25 @@ pub const APP_SEND_CHOICES: &[AppSendFraction] = &[
     AppSendFraction::Zero,
 ];
 
+/// Which generated QE evaluator models the network.  `Plain` is the
+/// original CBR-delay link; `Bursty` adds a sender whose arrivals may be
+/// perturbed by up to `BURSTY_K` bytes.  `--qe-model` overrides this.
+pub const QE_MODEL: QeModel = QeModel::Plain;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum QeModel {
+    Plain,
+    Bursty,
+}
+
+/// Bursty model only: the sender's maximum burstiness `K`, in the same units
+/// as C and B.  The QE results are only valid when `K < BURSTY_PERT * B`.
+pub const BURSTY_K: RealNumRep = RealNumRep::new_raw(1, 1);
+
+/// Bursty model only: `pert` in the constraint `K < pert * B`, i.e. how large
+/// a burst may be relative to the (unknown) buffer.
+pub const BURSTY_PERT: RealNumRep = RealNumRep::new_raw(1, 2);
+
 /// Minimax plies per CCA decision.  This must be even: one CCA action and one
 /// adversary action make a round.  Four is a practical interactive default;
 /// increase only after reducing the action spaces or when you specifically

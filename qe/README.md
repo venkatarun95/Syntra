@@ -43,6 +43,9 @@ python3 -m qe.main -t 6
 | `--input-dir` | `outputs/qe/cbrdelay_l0_t6/` | Where the transpile stage reads solved SMT2 query results from |
 | `--output-path` | `outputs/qe/cbrdelay_l0_t6/lib.rs` | Where the transpile stage writes the generated Rust file |
 
+| `--only-lhs` | (all) | Only solve/transpile queries with these left-hand sides, e.g. `--only-lhs C` to re-solve just C at a smaller `T` |
+| `--extra-input` | (none) | `T=DIR`, repeatable, `--mode transpile` only: also transpile results solved at trace length `T` from `DIR` into the same `lib.rs`, so the Rust side can fall back to smaller `T` where the main `T` is unsolved |
+
 `--output-dir` and `--input-dir` are separate flags so you can transpile
 against a directory of results produced by a different run (or machine)
 without re-solving:
@@ -124,6 +127,36 @@ v = m.v  # v.A, v.S, v.L, v.C, v.B, ...
 Models subclass each other the same way their `Config`/`Variables`/
 `Constraints` do (`CBRDelay(Ideal)`, with `CBRDelay.Constraints(Ideal.Constraints)`
 etc.), so a subclass only needs to define what's different from its parent.
+
+## Bursty CBR-delay results
+
+The `bursty_cbrdelay` config's results are spread over several trace lengths,
+because the C queries did not finish at larger `T`:
+
+| T | Directory | Status |
+| --- | --- | --- |
+| 6 | `outputs/qe/bursty_cbrdelay_T6/` | everything except C |
+| 5 | `bursty_cbrdelay_T6/` (top level; despite its name it holds the T=5 run) | C with 1 loss only |
+| 4 | `outputs/qe/bursty_cbrdelay_T4/` | C only (`--only-lhs C`) |
+
+To re-solve one quantity at another `T`:
+
+```bash
+python3 -m qe.main --mode solve --config bursty_cbrdelay -t 4 --only-lhs C \
+  --output-dir outputs/qe/bursty_cbrdelay_T4
+```
+
+`sh scripts/transpile_bursty.sh` transpiles all of them into
+`synthesizer/network_model_bursty_qe_output/src/lib.rs`.  It reads from
+scratch copies, because transpiling writes `.smt2.z3` debug files next to its
+inputs.  Which `T` to use for each quantity is decided at runtime in Rust
+(`NetworkModelNC::compute_c`; see `synthesizer/minimax/CCA_DEVELOPMENT.md`).
+
+Free model parameters that QE does not eliminate (bursty: `K`, `pert`) are
+listed in the model's `qe_parameters`, and become trailing arguments of every
+generated function.  For every B query the transpiler also emits
+`compute_c_from_b_*`: the clauses of that B result that constrain C alone.
+These are sound bounds on C even when the C query is unsolved.
 
 ## Output layout
 

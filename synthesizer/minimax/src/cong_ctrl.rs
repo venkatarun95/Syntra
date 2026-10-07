@@ -16,12 +16,13 @@ use minimax::State;
 // use network_model_z3::NetworkModelZ3;
 use ds::tree::Tree;
 use ds::*;
-use network_model_nc::NetworkModelNC;
+use network_model_nc::{BurstyQe, NetworkModelNC};
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
     state_policy, CandidateAction, InconsistentQeWindows, StatePolicy, StateQuantities, APP_IS_BACKLOGGED,
     APP_SEND_CHOICES, CANDIDATE_ACTIONS, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH,
+    BURSTY_K, BURSTY_PERT, QE_MODEL, QeModel,
 };
 
 // ------------------------------------------------------------------------------------------
@@ -932,6 +933,10 @@ struct Args {
     /// iterating on objectives/actions; the minimax search grows quickly.
     #[arg(long, default_value_t = 4)]
     steps: u32,
+
+    /// Generated QE evaluator; defaults to `QE_MODEL` in the config.
+    #[arg(long, value_enum)]
+    qe_model: Option<QeModel>,
 }
 
 fn get_sim_tag(args: &Args) -> String {
@@ -944,6 +949,11 @@ fn get_sim_tag(args: &Args) -> String {
             ret.push_str("_cbrd");
         }
         ret.push_str(&format!("_c{}_b{}", args.sim_c, args.sim_b));
+    }
+    if args.qe_model.unwrap_or(QE_MODEL) == QeModel::Bursty {
+        // Ratios print as "1/2"; keep the tag a single path component.
+        let tag = format!("_bursty_k{}_pert{}", BURSTY_K, BURSTY_PERT);
+        ret.push_str(&tag.replace('/', "over"));
     }
     ret
 }
@@ -1059,6 +1069,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         NetworkModelNC::new_with_app_send_choices(APP_SEND_CHOICES)
     };
+    let qe_model = args.qe_model.unwrap_or(QE_MODEL);
+    info!("QE model: {:?}", qe_model);
+    if qe_model == QeModel::Bursty {
+        network_model = network_model.with_qe(std::sync::Arc::new(BurstyQe {
+            k: BURSTY_K,
+            pert: BURSTY_PERT,
+        }));
+    }
 
     network_model.init();
     let mut ccs = CongCtrlState::new(network_model);

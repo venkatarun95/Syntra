@@ -5,6 +5,9 @@ from qe.util import z3_min
 
 
 class BurstyCBRDelay(Ideal):
+    # Neither is eliminated by the default bursty query config; both are
+    # constrained positive by `perturb`.
+    qe_parameters = ("K", "pert")
 
     @dataclass
     class Config(Ideal.Config):

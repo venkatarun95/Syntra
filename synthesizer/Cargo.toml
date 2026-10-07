@@ -6,6 +6,7 @@ members = [
     "network_model_nc",
     # "network_model_z3",
     "network_model_nc_qe_output",
+    "network_model_bursty_qe_output",
     "ds"
 , "abr_common", "network_model_c"]
 resolver = "2"

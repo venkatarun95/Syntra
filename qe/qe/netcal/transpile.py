@@ -93,6 +93,9 @@ def my_str(expr: z3.ExprRef) -> str:
         return " + ".join([my_str(x) for x in expr.children()])
     elif expr.decl().kind() == z3.Z3_OP_MUL:
         children = expr.children()
+        if not any(isinstance(x, z3.RatNumRef) or x.decl().kind() == z3.Z3_OP_UMINUS for x in children):
+            # Product of variables, e.g. `B * pert` with a model parameter.
+            return " * ".join([f"({my_str(x)})" for x in children])
         assert len(children) == 2
         const = children[0]
         var = children[1]
@@ -103,6 +106,10 @@ def my_str(expr: z3.ExprRef) -> str:
         if const_is_neg(const):
             return f"-{var} * {z3.simplify(-const)}"
         return f"{var} * {const}"
+    elif expr.decl().kind() == z3.Z3_OP_DIV and not isinstance(expr, z3.RatNumRef):
+        # Appears when a bound is divided by a model-parameter coefficient.
+        num, den = expr.children()
+        return f"({my_str(num)}) / ({my_str(den)})"
     elif isinstance(expr, z3.ArithRef) and expr.decl().kind() == z3.Z3_OP_UMINUS:
         return f"-{my_str(expr.children()[0])}"
     elif isinstance(expr, z3.RatNumRef):
@@ -151,7 +158,7 @@ def eliminate_ite(expr: z3.ExprRef) -> List[z3.ExprRef]:
     return ret
 
 
-def transpile_union_list(lhs: z3.ExprRef, ineq_list: List[z3.ExprRef]):
+def transpile_union_list(lhs: z3.ExprRef, ineq_list: List[z3.ExprRef], positive_params: Tuple[str, ...] = ()):
     ineq_with_lhs = []
     ineq_without_lhs = []
     for ineq in ineq_list:
@@ -179,7 +186,7 @@ def transpile_union_list(lhs: z3.ExprRef, ineq_list: List[z3.ExprRef]):
 
         interval_list = []
         for ineq in ineq_with_lhs:
-            interval = transpile_ineq_interval(lhs, ineq)
+            interval = transpile_ineq_interval(lhs, ineq, positive_params)
             interval_list.append(interval)
 
         interval_list_arguments = ", ".join(interval_list)
@@ -203,7 +210,22 @@ def rename_ineq_op(op: str):
     return op
 
 
-def transpile_ineq_interval(lhs: z3.ExprRef, orig_ineq: z3.BoolRef) -> str:
+def coeff_is_neg(coeff: z3.ArithRef, positive_params: Tuple[str, ...]) -> bool:
+    if coeff.decl().kind() == z3.Z3_OP_UNINTERPRETED:
+        # Only parameters known to be strictly positive have a static sign.
+        if str(coeff) not in positive_params:
+            raise NotImplementedError(f"coefficient {coeff} has unknown sign")
+        return False
+    if coeff.decl().kind() == z3.Z3_OP_MUL:
+        ret = False
+        for x in coeff.children():
+            assert isinstance(x, z3.ArithRef)
+            ret = ret != coeff_is_neg(x, positive_params)
+        return ret
+    return const_is_neg(coeff)
+
+
+def transpile_ineq_interval(lhs: z3.ExprRef, orig_ineq: z3.BoolRef, positive_params: Tuple[str, ...] = ()) -> str:
     if "If" in str(orig_ineq):
         if orig_ineq.decl().kind() == z3.Z3_OP_EQ:
             assert contains(lhs, orig_ineq.children()[0])
@@ -259,9 +281,13 @@ def transpile_ineq_interval(lhs: z3.ExprRef, orig_ineq: z3.BoolRef) -> str:
     coeff = 1
     coeff_neg = False
     if term.decl().kind() == z3.Z3_OP_MUL:
-        coeff = term.children()[0]
+        others = [x for x in term.children() if not x.eq(lhs)]
+        assert len(others) == len(term.children()) - 1
+        coeff = others[0]
+        for x in others[1:]:
+            coeff = coeff * x
         assert isinstance(coeff, z3.ArithRef)
-        coeff_neg = const_is_neg(coeff)
+        coeff_neg = coeff_is_neg(coeff, positive_params)
 
     # Get bound
     assert isinstance(expr, z3.ArithRef)
@@ -321,6 +347,7 @@ rename_dict = {
     "S_t": "s",
     "L_t": "l",
     "I_t": "i",
+    "P_t": "p",
     "Q_t": "q",
 }
 
@@ -407,8 +434,14 @@ def transpile(
     input_dir: str, output_path: str,
     T: int, lhs: str, eliminate: List[str], n_losses_observed: int,
     sim: bool, ideal: bool,
-    newly_obs_l: int
+    newly_obs_l: int,
+    c_from_b: bool = False,
 ) -> Optional[str]:
+    """
+    With c_from_b, read the solved B query but emit only its clauses that
+    constrain C without mentioning B, as a C bound.  These are sound
+    constraints on C at this T even when the C query itself did not finish.
+    """
     # The interface of this function needs to be Send + Sync. As this may be
     # called in a new thread.
     c = network_model.Config(T=T)
@@ -439,7 +472,9 @@ def transpile(
     # Substitute each variable name with the name that will be used in rust.
     cnf = rename_vars(c, v, cnf)
 
-    if lhs in ["C", "B"]:
+    if lhs in ["C", "B"] or lhs.startswith("Q_"):
+        # Q_{T-1} is a standalone variable defined by lhs_specific_constraints,
+        # not an element of a model vector, so rename_vars leaves it as is.
         lhs_var = z3.Real(lhs)
     else:
         prefix = lhs.split("_")[0] + "_t"
@@ -454,9 +489,17 @@ def transpile(
     # of the lhs variable under the CNF constraints.
     fn_prefix, fn_name = get_function_name(
         lhs, T, n_losses_observed, sim, ideal, newly_obs_l)
+    b_var = None
+    if c_from_b:
+        assert lhs == "B" and not sim and not ideal
+        b_var = lhs_var
+        lhs, lhs_var = "C", z3.Real("C")
+        fn_prefix = "compute_c_from_b"
+        fn_name = f"{fn_prefix}_t_{T}_l_{n_losses_observed}"
     print(fn_name)
     update_fn_ptr_dict(fn_prefix, T, n_losses_observed, newly_obs_l, fn_name)
-    extra_args = get_extra_input_for_lhs(lhs, sim)
+    extra_args = get_extra_input_for_lhs(lhs, sim) + "".join(
+        f", {p}: RealNumRep" for p in network_model.qe_parameters)
     ret_str_list = [
         f"pub fn {fn_name}(a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], L0: RealNumRep{extra_args}) -> IntervalList<RealNumRep> {{",
         f"assert!(l.len() == {max(newly_obs_l + 1, n_losses_observed)});"
@@ -474,15 +517,17 @@ def transpile(
             print(f"For lhs {lhs_var}, converted {disjunction} to {ret}")
         else:
             disjunctions.append(disjunction)
+    if b_var is not None:
+        disjunctions = [x for x in disjunctions if not contains(b_var, x)]
 
     for disjunction in disjunctions:
         assert isinstance(disjunction, z3.BoolRef)
         # import ipdb; ipdb.set_trace()
         this_str = ""
         if disjunction.decl().kind() == z3.Z3_OP_OR:
-            this_str = transpile_union_list(lhs_var, disjunction.children())
+            this_str = transpile_union_list(lhs_var, disjunction.children(), network_model.qe_parameters)
         elif is_ineq(disjunction):
-            this_str = transpile_union_list(lhs_var, [disjunction])
+            this_str = transpile_union_list(lhs_var, [disjunction], network_model.qe_parameters)
         else:
             assert False
         ret_str_list.append(this_str)
@@ -499,7 +544,6 @@ def transpile(
     return out_str
 
 
-@try_except_wrapper
 def transpile_all(
     network_model: Type[Ideal],
     input_dir: str,
@@ -507,11 +551,29 @@ def transpile_all(
     T: int,
     queries: List[QEQuery],
 ):
+    transpile_all_multi(network_model, [(T, input_dir, queries)], output_path)
+
+
+@try_except_wrapper
+def transpile_all_multi(
+    network_model: Type[Ideal],
+    runs: List[Tuple[int, str, List[QEQuery]]],
+    output_path: str,
+):
+    """
+    Transpile solved results for several trace lengths into one Rust file.
+    Each run is (T, input_dir, queries).  Function names include T, so the
+    dispatch tables simply gain one key per (T, losses) that was solved;
+    missing results are skipped and the Rust side chooses among what exists.
+    """
+    params = "".join("    RealNumRep,\n" for _ in network_model.qe_parameters)
+    # Not every function mentions every model parameter.
+    allow_unused = "#![allow(unused_variables)]\n" if network_model.qe_parameters else ""
     with open(output_path, "w") as f:
         f.write("""
 // Computer generated. Do not edit by hand.
 #![allow(clippy::all)]
-use ds::*;
+@@ALLOW@@use ds::*;
 use ds::interval::{Interval, IntervalList};
 use std::collections::HashMap;
 use lazy_static::lazy_static;
@@ -524,27 +586,35 @@ pub type QeFun = fn(
     RealNumRep,
     RealNumRep,
     RealNumRep,
-) -> IntervalList<RealNumRep>;
-pub type QeFunC =
-    fn(&[RealNumRep], &[RealNumRep], &[RealNumRep], RealNumRep) -> IntervalList<RealNumRep>;
+@@PARAMS@@) -> IntervalList<RealNumRep>;
+pub type QeFunC = fn(
+    &[RealNumRep],
+    &[RealNumRep],
+    &[RealNumRep],
+    RealNumRep,
+@@PARAMS@@) -> IntervalList<RealNumRep>;
 pub type QeFunB = fn(
     &[RealNumRep],
     &[RealNumRep],
     &[RealNumRep],
     RealNumRep,
     RealNumRep,
-) -> IntervalList<RealNumRep>;
-pub type QeFunRate =
-    fn(&[RealNumRep], &[RealNumRep], &[RealNumRep], RealNumRep) -> IntervalList<RealNumRep>;
+@@PARAMS@@) -> IntervalList<RealNumRep>;
+pub type QeFunRate = fn(
+    &[RealNumRep],
+    &[RealNumRep],
+    &[RealNumRep],
+    RealNumRep,
+@@PARAMS@@) -> IntervalList<RealNumRep>;
 pub type QeFunSim = fn(
     &[RealNumRep],
     &[RealNumRep],
     &[RealNumRep],
     RealNumRep,
     RealNumRep,
-) -> IntervalList<RealNumRep>;
+@@PARAMS@@) -> IntervalList<RealNumRep>;
 
-""")
+""".replace("@@PARAMS@@", params).replace("@@ALLOW@@", allow_unused))
         # f.write("// Computer generated. Do not edit by hand.\n")
         # f.write("use crate::cc_common::*;\n")
         # f.write("use crate::interval::{Interval, IntervalList};\n")
@@ -554,13 +624,16 @@ pub type QeFunSim = fn(
         # f.write("pub type QeFunRate = fn(&[RealNumRep], &[RealNumRep], &[RealNumRep], RealNumRep) -> IntervalList<RealNumRep>;\n")
         # f.write("\n")
 
-    for qe_query in queries:
-        lhs = qe_query.lhs
-        eliminate = qe_query.eliminate
-        n_losses_observed = qe_query.n_losses_observed
-        ret = transpile(network_model, input_dir, output_path, T, lhs, get_string_list(eliminate), n_losses_observed, qe_query.sim, qe_query.ideal, qe_query.newly_obs_l)
-        # print(ret)
-        # import ipdb; ipdb.set_trace()
+    for T, input_dir, queries in runs:
+        for qe_query in queries:
+            lhs = qe_query.lhs
+            eliminate = qe_query.eliminate
+            n_losses_observed = qe_query.n_losses_observed
+            ret = transpile(network_model, input_dir, output_path, T, lhs, get_string_list(eliminate), n_losses_observed, qe_query.sim, qe_query.ideal, qe_query.newly_obs_l)
+            if lhs == "B" and not qe_query.sim and not qe_query.ideal:
+                transpile(network_model, input_dir, output_path, T, lhs, get_string_list(eliminate), n_losses_observed, qe_query.sim, qe_query.ideal, qe_query.newly_obs_l, c_from_b=True)
+            # print(ret)
+            # import ipdb; ipdb.set_trace()
 
     transpile_fn_ptr_dict(output_path)
     subprocess.run(["rustfmt", f"{output_path}"])

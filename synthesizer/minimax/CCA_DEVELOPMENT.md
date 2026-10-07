@@ -105,6 +105,46 @@ control intervals and an even depth of four.  If the program fails before
 printing a step result, reproduce with `--steps 1` before making search-wide
 changes.
 
+## QE models: plain and bursty
+
+`QE_MODEL` in `cbrdelay_cca_config.rs` (or `--qe-model plain|bursty`)
+selects which generated QE evaluator the unchanged `NetworkModelNC` uses:
+
+* `plain`: the original CBR-delay link, `network_model_nc_qe_output`.
+* `bursty`: CBR-delay behind a sender whose arrivals may be perturbed by up to
+  `K` bytes, `network_model_bursty_qe_output`.  QE leaves `K` and `pert` free
+  (they must satisfy `K < pert * B`), so they are fixed by `BURSTY_K` and
+  `BURSTY_PERT` in the config.  Bursty output files get a `_bursty_k…_pert…`
+  suffix.
+
+`network_model_nc/src/qe_tables.rs` hides the differences behind `QeTables`.
+Its lookups return `None` for an unsolved (T, losses) key instead of
+panicking, which is what makes partial QE results usable.
+
+### Unfinished QE queries for C
+
+The bursty C query did not finish at T=6, and at T=5 only one loss count
+finished.  When the C lookup for a window is missing, `NetworkModelNC::compute_c`
+intersects every constraint on C that *was* solved:
+
+1. C from shorter sub-windows, largest T first (T=5, then T=4, ...), over every
+   sub-window whose loss count has a result.
+2. `c_from_b`: the clauses of this window's (solved) B query that constrain C
+   without mentioning B.  The transpiler emits these as `COMPUTE_C_FROM_B`.
+3. Numerical elimination of B: C is feasible for the window iff its B interval
+   is non-empty, so `tighten_c_with_b` bisects for that range on a 1/16 grid.
+   Like `my_min`/`my_max`, it assumes the feasible C set is one interval.
+
+Step 3 is what the unfinished QE query would have done symbolically; for
+concrete observations it is a 1-D search.  The test
+`test_c_tightened_with_b_matches_exact` hides the plain model's T=6 C and
+checks that this recovers the exact T=6 C to within the grid, even with no
+sub-window results at all.  Steps 2-3 also keep every C passed to the T=6
+B/Q/S/L functions feasible; those functions `assert!` that C is feasible.
+
+Regenerate the bursty crate from all bursty results with
+`sh qe/scripts/transpile_bursty.sh` (see the `qe` README).
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in

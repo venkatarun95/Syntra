@@ -4,6 +4,10 @@ from qe.util import z3_min
 
 
 class Ideal:
+    # Free, strictly positive model parameters that QE leaves in its results
+    # and that the Rust caller supplies as fixed values.  Each becomes a
+    # trailing `RealNumRep` argument of every generated function.
+    qe_parameters: tuple = ()
 
     @dataclass
     class Config:

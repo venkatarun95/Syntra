@@ -1,5 +1,5 @@
 use itertools::Itertools;
-use log::{debug, error, info, trace};
+use log::{debug, error, info, trace, warn};
 use num_traits::ToPrimitive;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -11,6 +11,10 @@ use ds::interval::{Interval, IntervalList};
 use ds::*;
 use lazy_static::lazy_static;
 use network_model_nc_qe_output::*;
+use std::sync::Arc;
+
+pub mod qe_tables;
+pub use qe_tables::{BurstyQe, PlainQe, QeTables};
 
 const N_DISCRETE_POINTS: usize = 2;
 const EPS: RealNumRep = RealNumRep::new_raw(1, 1 << 4);
@@ -368,6 +372,7 @@ pub struct NetworkModelNC {
     sim_c: Option<RealNumRep>,
     sim_b: Option<RealNumRep>,
     app_send_choices: Vec<AppSendFraction>,
+    qe: Arc<dyn QeTables>,
 }
 
 impl NetworkModel for NetworkModelNC {
@@ -491,7 +496,7 @@ impl NetworkModel for NetworkModelNC {
         let tsteps = a.len() as i32;
         let n_losses_observed = l.len() as i32;
 
-        let mut c_interval = COMPUTE_C[&(tsteps, n_losses_observed)](&a, &l, &s, l0);
+        let mut c_interval = self.compute_c(relevant_history, tsteps, n_losses_observed, &a, &l, &s, l0);
         c_interval = c_interval.intersection(&IntervalList::interval_bounded(
             Bound::Included(SMALLEST_BW.into()),
             Bound::Included(LARGEST_BW.into()),
@@ -505,7 +510,7 @@ impl NetworkModel for NetworkModelNC {
         let mut min_b: RealNumRep = LARGEST_BW.into();
         let mut max_b: RealNumRep = SMALLEST_BW.into();
         for c_val in c_vals {
-            let mut b_interval = COMPUTE_B[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c_val);
+            let mut b_interval = expect_qe("B", tsteps, n_losses_observed, self.qe.b(tsteps, n_losses_observed, &a, &l, &s, l0, c_val));
             b_interval = b_interval.intersection(&IntervalList::interval_bounded(
                 Bound::Included(SMALLEST_BW.into()),
                 Bound::Included(LARGEST_BW.into()),
@@ -626,7 +631,7 @@ impl NetworkModel for NetworkModelNC {
                 let tsteps = a.len() as i32;
                 let n_losses_observed = l.len() as i32;
 
-                let mut q_interval = COMPUTE_Q[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c, b);
+                let mut q_interval = expect_qe("Q", tsteps, n_losses_observed, self.qe.q(tsteps, n_losses_observed, &a, &l, &s, l0, c, b));
                 assert!(!q_interval.is_empty());
                 if n_losses_observed == tsteps {
                     // In this case, due to our simplification process in QE, we remove
@@ -665,8 +670,7 @@ impl NetworkModel for NetworkModelNC {
         // } else {
         //     &COMPUTE_SIM_S_4
         // };
-        let compute_s_hm = &COMPUTE_S_5;
-        let s_interval = compute_s_hm[&(tsteps, n_losses_observed)](&a, &l, &s, l0, sim_c, sim_b);
+        let s_interval = expect_qe("S", tsteps, n_losses_observed, self.qe.s(tsteps, n_losses_observed, &a, &l, &s, l0, sim_c, sim_b));
         assert!(s_interval.is_contiguous_interval());
         let min_s = my_min(&s_interval);
         let max_s = my_max(&s_interval);
@@ -978,6 +982,21 @@ impl Default for NetworkModelNC {
     }
 }
 
+/// Index-style lookup with a message naming the unsolved QE query.
+fn expect_qe(
+    quantity: &str,
+    tsteps: i32,
+    n_losses_observed: i32,
+    bounds: Option<IntervalList<RealNumRep>>,
+) -> IntervalList<RealNumRep> {
+    bounds.unwrap_or_else(|| {
+        panic!(
+            "No QE result for {} at T={} with {} losses observed",
+            quantity, tsteps, n_losses_observed
+        )
+    })
+}
+
 impl NetworkModelNC {
     pub fn new() -> Self {
         Self {
@@ -985,7 +1004,200 @@ impl NetworkModelNC {
             sim_c: None,
             sim_b: None,
             app_send_choices: vec![AppSendFraction::Full],
+            qe: Arc::new(PlainQe),
         }
+    }
+
+    /// Use a different generated QE evaluator, e.g. `BurstyQe`.
+    pub fn with_qe(self, qe: Arc<dyn QeTables>) -> Self {
+        Self { qe, ..self }
+    }
+
+    /// Bounds on C for the window `relevant_history` (whose observation
+    /// vectors the caller already computed as `a`, `l`, `s`, `l0`).
+    ///
+    /// Uses the QE result for the whole window when one was solved, which is
+    /// always the case for the plain model.  Otherwise the C query for this
+    /// window did not finish, so intersect every constraint on C that did:
+    ///
+    /// 1. C from shorter sub-windows (`c_from_sub_windows`).
+    /// 2. The C-only clauses of this window's B query (`c_from_b`).
+    /// 3. C is feasible for this window iff its B interval is non-empty,
+    ///    which eliminates B numerically (`tighten_c_with_b`) — the step the
+    ///    unfinished QE query would have done symbolically.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_c(
+        &self,
+        relevant_history: &[ObservationNC],
+        tsteps: i32,
+        n_losses_observed: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+    ) -> IntervalList<RealNumRep> {
+        if let Some(c) = self.qe.c(tsteps, n_losses_observed, a, l, s, l0) {
+            return c;
+        }
+
+        let sub = self.c_from_sub_windows(relevant_history, tsteps);
+        let from_b = self.qe.c_from_b(tsteps, n_losses_observed, a, l, s, l0);
+        let mut c = IntervalList::interval_bounded(
+            Bound::Included(0.into()),
+            Bound::Included(LARGEST_BW.into()),
+        );
+        match (&sub, &from_b) {
+            (None, None) => panic!(
+                "No QE result constrains C at T={} with {} losses observed",
+                tsteps, n_losses_observed
+            ),
+            (Some(sub), None) => c = c.intersection(sub),
+            (None, Some(from_b)) => c = c.intersection(from_b),
+            (Some(sub), Some(from_b)) => {
+                let both = c.intersection(sub).intersection(from_b);
+                c = if both.is_empty() {
+                    // Discretized QE results can disagree slightly.  Values
+                    // outside `from_b` would trip `b`'s assertions, so it wins.
+                    debug!("C from sub-windows {:?} disagrees with C from B {:?}", sub, from_b);
+                    c.intersection(from_b)
+                } else {
+                    both
+                };
+            }
+        }
+        if from_b.is_some() {
+            c = self.tighten_c_with_b(c, tsteps, n_losses_observed, a, l, s, l0);
+        }
+        c
+    }
+
+    /// Shrink `c` to the C values for which this window's B interval is
+    /// non-empty, i.e. that are feasible for the whole window.  `c` must lie
+    /// within `QeTables::c_from_b`, so that evaluating `b` is safe.
+    ///
+    /// Like `my_min`/`my_max`, this assumes the feasible set of C is a single
+    /// interval: it finds one feasible C on a grid, then bisects towards each
+    /// end.  The ends are rounded inwards to feasible multiples of
+    /// 1/`C_GRID`, so they remain valid inputs to every other T-step function.
+    #[allow(clippy::too_many_arguments)]
+    fn tighten_c_with_b(
+        &self,
+        c: IntervalList<RealNumRep>,
+        tsteps: i32,
+        n_losses_observed: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+    ) -> IntervalList<RealNumRep> {
+        const C_GRID: RealNumInt = 16;
+        const N_SEEDS: RealNumInt = 16;
+        if c.is_empty() {
+            return c;
+        }
+        let at = |k: RealNumInt| RealNumRep::new(k, C_GRID);
+        let b_range = IntervalList::interval_bounded(
+            Bound::Included(SMALLEST_BW.into()),
+            Bound::Included(LARGEST_BW.into()),
+        );
+        let feasible = |k: RealNumInt| {
+            let point = IntervalList::interval_point(Bound::Included(at(k)));
+            !c.intersection(&point).is_empty()
+                && !expect_qe("B", tsteps, n_losses_observed, self.qe.b(tsteps, n_losses_observed, a, l, s, l0, at(k)))
+                    .intersection(&b_range)
+                    .is_empty()
+        };
+
+        let lo = (my_min(&c) * C_GRID).ceil().to_integer();
+        let hi = (my_max(&c) * C_GRID).floor().to_integer();
+        let Some(seed) = (0..=N_SEEDS)
+            .map(|i| lo + (hi - lo) * i / N_SEEDS)
+            .find(|&k| lo <= hi && feasible(k))
+        else {
+            warn!("No feasible C found in {:?} at T={}; keeping it untightened", c, tsteps);
+            return c;
+        };
+
+        // Invariant: `in_k` is feasible and `out_k` is not.
+        let bisect = |mut in_k: RealNumInt, mut out_k: RealNumInt| {
+            while (in_k - out_k).abs() > 1 {
+                let mid = (in_k + out_k) / 2;
+                if feasible(mid) {
+                    in_k = mid;
+                } else {
+                    out_k = mid;
+                }
+            }
+            in_k
+        };
+        let lower = if feasible(lo) { lo } else { bisect(seed, lo) };
+        let upper = if feasible(hi) { hi } else { bisect(seed, hi) };
+        trace!("C tightened with B from {:?} to [{}, {}]", c, at(lower), at(upper));
+        c.intersection(&IntervalList::interval_bounded(
+            Bound::Included(at(lower)),
+            Bound::Included(at(upper)),
+        ))
+    }
+
+    /// Intersect C over shorter sub-windows of `relevant_history`, largest
+    /// trace length first, using every sub-window whose loss count was
+    /// solved and that is not inside a sub-window already used.  C is a
+    /// persistent parameter, so each sub-window's bound is sound on its own.
+    /// Sub-windows ignore the outstanding CCA action; dropping the newest
+    /// arrival only loosens a bound.
+    fn c_from_sub_windows(
+        &self,
+        relevant_history: &[ObservationNC],
+        tsteps: i32,
+    ) -> Option<IntervalList<RealNumRep>> {
+        // (first, last) observation index of every sub-window used so far.
+        let mut used: Vec<(usize, usize)> = vec![];
+        let mut ret: Option<IntervalList<RealNumRep>> = None;
+        for sub_t in (1..tsteps).rev() {
+            let n_obs = sub_t as usize + 1;
+            if n_obs > relevant_history.len() {
+                continue;
+            }
+            for first in 0..=(relevant_history.len() - n_obs) {
+                let last = first + n_obs - 1;
+                if used.iter().any(|&(f, l)| f <= first && last <= l) {
+                    continue;
+                }
+                let window = &relevant_history[first..=last];
+                let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(window, &None);
+                let Some(c) = self.qe.c(sub_t, l.len() as i32, &a, &l, &s, l0) else {
+                    continue;
+                };
+                trace!(
+                    "C fallback: T={} window [{}, {}] losses={} gives {:?}",
+                    sub_t,
+                    first,
+                    last,
+                    l.len(),
+                    c
+                );
+                used.push((first, last));
+                ret = Some(match ret {
+                    None => c,
+                    Some(prev) => {
+                        let both = prev.intersection(&c);
+                        if both.is_empty() {
+                            // Generated QE is discretized, so independent
+                            // windows can disagree slightly; keep the bound
+                            // from the larger, earlier-chosen windows.
+                            debug!(
+                                "C fallback: ignoring disagreeing T={} window [{}, {}]",
+                                sub_t, first, last
+                            );
+                            prev
+                        } else {
+                            both
+                        }
+                    }
+                });
+            }
+        }
+        ret
     }
 
     pub fn new_with_app_send_choices(choices: &[AppSendFraction]) -> Self {
@@ -1062,7 +1274,7 @@ impl NetworkModelNC {
             let tsteps = s.len() as i32;
             let n_losses_observed = l.len() as i32;
 
-            let c_interval = COMPUTE_C[&(tsteps, n_losses_observed)](&a, &l, &s, l0);
+            let c_interval = self.compute_c(rh, tsteps, n_losses_observed, &a, &l, &s, l0);
             c_interval_all = c_interval_all.intersection(&c_interval);
             //assert!(!c_interval_all.is_empty());
             if c_interval_all.is_empty() {
@@ -1087,7 +1299,7 @@ impl NetworkModelNC {
                 let tsteps = s.len() as i32;
                 let n_losses_observed = l.len() as i32;
 
-                let b_interval = COMPUTE_B[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c_val);
+                let b_interval = expect_qe("B", tsteps, n_losses_observed, self.qe.b(tsteps, n_losses_observed, &a, &l, &s, l0, c_val));
                 //print!("{:?}\n",b_interval);
                 let old_b = b_interval_all.clone();
                 b_interval_all = b_interval_all.intersection(&b_interval);
@@ -1129,7 +1341,7 @@ impl NetworkModelNC {
         let n_losses_observed = l.len() as i32;
 
         assert!(FEASIBLE_SIZE >= tsteps as usize);
-        let mut c_interval = COMPUTE_C[&(tsteps, n_losses_observed)](&a, &l, &s, l0);
+        let mut c_interval = self.compute_c(relevant_history, tsteps, n_losses_observed, &a, &l, &s, l0);
         c_interval = c_interval.intersection(&IntervalList::interval_bounded(
             Bound::Included(0.into()),
             Bound::Included(LARGEST_BW.into()),
@@ -1142,7 +1354,7 @@ impl NetworkModelNC {
 
         let mut ret = Vec::new();
         for c_val in c_vals {
-            let mut b_interval = COMPUTE_B[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c_val);
+            let mut b_interval = expect_qe("B", tsteps, n_losses_observed, self.qe.b(tsteps, n_losses_observed, &a, &l, &s, l0, c_val));
             b_interval = b_interval.intersection(&IntervalList::interval_bounded(
                 Bound::Included(0.into()),
                 Bound::Included(LARGEST_BW.into()),
@@ -1166,7 +1378,7 @@ impl NetworkModelNC {
         let tsteps = a.len() as i32;
         let n_losses_observed = l.len() as i32;
 
-        let s_interval = COMPUTE_S[&(tsteps, n_losses_observed)](&a, &l, &s, l0, c, b);
+        let s_interval = expect_qe("S", tsteps, n_losses_observed, self.qe.s(tsteps, n_losses_observed, &a, &l, &s, l0, c, b));
         assert!(s_interval.is_contiguous_interval());
         let min_s = my_min(&s_interval);
         let max_s = my_max(&s_interval);
@@ -1203,7 +1415,7 @@ impl NetworkModelNC {
             s.push(s_val);
             trace!("Pushing S[{}]={}", tsteps, s_val);
             let prior_loss = l.len() as i32;
-            let los = NetworkModelNC::compute_loss_observations(&a, &l, &s, l0, c, b, prior_loss);
+            let los = self.compute_loss_observations(&a, &l, &s, l0, c, b, prior_loss);
             for lo in los {
                 let this_lo = if lo.is_empty() {
                     let time_ago = (tsteps - 1 - n_losses_observed) + 1;
@@ -1238,7 +1450,9 @@ impl NetworkModelNC {
         *s >= *a - *l
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compute_loss_observations(
+        &self,
         a: &[RealNumRep],
         l: &[RealNumRep],
         s: &[RealNumRep],
@@ -1257,8 +1471,12 @@ impl NetworkModelNC {
 
         trace!("Computing losses after: L={:?}", l);
         let time_ago = (tsteps - 1 - n_losses_observed) as usize;
-        let l_intervals =
-            COMPUTE_L_OBS[&(tsteps, prior_loss, n_losses_observed)](a, l, s, l0, c, b);
+        let l_intervals = expect_qe(
+            "L",
+            tsteps,
+            n_losses_observed,
+            self.qe.l_obs(tsteps, prior_loss, n_losses_observed, a, l, s, l0, c, b),
+        );
         trace!("Got l_intervals={:?}", l_intervals);
 
         // Check if these losses will be observed
@@ -1284,7 +1502,7 @@ impl NetworkModelNC {
                 trace!("Pushing L[{}]={}", n_losses_observed, this_l);
                 l_clone.push(*this_l);
                 let recur_lo =
-                    NetworkModelNC::compute_loss_observations(a, &l_clone, s, l0, c, b, prior_loss);
+                    self.compute_loss_observations(a, &l_clone, s, l0, c, b, prior_loss);
                 trace!("Popping L[{}]", n_losses_observed);
                 l_clone.pop();
 
@@ -1377,11 +1595,13 @@ impl NetworkModelNC {
         // } else {
         //     &COMPUTE_SIM_L_OBS
         // };
-        let compute_l_hm = &COMPUTE_L_OBS;
-
         let time_ago = (tsteps - 1 - n_losses_observed) as usize;
-        let l_interval =
-            compute_l_hm[&(tsteps, prior_loss, n_losses_observed)](a, l, s, l0, sim_c, sim_b);
+        let l_interval = expect_qe(
+            "L",
+            tsteps,
+            n_losses_observed,
+            self.qe.l_obs(tsteps, prior_loss, n_losses_observed, a, l, s, l0, sim_c, sim_b),
+        );
         let this_l = my_min(&l_interval);
 
         let mut ret = Vec::new();
@@ -1430,6 +1650,125 @@ mod tests {
             let mut $rh = get_dummy_history();
             let mut $mc = None;
         };
+    }
+
+    // `compute_c_from_b_t_6_l_*` for the plain model; see the file header.
+    include!("plain_c_from_b_t6.rs");
+
+    /// The plain QE tables with C unsolved above `max_t`, mimicking a QE run
+    /// that did not finish.  With `with_c_from_b`, also provide the C-only
+    /// clauses of the T=6 B results, as the bursty tables do.
+    #[derive(Debug)]
+    struct PlainWithoutC {
+        max_t: i32,
+        with_c_from_b: bool,
+    }
+
+    impl QeTables for PlainWithoutC {
+        fn c(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
+            -> Option<IntervalList<RealNumRep>> {
+            if t > self.max_t {
+                return None;
+            }
+            PlainQe.c(t, n, a, l, s, l0)
+        }
+
+        fn c_from_b(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
+            -> Option<IntervalList<RealNumRep>> {
+            let f: fn(&[RealNumRep], &[RealNumRep], &[RealNumRep], RealNumRep) -> IntervalList<RealNumRep> =
+                match (t, n) {
+                    (6, 0) => compute_c_from_b_t_6_l_0,
+                    (6, 1) => compute_c_from_b_t_6_l_1,
+                    (6, 2) => compute_c_from_b_t_6_l_2,
+                    (6, 3) => compute_c_from_b_t_6_l_3,
+                    (6, 4) => compute_c_from_b_t_6_l_4,
+                    (6, 5) => compute_c_from_b_t_6_l_5,
+                    (6, 6) => compute_c_from_b_t_6_l_6,
+                    _ => return None,
+                };
+            self.with_c_from_b.then(|| f(a, l, s, l0))
+        }
+
+        fn b(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep, c: RealNumRep)
+            -> Option<IntervalList<RealNumRep>> {
+            PlainQe.b(t, n, a, l, s, l0, c)
+        }
+
+        fn q(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep, c: RealNumRep, b: RealNumRep)
+            -> Option<IntervalList<RealNumRep>> {
+            PlainQe.q(t, n, a, l, s, l0, c, b)
+        }
+
+        fn s(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep, c: RealNumRep, b: RealNumRep)
+            -> Option<IntervalList<RealNumRep>> {
+            PlainQe.s(t, n, a, l, s, l0, c, b)
+        }
+
+        fn l_obs(&self, t: i32, prior: i32, total: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep, c: RealNumRep, b: RealNumRep)
+            -> Option<IntervalList<RealNumRep>> {
+            PlainQe.l_obs(t, prior, total, a, l, s, l0, c, b)
+        }
+    }
+
+    const SIM_C: RealNumInt = 20;
+
+    /// Seven-observation windows from a plain-model simulation with C=20,
+    /// B=10, driven by a fixed sequence of rates.
+    fn simulated_windows() -> Vec<Vec<ObservationNC>> {
+        let mut nm = NetworkModelNC::new();
+        nm.setup_network_move_sim(false, SIM_C.into(), 10.into());
+        let mut history = nm.get_initial_history();
+        let mut ret = vec![];
+        for rate in [5, 15, 10, 25, 30, 20, 35, 15, 25, 40, 10, 30, 45, 5, 20, 25] {
+            let move_cca = Some(CCAAction { rate: rate.into() });
+            let rh = &history[history.len() - FEASIBLE_SIZE..];
+            let na = nm.get_network_move_sim(rh, &move_cca, false).unwrap();
+            let obs = nm.compute_observation(history.last().unwrap(), &na, &move_cca);
+            history.push(obs);
+            ret.push(history[history.len() - HISTORY_SIZE..].to_vec());
+        }
+        ret
+    }
+
+    /// (exact T=6 C, C computed by `nm` without it), both clipped like a belief.
+    fn exact_and_fallback_c(nm: &NetworkModelNC, window: &[ObservationNC]) -> (IntervalList<RealNumRep>, IntervalList<RealNumRep>) {
+        let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(window, &None);
+        let (t, n) = (a.len() as i32, l.len() as i32);
+        let clip = IntervalList::interval_bounded(Bound::Included(0.into()), Bound::Included(LARGEST_BW.into()));
+        let exact = PlainQe.c(t, n, &a, &l, &s, l0).unwrap().intersection(&clip);
+        let fallback = nm.compute_c(window, t, n, &a, &l, &s, l0).intersection(&clip);
+        (exact, fallback)
+    }
+
+    /// Falling back to shorter QE windows for C must be sound (contain the
+    /// true C) and can only be looser than the full-window result.
+    #[test]
+    fn test_c_from_sub_windows_is_sound() {
+        for max_t in [5, 4] {
+            let nm = NetworkModelNC::new().with_qe(Arc::new(PlainWithoutC { max_t, with_c_from_b: false }));
+            for window in simulated_windows() {
+                let (exact, fallback) = exact_and_fallback_c(&nm, &window);
+                assert!(!fallback.intersection(&IntervalList::interval_point(Bound::Included(SIM_C.into()))).is_empty());
+                assert_eq!(exact.intersection(&fallback), exact, "max_t={} fallback={:?}", max_t, fallback);
+            }
+        }
+    }
+
+    /// Combining sub-windows, the C-only clauses of B, and B feasibility
+    /// should recover the exact T=6 C to within the bisection grid.
+    #[test]
+    fn test_c_tightened_with_b_matches_exact() {
+        let tol = RealNumRep::new(1, 8);
+        for max_t in [5, 4, 0] {
+            let nm = NetworkModelNC::new().with_qe(Arc::new(PlainWithoutC { max_t, with_c_from_b: true }));
+            for window in simulated_windows() {
+                let (exact, fallback) = exact_and_fallback_c(&nm, &window);
+                let (e_lo, e_hi, f_lo, f_hi) = (my_min(&exact), my_max(&exact), my_min(&fallback), my_max(&fallback));
+                let msg = format!("max_t={} exact=[{}, {}] fallback=[{}, {}]", max_t, e_lo, e_hi, f_lo, f_hi);
+                assert!(f_lo <= SIM_C.into() && RealNumRep::from(SIM_C) <= f_hi, "{}", msg);
+                assert!(e_lo - tol <= f_lo && f_lo <= e_lo + tol && e_hi - tol <= f_hi && f_hi <= e_hi + tol, "{}", msg);
+            }
+        }
     }
 
     fn get_dummy_history() -> Vec<ObservationNC> {
