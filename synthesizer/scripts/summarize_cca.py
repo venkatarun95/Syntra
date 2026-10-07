@@ -57,10 +57,13 @@ def summarize(path):
 
     tight = next((i for i in range(n) if max_c[i] <= 1.25 * min_c[i]), None)
     sound = true_c is None or min_c[-1] - 1e-9 <= true_c <= max_c[-1] + 1e-9
+    min_b, max_b = f(rows[-1], "min_b"), f(rows[-1], "max_b")
+    b_sound = true_b is None or min_b - 1e-9 <= true_b <= max_b + 1e-9
     out.append(
         f"C: first within 25% at t={tight}; final [{min_c[-1]:.2f}, {max_c[-1]:.2f}]"
         f"{'' if sound else '  ** true C OUTSIDE final bound **'};"
-        f" final B [{f(rows[-1], 'min_b'):.1f}, {f(rows[-1], 'max_b'):.1f}]"
+        f" final B [{min_b:.1f}, {max_b:.1f}]"
+        f"{'' if b_sound else '  ** true B OUTSIDE final bound **'}"
     )
 
     if true_c:

@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::fmt::Debug;
+use std::ops::Bound;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
@@ -16,6 +17,11 @@ use ds::*;
 type Bounds = Option<IntervalList<RealNumRep>>;
 
 pub trait QeTables: Debug + Send + Sync {
+    /// The burstiness values this evaluator assumes (0 for the plain link).
+    fn k_values(&self) -> Vec<RealNumRep> {
+        vec![0.into()]
+    }
+
     fn c(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
         -> Bounds;
 
@@ -163,6 +169,11 @@ impl QeTables for PlainQe {
     }
 }
 
+/// (T, losses) keys of `network_model_bursty_qe_output::COMPUTE_C` that were
+/// checked to come from the bursty model.  Add a key once its query input
+/// mentions K (`P_t >= A_t - K`).
+pub const BURSTY_C_RESOLVED: &[(i32, i32)] = &[];
+
 /// CBR-delay behind a sender whose arrivals may be perturbed by up to `k`
 /// bytes (`network_model_bursty_qe_output`).  QE leaves `k` and `pert` (the
 /// bound `k < pert * B`) free, so they are supplied here as fixed values.
@@ -173,8 +184,21 @@ pub struct BurstyQe {
 }
 
 impl QeTables for BurstyQe {
+    fn k_values(&self) -> Vec<RealNumRep> {
+        vec![self.k]
+    }
+
     fn c(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
         -> Bounds {
+        // The only C result currently generated, T=5 with 1 loss, was
+        // solved from a query without the burst constraints (its input in
+        // qe/bursty_cbrdelay_T6/ uses A instead of P and has no K): it is a
+        // plain CBR-delay bound, tighter than the bursty one, and excludes
+        // the true C of bursty traces.  Ignore it until it is re-solved; see
+        // `BURSTY_C_RESOLVED`.
+        if !BURSTY_C_RESOLVED.contains(&(t, n)) {
+            return None;
+        }
         network_model_bursty_qe_output::COMPUTE_C
             .get(&(t, n))
             .map(|f| f(a, l, s, l0, self.k, self.pert))
@@ -314,7 +338,7 @@ static QUIET_HOOK: Once = Once::new();
 
 /// Run `f`, returning `None` instead of unwinding (and without printing the
 /// panic message) if it panics.
-fn quietly_catch<T>(f: impl FnOnce() -> T) -> Option<T> {
+pub(crate) fn quietly_catch<T>(f: impl FnOnce() -> T) -> Option<T> {
     QUIET_HOOK.call_once(|| {
         let previous = panic::take_hook();
         panic::set_hook(Box::new(move |info| {
@@ -330,6 +354,10 @@ fn quietly_catch<T>(f: impl FnOnce() -> T) -> Option<T> {
 }
 
 impl QeTables for UnionBurstyQe {
+    fn k_values(&self) -> Vec<RealNumRep> {
+        self.ks.clone()
+    }
+
     fn c(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
         -> Bounds {
         // A K whose C is unsolved would make the union unsound, so either
@@ -410,6 +438,20 @@ impl QeTables for UnionBurstyQe {
         c: RealNumRep,
         b: RealNumRep,
     ) -> Bounds {
-        self.union(Some(b), |q| q.l_obs(t, prior, total, a, l, s, l0, c, b))
+        // The newest service may have been chosen from another K's range;
+        // only a K that allows it may explain the losses, or the resulting
+        // observation would be feasible for no K at all.
+        let newest = IntervalList::interval_point(Bound::Included(*s.last().unwrap()));
+        let (s_prefix, l_prior) = (&s[..s.len() - 1], &l[..prior as usize]);
+        self.union(Some(b), |q| {
+            let allows_s = q
+                .s(t, prior, a, l_prior, s_prefix, l0, c, b)
+                .is_some_and(|range| !range.intersection(&newest).is_empty());
+            if allows_s {
+                q.l_obs(t, prior, total, a, l, s, l0, c, b)
+            } else {
+                None
+            }
+        })
     }
 }

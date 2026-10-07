@@ -131,6 +131,12 @@ pub const C_TIGHT_RATIO: RealNumRep = RealNumRep::new_raw(5, 4);
 /// The buffer counts as small once `max_b < SMALL_BUFFER_BDP * min_c`.
 pub const SMALL_BUFFER_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 
+/// While exploring, drain once the queue may exceed this many BDPs
+/// (`max_q > EXPLORE_MAX_QUEUE_BDP * min_c`).  Learning C needs only a brief
+/// queue; filling a large buffer adds delay (and makes QE enumerate many
+/// unobserved losses, which is slow).
+pub const EXPLORE_MAX_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
+
 /// RTTs between probes once C is tight.
 pub const PROBE_INTERVAL_RTTS: usize = 10;
 
@@ -200,6 +206,9 @@ pub struct StateQuantities<'a> {
     /// CLI overrides of `PROBE_INTERVAL_RTTS` / `DRAIN_INTERVAL_RTTS`.
     pub probe_interval_rtts: usize,
     pub drain_interval_rtts: usize,
+    /// `--belief-history`: observations whose overlapping QE windows are
+    /// intersected for the belief (`None`: the whole history).
+    pub belief_history: Option<usize>,
 }
 
 /// What the planner is doing this RTT.  Logged in the CSV.
@@ -221,6 +230,10 @@ pub enum Mode {
 pub struct KTracker {
     /// Every hypothesis and whether it is still consistent.
     pub alive: Vec<(RealNumInt, bool)>,
+    /// Per hypothesis, the intersection of every window's C and B bounds
+    /// under it.  C and B are static, so an empty intersection rules the
+    /// hypothesis out even if each window alone is feasible.
+    pub bounds: Vec<Option<BeliefBounds>>,
     /// Timestep since which no K was ruled out.
     pub stable_since: usize,
     /// The K set the belief currently uses.
@@ -281,19 +294,24 @@ fn names(objectives: &[&str]) -> Vec<String> {
     objectives.iter().map(|name| (*name).to_string()).collect()
 }
 
+/// `update_k`: windows computed independently may disagree by QE's
+/// discretization slack; only a larger gap between their C or B bounds
+/// rules a K out.
+pub const K_WINDOW_DISAGREEMENT_TOL: RealNumRep = RealNumRep::new_raw(1, 1);
+
 /// Bursty model, `KPolicy::Hypotheses` only: update which K are still
 /// consistent and return the K set the belief should use.  Called once per
-/// committed observation, before `state_policy`.  `feasible(k)` says
-/// whether the newest QE window is consistent with burstiness `k`.
+/// committed observation, before `state_policy`.  `window_belief(k)` is the
+/// newest QE window's belief under burstiness `k`, or `None` if the window
+/// is infeasible for it.
 ///
 /// K feasibility is not monotone, so every hypothesis is tested.  While the
 /// smallest alive K is unconfirmed, the belief is the union over every
-/// alive K; once it has survived `K_CONFIRM_RTTS` RTTs without any K being
-/// ruled out, only it is assumed.
+/// alive K; once it has survived `K_CONFIRM_RTTS` RTTs, only it is assumed.
 pub fn update_k(
     planner: &mut PlannerState,
     timestep: usize,
-    feasible: &dyn Fn(RealNumInt) -> bool,
+    window_belief: &dyn Fn(RealNumInt) -> Option<BeliefBounds>,
 ) -> Vec<RealNumInt> {
     let hypotheses = match K_POLICY {
         KPolicy::Fixed(k) => return vec![k],
@@ -302,15 +320,49 @@ pub fn update_k(
     let tracker = &mut planner.k;
     if tracker.alive.is_empty() {
         tracker.alive = hypotheses.iter().map(|&k| (k, true)).collect();
+        tracker.bounds = vec![None; hypotheses.len()];
         tracker.stable_since = timestep;
     }
     let smallest = |alive: &[(RealNumInt, bool)]| alive.iter().find(|(_, a)| *a).map(|(k, _)| *k);
     let smallest_before = smallest(&tracker.alive);
-    for (k, alive) in tracker.alive.iter_mut() {
-        if *alive && !feasible(*k) {
-            info!("t={}: K={} ruled out", timestep, k);
-            *alive = false;
+    for ((k, alive), acc) in tracker.alive.iter_mut().zip(tracker.bounds.iter_mut()) {
+        if !*alive {
+            continue;
         }
+        let Some(next) = window_belief(*k) else {
+            info!("t={}: K={} ruled out (window infeasible)", timestep, k);
+            *alive = false;
+            continue;
+        };
+        let merged = match acc {
+            None => next,
+            Some(prev) => BeliefBounds {
+                min_c: std::cmp::max(prev.min_c, next.min_c),
+                max_c: std::cmp::min(prev.max_c, next.max_c),
+                min_b: std::cmp::max(prev.min_b, next.min_b),
+                max_b: std::cmp::min(prev.max_b, next.max_b),
+                ..next
+            },
+        };
+        let tol = K_WINDOW_DISAGREEMENT_TOL;
+        if merged.min_c > merged.max_c + tol || merged.min_b > merged.max_b + tol {
+            info!(
+                "t={}: K={} ruled out (windows disagree: c=[{}, {}], b=[{}, {}])",
+                timestep, k, merged.min_c, merged.max_c, merged.min_b, merged.max_b
+            );
+            *alive = false;
+            continue;
+        }
+        // Within the tolerance, keep the newest window's bounds for the
+        // dimension that crossed, so the intersection stays non-empty.
+        let mut merged = merged;
+        if merged.min_c > merged.max_c {
+            (merged.min_c, merged.max_c) = (next.min_c, next.max_c);
+        }
+        if merged.min_b > merged.max_b {
+            (merged.min_b, merged.max_b) = (next.min_b, next.max_b);
+        }
+        *acc = Some(merged);
     }
     // Ruling out a large K (e.g. by a small buffer) is no evidence against
     // the smallest K, so only restart its confirmation when it changes.
@@ -324,6 +376,7 @@ pub fn update_k(
         // the list.  Start over rather than use an empty belief.
         warn!("t={}: every K hypothesis was ruled out; reviving all", timestep);
         tracker.alive = hypotheses.iter().map(|&k| (k, true)).collect();
+        tracker.bounds = vec![None; hypotheses.len()];
         tracker.stable_since = timestep;
         alive = hypotheses.to_vec();
     }
@@ -347,10 +400,13 @@ pub fn record_action(planner: &mut PlannerState, timestep: usize, action: Option
 /// It is the long-horizon planner: it picks a `Mode`, and the mode
 /// restricts what minimax may do over its short horizon.
 pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> StatePolicy {
-    // This is deliberately policy code, not an engine fallback: try the
-    // desired long history and choose the QE-sized history if its window
-    // intersection is inconsistent.
-    let default_history_len = 10;
+    // This is deliberately policy code, not an engine fallback: use the whole
+    // history (the engine caches committed windows, and C and B are static,
+    // so nothing learned is forgotten), falling back to the windows before
+    // the first inconsistent one.
+    let default_history_len = state
+        .belief_history
+        .map_or(state.history.len(), |n| n.clamp(QE_WINDOW_OBSERVATIONS, state.history.len()));
     let (_history_len, belief) = match (state.belief_bounds_for_history)(default_history_len) {
         Ok(belief) => (default_history_len, belief),
         Err(conflict) => (
@@ -401,6 +457,9 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
 
     let aggressive_budget = std::cmp::max(belief.min_c, 2.into());
     let (candidate_actions, loss_tolerance_abs) = match mode {
+        Mode::Explore if belief.max_q > belief.min_c * EXPLORE_MAX_QUEUE_BDP => {
+            (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET)
+        }
         Mode::Explore => {
             // Capturing bandwidth fast matters most while C is loose; only
             // a buffer proven small makes the CCA ration its probes.
@@ -420,7 +479,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     };
 
     StatePolicy {
-        belief_history_observations: state.history.len(),
+        belief_history_observations: default_history_len,
         loss_tolerance_abs,
         delay_tolerance_frac: 3.into(),
         objective_order: names(OBJECTIVE_ORDER),

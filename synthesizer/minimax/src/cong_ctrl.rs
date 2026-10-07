@@ -904,7 +904,7 @@ impl CongCtrlState<NetworkModelNC> {
             let feasible = |k: RealNumInt| {
                 let mut nm = self.network_model.clone();
                 nm.set_qe(std::sync::Arc::new(BurstyQe { k: k.into(), pert: BURSTY_PERT }));
-                nm.window_feasible(window)
+                nm.try_window_belief(window)
             };
             let mut planner = std::mem::take(&mut self.planner);
             let ks = update_k(&mut planner, timestep, &feasible);
@@ -926,6 +926,7 @@ impl CongCtrlState<NetworkModelNC> {
             belief_bounds_for_history: &belief_bounds_for_history,
             probe_interval_rtts: intervals.probe,
             drain_interval_rtts: intervals.drain,
+            belief_history: intervals.belief_history,
         };
         let mut planner = self.planner.clone();
         let mut policy = state_policy(&state, &mut planner);
@@ -965,6 +966,7 @@ impl CongCtrlState<NetworkModelNC> {
 struct PlannerIntervals {
     probe: usize,
     drain: usize,
+    belief_history: Option<usize>,
 }
 
 fn union_bursty_qe(ks: &[RealNumInt]) -> std::sync::Arc<UnionBurstyQe> {
@@ -1045,6 +1047,11 @@ struct Args {
     /// Override `DRAIN_INTERVAL_RTTS` in the config.
     #[arg(long)]
     drain_interval: Option<usize>,
+
+    /// Observations whose overlapping QE windows are intersected for the
+    /// belief (default: the whole history).
+    #[arg(long)]
+    belief_history: Option<usize>,
 }
 
 /// `--sim-policy`.  With the bursty model, `max`/`min`/`random`/`alternate`
@@ -1105,6 +1112,9 @@ fn get_sim_tag(args: &Args) -> String {
     ret.push_str(&format!("_{:?}", args.sim_policy).to_lowercase());
     if matches!(args.sim_policy, SimChoice::Random | SimChoice::Mixed) {
         ret.push_str(&format!("_seed{}", args.seed));
+    }
+    if let Some(n) = args.belief_history {
+        ret.push_str(&format!("_bh{}", n));
     }
     ret
 }
@@ -1239,6 +1249,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let intervals = PlannerIntervals {
         probe: args.probe_interval.unwrap_or(PROBE_INTERVAL_RTTS),
         drain: args.drain_interval.unwrap_or(DRAIN_INTERVAL_RTTS),
+        belief_history: args.belief_history,
     };
 
     network_model.init();
