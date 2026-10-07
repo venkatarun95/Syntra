@@ -100,6 +100,11 @@ impl<S: State> Search<S> {
         }
     }
 
+    /// The transposition table, e.g. to read the reply the search expected.
+    pub fn tt(&self) -> &TranspositionTable<S> {
+        &self.tt
+    }
+
     /// Deepen the tree to the given depth. Used for iterative
     /// deepening. `alpha` (and `beta`) are the maximizer and minimizer's best
     /// score in our subtree. Only returns `None` if we ran out of time because `stop_flag` was triggered.

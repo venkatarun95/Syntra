@@ -5,7 +5,10 @@
 //! never solved, so the caller can fall back to a different trace length
 //! instead of panicking inside a `HashMap` index.
 
+use std::cell::Cell;
 use std::fmt::Debug;
+use std::panic::{self, AssertUnwindSafe};
+use std::sync::Once;
 
 use ds::interval::IntervalList;
 use ds::*;
@@ -274,5 +277,139 @@ impl QeTables for BurstyQe {
         table
             .get(&(t, prior))
             .map(|f| f(a, l, s, l0, c, b, self.k, self.pert))
+    }
+}
+
+/// The bursty model when the burstiness is only known to be one of `ks`:
+/// every bound is the union of the per-K bounds.  Feasibility is not
+/// monotone in K (bursts rule out small K, a small buffer rules out large
+/// K), so no single K is conservative; the union is.  Functions taking B
+/// only consult the K with `K < pert * B`, the constraint every bursty
+/// result assumes.  A lookup is `None` only if it is `None` for every K.
+#[derive(Debug)]
+pub struct UnionBurstyQe {
+    pub ks: Vec<RealNumRep>,
+    pub pert: RealNumRep,
+}
+
+impl UnionBurstyQe {
+    /// Union of `f` over every K whose preconditions hold.  A generated
+    /// function asserts the model constraints that do not involve its
+    /// result, i.e. that its (C, B) inputs are feasible for its K.  A (C, B)
+    /// from the union belief can be feasible for one K and not another; such
+    /// a K contributes nothing, so its assertion failure is skipped.
+    fn union(&self, b: Option<RealNumRep>, f: impl Fn(&BurstyQe) -> Bounds) -> Bounds {
+        self.ks
+            .iter()
+            .filter(|&&k| b.map_or(true, |b| k < self.pert * b))
+            .filter_map(|&k| quietly_catch(|| f(&BurstyQe { k, pert: self.pert })).flatten())
+            .reduce(|acc, x| acc.union(&x))
+    }
+}
+
+thread_local! {
+    static QUIET_PANICS: Cell<bool> = const { Cell::new(false) };
+}
+static QUIET_HOOK: Once = Once::new();
+
+/// Run `f`, returning `None` instead of unwinding (and without printing the
+/// panic message) if it panics.
+fn quietly_catch<T>(f: impl FnOnce() -> T) -> Option<T> {
+    QUIET_HOOK.call_once(|| {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            if !QUIET_PANICS.with(Cell::get) {
+                previous(info)
+            }
+        }));
+    });
+    QUIET_PANICS.with(|q| q.set(true));
+    let ret = panic::catch_unwind(AssertUnwindSafe(f));
+    QUIET_PANICS.with(|q| q.set(false));
+    ret.ok()
+}
+
+impl QeTables for UnionBurstyQe {
+    fn c(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
+        -> Bounds {
+        // A K whose C is unsolved would make the union unsound, so either
+        // every K has this C result or none is used.
+        let per_k: Vec<Bounds> = self
+            .ks
+            .iter()
+            .map(|&k| BurstyQe { k, pert: self.pert }.c(t, n, a, l, s, l0))
+            .collect();
+        if per_k.iter().any(Option::is_none) {
+            return None;
+        }
+        per_k.into_iter().flatten().reduce(|acc, x| acc.union(&x))
+    }
+
+    fn c_from_b(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+    ) -> Bounds {
+        self.union(None, |q| q.c_from_b(t, n, a, l, s, l0))
+    }
+
+    fn b(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: RealNumRep,
+    ) -> Bounds {
+        self.union(None, |q| q.b(t, n, a, l, s, l0, c))
+    }
+
+    fn q(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: RealNumRep,
+        b: RealNumRep,
+    ) -> Bounds {
+        self.union(Some(b), |q| q.q(t, n, a, l, s, l0, c, b))
+    }
+
+    fn s(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: RealNumRep,
+        b: RealNumRep,
+    ) -> Bounds {
+        self.union(Some(b), |q| q.s(t, n, a, l, s, l0, c, b))
+    }
+
+    fn l_obs(
+        &self,
+        t: i32,
+        prior: i32,
+        total: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: RealNumRep,
+        b: RealNumRep,
+    ) -> Bounds {
+        self.union(Some(b), |q| q.l_obs(t, prior, total, a, l, s, l0, c, b))
     }
 }

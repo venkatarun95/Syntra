@@ -31,9 +31,11 @@ The configuration file owns these choices:
 | `APP_IS_BACKLOGGED` | `true` means the source always supplies whatever the CCA requests. |
 | `APP_SEND_CHOICES` | When not backlogged, the adversary chooses Full, Half, or Zero application supply each control interval. |
 | `SEARCH_DEPTH` | Even minimax ply count: a CCA action followed by an adversary action is one round.  Keep the default modest. |
-| `CandidateAction` / `CANDIDATE_ACTIONS` | The finite, editable CCA action space. |
+| `CandidateAction` | The finite, editable CCA action space; the planner picks the subset minimax may use each RTT (`StatePolicy::candidate_actions`). |
 | `OBJECTIVE_ORDER` | Lexicographic metric order, from most to least important. |
-| `state_policy` | Per-committed-state hook for QE-history length, tolerances, and objective order. |
+| `state_policy` | Per-committed-state planner: mode, candidate actions, QE-history length, tolerances, and objective order. |
+| `K_POLICY`, `K_CONFIRM_RTTS` | Bursty model: fixed K, or K hypotheses tracked by `update_k`. |
+| Planner constants | `C_TIGHT_RATIO`, `SMALL_BUFFER_BDP`, `PROBE_INTERVAL_RTTS`, `DRAIN_INTERVAL_RTTS`, loss budgets; see "Planner". |
 
 The non-backlogged option is an adversarial finite approximation; it does *not*
 require a different QE model.  For each feasible network response the
@@ -50,7 +52,10 @@ CCA therefore never sends a longer formula to QE.  Set
 window ending in that history and intersects each returned belief bound.  For a
 history ending at `t`, this is `[t-6,t]`, `[t-7,t-1]`, and so on.
 
-Edit `state_policy(&StateQuantities)` in `cbrdelay_cca_config.rs` to select the
+Committed windows' bounds are cached (per K set), so a long history costs
+one QE evaluation per new window rather than per window per tree node.
+
+Edit `state_policy(&StateQuantities, &mut PlannerState)` in `cbrdelay_cca_config.rs` to select the
 history length, `loss_tolerance_abs`, `delay_tolerance_frac`, and
 `objective_order`.  Its input exposes the full oldest-to-newest observation
 history, timestep, and preceding belief.  The resulting policy is frozen for
@@ -113,9 +118,9 @@ selects which generated QE evaluator the unchanged `NetworkModelNC` uses:
 * `plain`: the original CBR-delay link, `network_model_nc_qe_output`.
 * `bursty`: CBR-delay behind a sender whose arrivals may be perturbed by up to
   `K` bytes, `network_model_bursty_qe_output`.  QE leaves `K` and `pert` free
-  (they must satisfy `K < pert * B`), so they are fixed by `BURSTY_K` and
-  `BURSTY_PERT` in the config.  Bursty output files get a `_bursty_k…_pert…`
-  suffix.
+  (they must satisfy `K < pert * B`); `pert` is `BURSTY_PERT` and K comes
+  from `K_POLICY` (see "Burstiness hypotheses").  Bursty output files get a
+  `_bursty_k…_pert…_simk…` suffix.
 
 `network_model_nc/src/qe_tables.rs` hides the differences behind `QeTables`.
 Its lookups return `None` for an unsolved (T, losses) key instead of
@@ -144,6 +149,59 @@ B/Q/S/L functions feasible; those functions `assert!` that C is feasible.
 
 Regenerate the bursty crate from all bursty results with
 `sh qe/scripts/transpile_bursty.sh` (see the `qe` README).
+
+## Planner (long-horizon modes)
+
+Minimax only looks `SEARCH_DEPTH / 2` RTTs ahead, so decisions on longer
+time scales are made by a planner in `cbrdelay_cca_config.rs`.  The engine
+owns its memory (`PlannerState`) and calls, once per committed RTT:
+
+1. `update_k` (bursty model): which burstiness hypotheses are still alive,
+   and the K set the belief uses.
+2. `state_policy`: picks a `Mode` and, from it, the candidate actions,
+   loss budget and objectives for this RTT's search.  With one candidate
+   the search is skipped.
+3. `record_action`, after the move is chosen (probe bookkeeping).
+
+Modes: `Explore` (C loose; minimax picks among `MaxAllowedRate`,
+`DrainQueue`, `ProbeAboveLimit`), `Cruise` (C tight; hold `DrainQueue`,
+which is `min_c` once the queue is empty), `Probe` (C tight and a probe is
+due) and `Drain` (every `DRAIN_INTERVAL_RTTS`, held until the belief proves
+`max_q <= DRAIN_MAX_Q`, so the min-RTT estimate is refreshed).  All constants
+are experiment starting points; `--probe-interval` and `--drain-interval`
+override two of them.
+
+### Burstiness hypotheses
+
+With `KPolicy::Hypotheses`, each K is tested on every new QE window with
+`NetworkModelNC::window_feasible` (a K is ruled out when no C on the search
+grid leaves B non-empty).  Feasibility is not monotone in K: bursts rule out
+small K, and a small buffer rules out large K (`B > K / pert`).  So the
+belief uses `UnionBurstyQe`, the union of the per-K QE bounds over the
+assumed set: every alive K, until the smallest alive K has survived
+`K_CONFIRM_RTTS` without any K being ruled out, then that K alone.  A
+generated function asserts that its (C, B) inputs are feasible for its K;
+the union skips a K whose assertion fails (see `quietly_catch`).
+
+### Simulation policies
+
+The simulated link has its own K (`--sim-k`, via `with_sim_qe`), so the
+CCA's hypotheses do not change it.  K only bounds what the link may do;
+`--sim-policy` decides what it does: `max`/`min` service (never/always
+withhold bursts), `random` (seeded by `--seed`), `adversary` (replay the
+reply minimax expected, which is feasible for the CCA's belief rather than
+the true C/B) or `mixed` (switch among those every `--mixed-period` RTTs).
+
+### Experiment scripts
+
+```bash
+sh scripts/cca_sweep.sh OUT 60 "20,10,1,max 20,9,4,min 50,200,1,random,3"
+python3 scripts/summarize_cca.py OUT
+```
+
+Each scenario is `C,B,SIM_K,POLICY[,SEED]`.  The summary prints one compact
+block per run (convergence, utilization, loss gaps, queue, drains, mode and
+K timelines), which is small enough to hand to a cheaper model.
 
 ## QE/transpilation boundary
 

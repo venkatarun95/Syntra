@@ -4,8 +4,9 @@ use itertools::Itertools;
 use log::{debug, info, warn};
 use num_traits::ToPrimitive;
 use serde::Serialize;
+use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::path::Path;
@@ -16,13 +17,13 @@ use minimax::State;
 // use network_model_z3::NetworkModelZ3;
 use ds::tree::Tree;
 use ds::*;
-use network_model_nc::{BurstyQe, NetworkModelNC};
+use network_model_nc::{BurstyLinkSim, BurstyQe, LinkChoice, NetworkActionNC, NetworkModelNC, UnionBurstyQe};
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
-    state_policy, CandidateAction, InconsistentQeWindows, StatePolicy, StateQuantities, APP_IS_BACKLOGGED,
-    APP_SEND_CHOICES, CANDIDATE_ACTIONS, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH,
-    BURSTY_K, BURSTY_PERT, QE_MODEL, QeModel,
+    record_action, state_policy, update_k, CandidateAction, InconsistentQeWindows, KPolicy, PlannerState,
+    StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
+    K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
 };
 
 // ------------------------------------------------------------------------------------------
@@ -255,6 +256,15 @@ struct CongCtrlState<NM: NetworkModel> {
 
     // Config
     policy: StatePolicy,
+    /// Long-horizon planner memory; see `cbrdelay_cca_config::state_policy`.
+    planner: PlannerState,
+    /// K set of the bursty belief (`None` for the plain model).
+    qe_ks: Option<Vec<RealNumInt>>,
+    /// Belief bounds of committed QE windows, which never change for a given
+    /// K set.  Speculative windows are not cached.
+    window_cache: RefCell<HashMap<Vec<NM::O>, BeliefBounds>>,
+    /// The candidate that produced the last committed CCA move.
+    last_action: Option<CandidateAction>,
 
     n_nodes_explored: u32,
 
@@ -685,45 +695,57 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         ret.into_iter().map(CCMove::Network).collect()
     }
 
+    /// The rate of every candidate action the policy allows, in policy order.
+    fn candidate_rates(&self) -> Vec<(CandidateAction, RealNumRep)> {
+        let belief_bounds = self.get_latest_belief_bounds();
+        let needs_max_rate = self.policy.candidate_actions.iter().any(|candidate| {
+            matches!(
+                candidate,
+                CandidateAction::MaxAllowedRate | CandidateAction::ProbeAboveLimit
+            )
+        });
+        // `compute_max_allowed_rate` enumerates network moves, so skip it
+        // when only `DrainQueue` is allowed.
+        let max_allowed_rate = if needs_max_rate {
+            let rh = self.get_relevant_history(Some(QE_WINDOW_OBSERVATIONS));
+            self.network_model.compute_max_allowed_rate(
+                &rh,
+                &self.move_cca,
+                0.into(),
+                self.policy.delay_tolerance_frac,
+                1,
+            )
+        } else {
+            None
+        };
+        let min_c = belief_bounds.min_c;
+        let max_q = belief_bounds.max_q;
+        self.policy
+            .candidate_actions
+            .iter()
+            .map(|candidate| {
+                let rate = match candidate {
+                    CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
+                    CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
+                    CandidateAction::ProbeAboveLimit => {
+                        max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
+                    }
+                };
+                (*candidate, rate)
+            })
+            .filter(|(_, rate)| *rate >= 0.into())
+            .collect()
+    }
+
     fn compute_cca_moves(&self) -> Vec<CCMove<NM::NA>> {
         assert!(!self.maximizer()); // only call when its CCA's turn.
         let start = std::time::Instant::now();
-        let belief_bounds = self.get_latest_belief_bounds();
-
-        let rh = self.get_relevant_history(Some(QE_WINDOW_OBSERVATIONS));
-        let mc = self.move_cca;
-
-        let max_allowed_rate = self.network_model.compute_max_allowed_rate(
-            &rh,
-            &mc,
-            0.into(),
-            self.policy.delay_tolerance_frac,
-            1,
-        );
-        // debug!("Got max_allowed_rate: {:?}", max_allowed_rate);
-
-        // let max_allowed_rate2 = self.network_model.compute_max_allowed_rate(
-        //     &rh,
-        //     &mc,
-        //     self.loss_tolerance_abs,
-        //     self.delay_tolerance_frac,
-        //     2,
-        // );
-        let min_c = belief_bounds.min_c;
-        let max_q = belief_bounds.max_q;
-        let ret: Vec<CCMove<NM::NA>> = CANDIDATE_ACTIONS
-            .iter()
-            .map(|candidate| match candidate {
-                CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
-                CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
-                CandidateAction::ProbeAboveLimit => {
-                    max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
-                }
-            })
-            .filter(|x| *x >= 0.into())
-            .map(|rate| CCMove::CCA(CCAAction { rate }))
+        let ret = self
+            .candidate_rates()
+            .into_iter()
+            .map(|(_, rate)| CCMove::CCA(CCAAction { rate }))
+            .unique()
             .collect();
-        let ret = ret.into_iter().unique().collect();
         // https://stackoverflow.com/questions/47636618/vecdedup-does-not-work-how-do-i-deduplicate-a-vector-of-strings
         debug!("CCA choices:\n{:?}\n in {:.2?} time.", ret, start.elapsed());
         ret
@@ -734,24 +756,30 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         assert!(history.len() >= QE_WINDOW_OBSERVATIONS);
 
         let window_count = history.len() - QE_WINDOW_OBSERVATIONS + 1;
-        let mut windows = history.windows(QE_WINDOW_OBSERVATIONS).enumerate();
-        let (first_idx, first) = windows.next().unwrap();
-        let first_action = if first_idx + 1 == window_count {
-            &self.move_cca
-        } else {
-            &None
-        };
-        let mut bounds = self
-            .network_model
-            .compute_belief_bounds(first, first_action);
-        for (idx, window) in windows {
+        // Observations at index >= n_committed are speculative.
+        let n_committed = history.len() - std::cmp::min(self.history_stack.len(), history.len());
+        let window_bounds = |idx: usize, window: &[NM::O]| {
             // An outstanding CCA action belongs only to the newest window.
             let action = if idx + 1 == window_count {
                 &self.move_cca
             } else {
                 &None
             };
-            let next = self.network_model.compute_belief_bounds(window, action);
+            if action.is_some() || idx + QE_WINDOW_OBSERVATIONS > n_committed {
+                return self.network_model.compute_belief_bounds(window, action);
+            }
+            if let Some(bounds) = self.window_cache.borrow().get(window) {
+                return *bounds;
+            }
+            let bounds = self.network_model.compute_belief_bounds(window, action);
+            self.window_cache.borrow_mut().insert(window.to_vec(), bounds);
+            bounds
+        };
+        let mut windows = history.windows(QE_WINDOW_OBSERVATIONS).enumerate();
+        let (first_idx, first) = windows.next().unwrap();
+        let mut bounds = window_bounds(first_idx, first);
+        for (idx, window) in windows {
+            let next = window_bounds(idx, window);
             let min_c = std::cmp::max(bounds.min_c, next.min_c);
             let max_c = std::cmp::min(bounds.max_c, next.max_c);
             let min_b = std::cmp::max(bounds.min_b, next.min_b);
@@ -850,6 +878,10 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             recording_tree: false,
             disable_pre_enumeration: false,
             policy: StatePolicy::default(),
+            planner: PlannerState::default(),
+            qe_ks: None,
+            window_cache: RefCell::new(HashMap::new()),
+            last_action: None,
             n_nodes_explored: 0,
             parallel_binary_search: false,
             // pool: rayon::ThreadPoolBuilder::new()
@@ -863,17 +895,40 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 impl CongCtrlState<NetworkModelNC> {
     /// Freeze the user-selected policy for the next minimax tree.  This is
     /// intentionally called only between committed control intervals.
-    fn select_state_policy(&mut self, obj_perm: &[String]) {
+    fn select_state_policy(&mut self, obj_perm: &[String], intervals: &PlannerIntervals) {
+        let timestep = self.history.len().saturating_sub(QE_WINDOW_OBSERVATIONS);
+        if self.qe_ks.is_some() {
+            // Test each K on the newest committed window with its own
+            // evaluator, so an inconsistent K cannot trip the belief asserts.
+            let window = &self.history[self.history.len() - QE_WINDOW_OBSERVATIONS..];
+            let feasible = |k: RealNumInt| {
+                let mut nm = self.network_model.clone();
+                nm.set_qe(std::sync::Arc::new(BurstyQe { k: k.into(), pert: BURSTY_PERT }));
+                nm.window_feasible(window)
+            };
+            let mut planner = std::mem::take(&mut self.planner);
+            let ks = update_k(&mut planner, timestep, &feasible);
+            self.planner = planner;
+            if self.qe_ks.as_ref() != Some(&ks) {
+                info!("t={}: belief uses K in {:?}", timestep, ks);
+                self.network_model.set_qe(union_bursty_qe(&ks));
+                self.window_cache.borrow_mut().clear();
+                self.qe_ks = Some(ks);
+            }
+        }
         let belief_bounds_for_history = |history_observations| {
             self.try_compute_belief_bounds(history_observations)
         };
         let state = StateQuantities {
-            timestep: self.history.len().saturating_sub(QE_WINDOW_OBSERVATIONS),
+            timestep,
             history: &self.history,
             previous_belief: self.belief_bounds,
             belief_bounds_for_history: &belief_bounds_for_history,
+            probe_interval_rtts: intervals.probe,
+            drain_interval_rtts: intervals.drain,
         };
-        let mut policy = state_policy(&state);
+        let mut planner = self.planner.clone();
+        let mut policy = state_policy(&state, &mut planner);
         assert!(
             policy.belief_history_observations >= QE_WINDOW_OBSERVATIONS,
             "belief_history_observations must be at least QE_WINDOW_OBSERVATIONS"
@@ -889,7 +944,34 @@ impl CongCtrlState<NetworkModelNC> {
         );
         policy.objective_order = objective_order;
         self.policy = policy;
+        self.planner = planner;
     }
+
+    /// Commit `m` (the CCA move just chosen at the root) to the planner.
+    fn record_cca_move(&mut self, m: &CCMove<NetworkActionNC>) {
+        let CCMove::CCA(a) = m else { return };
+        let timestep = self.history.len().saturating_sub(QE_WINDOW_OBSERVATIONS);
+        let action = self
+            .candidate_rates()
+            .into_iter()
+            .find(|(_, rate)| *rate == a.rate)
+            .map(|(candidate, _)| candidate);
+        record_action(&mut self.planner, timestep, action);
+        self.last_action = action;
+    }
+}
+
+/// `--probe-interval` / `--drain-interval`, passed to the planner.
+struct PlannerIntervals {
+    probe: usize,
+    drain: usize,
+}
+
+fn union_bursty_qe(ks: &[RealNumInt]) -> std::sync::Arc<UnionBurstyQe> {
+    std::sync::Arc::new(UnionBurstyQe {
+        ks: ks.iter().map(|&k| k.into()).collect(),
+        pert: BURSTY_PERT,
+    })
 }
 
 #[derive(Parser, Debug)]
@@ -937,6 +1019,67 @@ struct Args {
     /// Generated QE evaluator; defaults to `QE_MODEL` in the config.
     #[arg(long, value_enum)]
     qe_model: Option<QeModel>,
+
+    /// Bursty model: the simulated link's burstiness, independent of the
+    /// K the CCA assumes.  It only bounds what the simulated adversary may
+    /// do; `--sim-policy` decides whether it bursts.
+    #[arg(long, default_value_t = 1)]
+    sim_k: RealNumInt,
+
+    /// How the simulated link picks each response.
+    #[arg(long, value_enum, default_value_t = SimChoice::Max)]
+    sim_policy: SimChoice,
+
+    /// Seed for `random` and `mixed` simulation policies.
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+
+    /// `mixed`: RTTs between switches of the simulation policy.
+    #[arg(long, default_value_t = 10)]
+    mixed_period: u32,
+
+    /// Override `PROBE_INTERVAL_RTTS` in the config.
+    #[arg(long)]
+    probe_interval: Option<usize>,
+
+    /// Override `DRAIN_INTERVAL_RTTS` in the config.
+    #[arg(long)]
+    drain_interval: Option<usize>,
+}
+
+/// `--sim-policy`.  With the bursty model, `max`/`min`/`random`/`alternate`
+/// drive `BurstyLinkSim`, a forward simulation of the true (C, B, K) link:
+/// never burst and serve as much as possible / always burst by K and serve
+/// as little as possible / random / burst every other RTT.  `adversary`
+/// replays the network move minimax expected (feasible for the CCA's belief,
+/// so not tied to the true C/B).  `mixed` switches among the four link
+/// policies every `--mixed-period` RTTs.  The plain model keeps the original
+/// QE-based simulator (`max` only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum SimChoice {
+    Max,
+    Min,
+    Random,
+    Alternate,
+    Adversary,
+    Mixed,
+}
+
+/// xorshift64*: deterministic simulation randomness without a dependency.
+struct SimRng(u64);
+
+impl SimRng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+
+    /// A fraction in [0, 1) on a 1/16 grid.
+    fn fraction(&mut self) -> RealNumRep {
+        RealNumRep::new((self.next() >> 60) as RealNumInt, 16)
+    }
 }
 
 fn get_sim_tag(args: &Args) -> String {
@@ -952,10 +1095,22 @@ fn get_sim_tag(args: &Args) -> String {
     }
     if args.qe_model.unwrap_or(QE_MODEL) == QeModel::Bursty {
         // Ratios print as "1/2"; keep the tag a single path component.
-        let tag = format!("_bursty_k{}_pert{}", BURSTY_K, BURSTY_PERT);
+        let assumed = match K_POLICY {
+            KPolicy::Fixed(k) => format!("{}", k),
+            KPolicy::Hypotheses(ks) => ks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("-"),
+        };
+        let tag = format!("_bursty_k{}_pert{}_simk{}", assumed, BURSTY_PERT, args.sim_k);
         ret.push_str(&tag.replace('/', "over"));
     }
+    ret.push_str(&format!("_{:?}", args.sim_policy).to_lowercase());
+    if matches!(args.sim_policy, SimChoice::Random | SimChoice::Mixed) {
+        ret.push_str(&format!("_seed{}", args.seed));
+    }
     ret
+}
+
+fn ks_string(ks: &[RealNumInt]) -> String {
+    ks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("|")
 }
 
 fn get_obj_tag(args: &Args) -> String {
@@ -1056,7 +1211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut wtr = csv::Writer::from_path(csv_path).unwrap();
         wtr.write_record([
             "time", "r", "a", "ld", "s", "qdel", "min_c", "max_c", "min_b", "max_b", "min_q",
-            "max_q", "min_if", "max_if",
+            "max_q", "min_if", "max_if", "mode", "action", "loss_tol", "sim", "qe_ks", "alive_ks",
         ])?;
         some_wtr = Some(wtr);
     }
@@ -1072,16 +1227,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let qe_model = args.qe_model.unwrap_or(QE_MODEL);
     info!("QE model: {:?}", qe_model);
     if qe_model == QeModel::Bursty {
-        network_model = network_model.with_qe(std::sync::Arc::new(BurstyQe {
-            k: BURSTY_K,
-            pert: BURSTY_PERT,
-        }));
+        // The CCA's K set is chosen by `select_state_policy`; the simulated
+        // link keeps its own K.
+        network_model = network_model
+            .with_qe(union_bursty_qe(&[args.sim_k]))
+            .with_sim_qe(std::sync::Arc::new(BurstyQe {
+                k: args.sim_k.into(),
+                pert: BURSTY_PERT,
+            }));
     }
+    let intervals = PlannerIntervals {
+        probe: args.probe_interval.unwrap_or(PROBE_INTERVAL_RTTS),
+        drain: args.drain_interval.unwrap_or(DRAIN_INTERVAL_RTTS),
+    };
 
     network_model.init();
     let mut ccs = CongCtrlState::new(network_model);
+    if qe_model == QeModel::Bursty {
+        ccs.qe_ks = Some(vec![]);
+    }
     ccs.init();
-    ccs.select_state_policy(&args.obj_perm);
+    ccs.select_state_policy(&args.obj_perm, &intervals);
     ccs.prepare_speculation();
     let mut search: minimax::Search<CongCtrlState<NetworkModelNC>> = minimax::Search::new();
     // cong_ctrl_state.best_move_guess(tt);
@@ -1098,20 +1264,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sim_strategy = Some(SimStrategy::new(&args));
     }
 
+    let mut rng = SimRng(args.seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
+    let mut link_sim = (qe_model == QeModel::Bursty && args.sim).then(|| {
+        BurstyLinkSim::new(args.sim_c, args.sim_b, args.sim_k.into(), ccs.history.len())
+    });
+    let mut mixed_choice = SimChoice::Max;
     let tsteps = args.steps;
     for t in 0..tsteps {
+        let mode = ccs.policy.mode;
+        let loss_tol = ccs.policy.loss_tolerance_abs;
         info!("Step {}: searching...", t);
         let start = std::time::Instant::now();
         if args.tree {
             ccs.start_recording_tree();
         }
 
+        let root_moves = ccs.move_choices_cca_stack.last().unwrap().clone();
+        let searched = !args.sim_max_rate && root_moves.len() > 1;
         let best_cc_move = if args.sim_max_rate {
             sim_strategy.as_mut().unwrap().get_rate(&ccs)
+        } else if !searched {
+            // The planner left a single move; nothing to search.
+            root_moves.first().cloned()
         } else {
             let (ret, _, _) = search.best_move(&mut ccs, Some(SEARCH_DEPTH), None);
             ret
         };
+        ccs.record_cca_move(best_cc_move.as_ref().unwrap());
 
         if args.tree {
             let mut file =
@@ -1126,14 +1305,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // );
         // ccs.reset_moves();
         ccs.make_move(best_cc_move.as_ref().unwrap());
-        let network_move = if args.sim {
-            ccs.get_network_move_sim(&args)
+        if args.sim_policy == SimChoice::Mixed && t % args.mixed_period == 0 {
+            // The adversary is excluded: its replies would desynchronize the
+            // link simulator's hidden state from the trace.
+            let choices = [SimChoice::Max, SimChoice::Min, SimChoice::Random, SimChoice::Alternate];
+            mixed_choice = choices[(rng.next() % choices.len() as u64) as usize];
+        }
+        let sim_choice = if args.sim_policy == SimChoice::Mixed {
+            mixed_choice
         } else {
-            ccs.any_move_guess()
+            args.sim_policy
+        };
+        let (network_move, sim_used) = if !args.sim {
+            (ccs.any_move_guess(), sim_choice)
+        } else {
+            // The adversary's reply to the chosen move, as minimax evaluated it.
+            let adversary_move = if searched {
+                match search.tt().get(&ccs.tt_state()) {
+                    Some((Some(CCMove::Network(na)), _, _)) => Some(CCMove::Network(na.clone())),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let mut link = |choice: SimChoice| -> Option<CCMove<NetworkActionNC>> {
+                let Some(sim) = link_sim.as_mut() else {
+                    // Plain model: the original QE-based simulator.
+                    return ccs.get_network_move_sim(&args);
+                };
+                let (zero, one, half) = (RealNumRep::from(0), RealNumRep::from(1), RealNumRep::new(1, 2));
+                let link_choice = match choice {
+                    SimChoice::Max => LinkChoice { burst: zero, service: one },
+                    SimChoice::Min => LinkChoice { burst: one, service: zero },
+                    SimChoice::Alternate => LinkChoice { burst: ((t % 2) as RealNumInt).into(), service: half },
+                    _ => LinkChoice { burst: rng.fraction(), service: rng.fraction() },
+                };
+                Some(CCMove::Network(sim.step(
+                    ccs.history.last().unwrap().a,
+                    ccs.history.len(),
+                    link_choice,
+                )))
+            };
+            match sim_choice {
+                // Without a search there is no expected reply; the worst
+                // case the true link allows is the closest stand-in.
+                SimChoice::Adversary | SimChoice::Mixed => match adversary_move {
+                    Some(m) => (Some(m), SimChoice::Adversary),
+                    None => (link(SimChoice::Min), SimChoice::Min),
+                },
+                choice => (link(choice), choice),
+            }
         };
         ccs.make_move(network_move.as_ref().unwrap());
         ccs.commit_move();
-        ccs.select_state_policy(&args.obj_perm);
+        ccs.select_state_policy(&args.obj_perm, &intervals);
         ccs.prepare_speculation();
         let bb = ccs.belief_bounds;
         let last_obs = ccs.history.last().unwrap();
@@ -1169,6 +1394,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{:.2}", bb.max_q.to_f64().unwrap()),
                 format!("{:.2}", bb.min_if.to_f64().unwrap()),
                 format!("{:.2}", bb.max_if.to_f64().unwrap()),
+                format!("{:?}", mode),
+                ccs.last_action.map_or("none".to_string(), |a| format!("{:?}", a)),
+                format!("{:.2}", loss_tol.to_f64().unwrap()),
+                format!("{:?}", sim_used).to_lowercase(),
+                ks_string(ccs.qe_ks.as_deref().unwrap_or(&[])),
+                ks_string(
+                    &ccs.planner
+                        .k
+                        .alive
+                        .iter()
+                        .filter(|(_, alive)| *alive)
+                        .map(|(k, _)| *k)
+                        .collect::<Vec<_>>(),
+                ),
             ])?;
             wtr.flush()?;
         }

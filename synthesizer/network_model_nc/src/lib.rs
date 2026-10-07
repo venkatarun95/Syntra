@@ -13,11 +13,39 @@ use lazy_static::lazy_static;
 use network_model_nc_qe_output::*;
 use std::sync::Arc;
 
+pub mod link_sim;
 pub mod qe_tables;
-pub use qe_tables::{BurstyQe, PlainQe, QeTables};
+pub use link_sim::{BurstyLinkSim, LinkChoice};
+pub use qe_tables::{BurstyQe, PlainQe, QeTables, UnionBurstyQe};
 
 const N_DISCRETE_POINTS: usize = 2;
 const EPS: RealNumRep = RealNumRep::new_raw(1, 1 << 4);
+/// C values searched numerically are multiples of 1/`C_GRID`.
+const C_GRID: RealNumInt = 16;
+
+/// Grid points (in units of 1/`C_GRID`) at which to look for a feasible C
+/// in `[lo, hi]`, low end first.  The feasible C of a window is often a
+/// narrow band near the low end of a wide prior such as `[min_c, 1000]`, so
+/// a uniform grid misses it: use a dense uniform grid over `[lo, 2 lo]` and a
+/// geometric one from there to `hi`.
+fn c_seed_grid(lo: RealNumInt, hi: RealNumInt) -> Vec<RealNumInt> {
+    const N_DENSE: RealNumInt = 64;
+    const N_GEOMETRIC: i32 = 64;
+    if lo > hi {
+        return vec![];
+    }
+    let dense_hi = std::cmp::min(hi, std::cmp::max(2 * lo, lo + N_DENSE));
+    let mut seeds: Vec<RealNumInt> =
+        (0..=N_DENSE).map(|i| lo + (dense_hi - lo) * i / N_DENSE).collect();
+    if dense_hi < hi {
+        let ratio = (hi as f64 / dense_hi as f64).powf(1.0 / N_GEOMETRIC as f64);
+        seeds.extend((1..=N_GEOMETRIC).map(|i| {
+            std::cmp::min(hi, (dense_hi as f64 * ratio.powi(i)).round() as RealNumInt)
+        }));
+    }
+    seeds.dedup();
+    seeds
+}
 
 lazy_static! {
     // The key is: (trace length, prior losses observed, total losses observed)
@@ -366,6 +394,18 @@ impl Display for AppSendFraction {
     }
 }
 
+/// How the simulator picks the next service among those feasible for the
+/// true (C, B) under `sim_qe`.  Losses are always the smallest feasible ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimPolicy {
+    /// Largest feasible service: the link never withholds a burst.
+    Max,
+    /// Smallest feasible service: the link withholds as much as it may.
+    Min,
+    /// `min + u * (max - min)` for a caller-supplied `u` in [0, 1].
+    Random,
+}
+
 #[derive(Clone, Debug)]
 pub struct NetworkModelNC {
     sim_ideal: Option<bool>,
@@ -373,6 +413,9 @@ pub struct NetworkModelNC {
     sim_b: Option<RealNumRep>,
     app_send_choices: Vec<AppSendFraction>,
     qe: Arc<dyn QeTables>,
+    /// QE evaluator of the simulated ground truth.  The CCA may change `qe`
+    /// (e.g. its assumed burstiness K) without changing the simulated link.
+    sim_qe: Option<Arc<dyn QeTables>>,
 }
 
 impl NetworkModel for NetworkModelNC {
@@ -658,75 +701,7 @@ impl NetworkModel for NetworkModelNC {
     ) -> Option<Self::NA> {
         assert_eq!(self.sim_ideal.unwrap(), sim_ideal);
         assert!(!sim_ideal);
-        let sim_c = self.sim_c.unwrap();
-        let sim_b = self.sim_b.unwrap();
-
-        let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(relevant_history, move_cca);
-        let tsteps = a.len() as i32;
-        let n_losses_observed = l.len() as i32;
-
-        // let compute_s_hm: &HashMap<(i32, i32), QeFunSim> = if sim_ideal {
-        //     &COMPUTE_SIM_IDEAL_S_4
-        // } else {
-        //     &COMPUTE_SIM_S_4
-        // };
-        let s_interval = expect_qe("S", tsteps, n_losses_observed, self.qe.s(tsteps, n_losses_observed, &a, &l, &s, l0, sim_c, sim_b));
-        assert!(s_interval.is_contiguous_interval());
-        let min_s = my_min(&s_interval);
-        let max_s = my_max(&s_interval);
-
-        let mut s_clone = s.clone();
-        s_clone.push(max_s);
-
-        // Compute loss observation
-        let prior_loss = l.len() as i32;
-        let lo_ret = self.get_sim_loss_observation(&a, &l, &s_clone, l0, prior_loss);
-        let lo = if lo_ret.is_empty() {
-            let time_ago = (tsteps - 1 - n_losses_observed) + 1;
-            assert!(time_ago >= 0);
-            vec![LossObservation {
-                t: time_ago as usize,
-                l: *l.last().unwrap(),
-            }]
-        } else {
-            lo_ret
-        };
-        return Some(NetworkActionNC {
-            s: max_s,
-            lo,
-            app_send_fraction: AppSendFraction::Full,
-        });
-        // Worst-case behavior
-        //if lo.last().unwrap().t == 2 && lo.last().unwrap().l == 0.into() {
-        if lo.last().unwrap().t == 2 {
-            let max_s = my_max(&s_interval);
-            let mut s_clone = s.clone();
-            s_clone.push(max_s);
-
-            let prior_loss = l.len() as i32;
-            let lo_ret = self.get_sim_loss_observation(&a, &l, &s_clone, l0, prior_loss);
-            let lo = if lo_ret.is_empty() {
-                let time_ago = (tsteps - 1 - n_losses_observed) + 1;
-                assert!(time_ago >= 0);
-                vec![LossObservation {
-                    t: time_ago as usize,
-                    l: *l.last().unwrap(),
-                }]
-            } else {
-                lo_ret
-            };
-            Some(NetworkActionNC {
-                s: max_s,
-                lo,
-                app_send_fraction: AppSendFraction::Full,
-            })
-        } else {
-            Some(NetworkActionNC {
-                s: min_s,
-                lo,
-                app_send_fraction: AppSendFraction::Full,
-            })
-        }
+        self.get_network_move_sim_policy(relevant_history, move_cca, SimPolicy::Max, 0.into())
     }
 
     fn setup_network_move_sim(&mut self, sim_ideal: bool, sim_c: RealNumRep, sim_b: RealNumRep) {
@@ -1005,12 +980,139 @@ impl NetworkModelNC {
             sim_b: None,
             app_send_choices: vec![AppSendFraction::Full],
             qe: Arc::new(PlainQe),
+            sim_qe: None,
         }
     }
 
     /// Use a different generated QE evaluator, e.g. `BurstyQe`.
     pub fn with_qe(self, qe: Arc<dyn QeTables>) -> Self {
         Self { qe, ..self }
+    }
+
+    /// Replace the evaluator the CCA's beliefs use, between searches.
+    pub fn set_qe(&mut self, qe: Arc<dyn QeTables>) {
+        self.qe = qe;
+    }
+
+    /// Simulate the ground truth with `sim_qe` instead of the CCA's `qe`.
+    pub fn with_sim_qe(self, sim_qe: Arc<dyn QeTables>) -> Self {
+        Self {
+            sim_qe: Some(sim_qe),
+            ..self
+        }
+    }
+
+    fn sim_tables(&self) -> &dyn QeTables {
+        self.sim_qe.as_deref().unwrap_or(&*self.qe)
+    }
+
+    /// The simulated link's response to `move_cca`, choosing the service by
+    /// `policy` (`u` is only used by `SimPolicy::Random`).
+    pub fn get_network_move_sim_policy(
+        &self,
+        relevant_history: &[ObservationNC],
+        move_cca: &Option<CCAAction>,
+        policy: SimPolicy,
+        u: RealNumRep,
+    ) -> Option<NetworkActionNC> {
+        let sim_c = self.sim_c.unwrap();
+        let sim_b = self.sim_b.unwrap();
+
+        let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(relevant_history, move_cca);
+        let tsteps = a.len() as i32;
+        let n_losses_observed = l.len() as i32;
+
+        let s_interval = expect_qe(
+            "S",
+            tsteps,
+            n_losses_observed,
+            self.sim_tables()
+                .s(tsteps, n_losses_observed, &a, &l, &s, l0, sim_c, sim_b),
+        );
+        assert!(s_interval.is_contiguous_interval());
+        let min_s = my_min(&s_interval);
+        let max_s = my_max(&s_interval);
+        let next_s = match policy {
+            SimPolicy::Max => max_s,
+            SimPolicy::Min => min_s,
+            // Round down to a 1/16 grid to keep rational denominators bounded.
+            SimPolicy::Random => {
+                min_s + ((max_s - min_s) * u * 16i32).floor() / 16i32
+            }
+        };
+
+        let mut s_clone = s.clone();
+        s_clone.push(next_s);
+
+        // Compute loss observation
+        let prior_loss = l.len() as i32;
+        let lo_ret = self.get_sim_loss_observation(&a, &l, &s_clone, l0, prior_loss);
+        let lo = if lo_ret.is_empty() {
+            let time_ago = (tsteps - 1 - n_losses_observed) + 1;
+            assert!(time_ago >= 0);
+            vec![LossObservation {
+                t: time_ago as usize,
+                l: l.last().copied().unwrap_or(l0),
+            }]
+        } else {
+            lo_ret
+        };
+        Some(NetworkActionNC {
+            s: next_s,
+            lo,
+            app_send_fraction: AppSendFraction::Full,
+        })
+    }
+
+    /// Whether some C and B explain `window` (a QE-sized window) under the
+    /// current `qe`.  Unlike `compute_belief_bounds`, this never asserts, so
+    /// it can test hypotheses such as a burstiness K: an infeasible window
+    /// rules the hypothesis out.  Like `tighten_c_with_b` it searches C on a
+    /// grid, so a very narrow feasible C range can be missed.
+    pub fn window_feasible(&self, window: &[ObservationNC]) -> bool {
+        let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(window, &None);
+        let tsteps = a.len() as i32;
+        let n_losses_observed = l.len() as i32;
+        let c = match self.qe.c(tsteps, n_losses_observed, &a, &l, &s, l0) {
+            Some(c) => c,
+            None => self.c_from_partial_results(window, tsteps, n_losses_observed, &a, &l, &s, l0).0,
+        }
+        .intersection(&IntervalList::interval_bounded(
+            Bound::Included(SMALLEST_BW.into()),
+            Bound::Included(LARGEST_BW.into()),
+        ));
+        if c.is_empty() {
+            return false;
+        }
+        let lo = (my_min(&c) * C_GRID).ceil().to_integer();
+        let hi = (my_max(&c) * C_GRID).floor().to_integer();
+        c_seed_grid(lo, hi)
+            .into_iter()
+            .any(|k| self.b_feasible_at(&c, RealNumRep::new(k, C_GRID), tsteps, n_losses_observed, &a, &l, &s, l0))
+    }
+
+    /// Whether `c_val` lies in `c` and leaves this window's B non-empty.
+    #[allow(clippy::too_many_arguments)]
+    fn b_feasible_at(
+        &self,
+        c: &IntervalList<RealNumRep>,
+        c_val: RealNumRep,
+        tsteps: i32,
+        n_losses_observed: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+    ) -> bool {
+        let point = IntervalList::interval_point(Bound::Included(c_val));
+        let b_range = IntervalList::interval_bounded(
+            Bound::Included(SMALLEST_BW.into()),
+            Bound::Included(LARGEST_BW.into()),
+        );
+        !c.intersection(&point).is_empty()
+            && !expect_qe("B", tsteps, n_losses_observed, self.qe.b(tsteps, n_losses_observed, a, l, s, l0, c_val))
+                .intersection(&b_range)
+                .is_empty()
     }
 
     /// Bounds on C for the window `relevant_history` (whose observation
@@ -1039,7 +1141,29 @@ impl NetworkModelNC {
         if let Some(c) = self.qe.c(tsteps, n_losses_observed, a, l, s, l0) {
             return c;
         }
+        let (c, has_from_b) =
+            self.c_from_partial_results(relevant_history, tsteps, n_losses_observed, a, l, s, l0);
+        if has_from_b {
+            self.tighten_c_with_b(c, tsteps, n_losses_observed, a, l, s, l0)
+        } else {
+            c
+        }
+    }
 
+    /// Steps 1-2 of `compute_c`, for a window whose C query is unsolved.
+    /// Also returns whether `c_from_b` constrained the result, in which case
+    /// evaluating `b` on it is safe.
+    #[allow(clippy::too_many_arguments)]
+    fn c_from_partial_results(
+        &self,
+        relevant_history: &[ObservationNC],
+        tsteps: i32,
+        n_losses_observed: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+    ) -> (IntervalList<RealNumRep>, bool) {
         let sub = self.c_from_sub_windows(relevant_history, tsteps);
         let from_b = self.qe.c_from_b(tsteps, n_losses_observed, a, l, s, l0);
         let mut c = IntervalList::interval_bounded(
@@ -1065,10 +1189,7 @@ impl NetworkModelNC {
                 };
             }
         }
-        if from_b.is_some() {
-            c = self.tighten_c_with_b(c, tsteps, n_losses_observed, a, l, s, l0);
-        }
-        c
+        (c, from_b.is_some())
     }
 
     /// Shrink `c` to the C values for which this window's B interval is
@@ -1090,30 +1211,16 @@ impl NetworkModelNC {
         s: &[RealNumRep],
         l0: RealNumRep,
     ) -> IntervalList<RealNumRep> {
-        const C_GRID: RealNumInt = 16;
-        const N_SEEDS: RealNumInt = 16;
         if c.is_empty() {
             return c;
         }
         let at = |k: RealNumInt| RealNumRep::new(k, C_GRID);
-        let b_range = IntervalList::interval_bounded(
-            Bound::Included(SMALLEST_BW.into()),
-            Bound::Included(LARGEST_BW.into()),
-        );
-        let feasible = |k: RealNumInt| {
-            let point = IntervalList::interval_point(Bound::Included(at(k)));
-            !c.intersection(&point).is_empty()
-                && !expect_qe("B", tsteps, n_losses_observed, self.qe.b(tsteps, n_losses_observed, a, l, s, l0, at(k)))
-                    .intersection(&b_range)
-                    .is_empty()
-        };
+        let feasible =
+            |k: RealNumInt| self.b_feasible_at(&c, at(k), tsteps, n_losses_observed, a, l, s, l0);
 
         let lo = (my_min(&c) * C_GRID).ceil().to_integer();
         let hi = (my_max(&c) * C_GRID).floor().to_integer();
-        let Some(seed) = (0..=N_SEEDS)
-            .map(|i| lo + (hi - lo) * i / N_SEEDS)
-            .find(|&k| lo <= hi && feasible(k))
-        else {
+        let Some(seed) = c_seed_grid(lo, hi).into_iter().find(|&k| feasible(k)) else {
             warn!("No feasible C found in {:?} at T={}; keeping it untightened", c, tsteps);
             return c;
         };
@@ -1600,7 +1707,8 @@ impl NetworkModelNC {
             "L",
             tsteps,
             n_losses_observed,
-            self.qe.l_obs(tsteps, prior_loss, n_losses_observed, a, l, s, l0, sim_c, sim_b),
+            self.sim_tables()
+                .l_obs(tsteps, prior_loss, n_losses_observed, a, l, s, l0, sim_c, sim_b),
         );
         let this_l = my_min(&l_interval);
 
@@ -1768,6 +1876,210 @@ mod tests {
                 assert!(f_lo <= SIM_C.into() && RealNumRep::from(SIM_C) <= f_hi, "{}", msg);
                 assert!(e_lo - tol <= f_lo && f_lo <= e_lo + tol && e_hi - tol <= f_hi && f_hi <= e_hi + tol, "{}", msg);
             }
+        }
+    }
+
+    const BURSTY_PERT: RealNumRep = RealNumRep::new_raw(1, 2);
+
+    fn bursty(k: RealNumInt) -> Arc<dyn QeTables> {
+        Arc::new(BurstyQe { k: k.into(), pert: BURSTY_PERT })
+    }
+
+    /// Seven-observation windows from a bursty simulation with burstiness
+    /// `k`, buffer `b` and C=`SIM_C`, driven by `rates`.  `Random` uses a
+    /// fixed sequence of fractions.
+    fn bursty_windows(k: RealNumInt, b: RealNumInt, policy: SimPolicy, rates: &[RealNumInt]) -> Vec<Vec<ObservationNC>> {
+        let mut nm = NetworkModelNC::new().with_qe(bursty(k));
+        nm.setup_network_move_sim(false, SIM_C.into(), b.into());
+        let mut history = nm.get_initial_history();
+        let mut ret = vec![];
+        for (i, &rate) in rates.iter().enumerate() {
+            let move_cca = Some(CCAAction { rate: rate.into() });
+            let rh = &history[history.len() - FEASIBLE_SIZE..];
+            let u = RealNumRep::new((i as RealNumInt * 7) % 16, 16);
+            let na = nm.get_network_move_sim_policy(rh, &move_cca, policy, u).unwrap();
+            let obs = nm.compute_observation(history.last().unwrap(), &na, &move_cca);
+            history.push(obs);
+            ret.push(history[history.len() - HISTORY_SIZE..].to_vec());
+        }
+        ret
+    }
+
+    const PROBE_RATES: [RealNumInt; 16] = [5, 15, 10, 25, 30, 20, 35, 15, 25, 40, 10, 30, 45, 5, 20, 25];
+
+    /// The burstiness that generated a trace must never be ruled out.
+    #[test]
+    fn test_true_k_is_feasible() {
+        for (k, b) in [(1, 5), (4, 9), (16, 33)] {
+            for policy in [SimPolicy::Max, SimPolicy::Min, SimPolicy::Random] {
+                let nm = NetworkModelNC::new().with_qe(bursty(k));
+                for (i, window) in bursty_windows(k, b, policy, &PROBE_RATES).iter().enumerate() {
+                    assert!(nm.window_feasible(window), "k={} b={} {:?} window {}", k, b, policy, i);
+                }
+            }
+        }
+    }
+
+    /// Exploratory: which K hypotheses each (true K, B, policy) trace rules
+    /// out.  Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_k_feasibility() {
+        let hypotheses = [1, 4, 16, 64];
+        for (k, b) in [(1, 5), (1, 200), (4, 9), (16, 33), (64, 129)] {
+            for policy in [SimPolicy::Max, SimPolicy::Min, SimPolicy::Random] {
+                let windows = bursty_windows(k, b, policy, &PROBE_RATES);
+                let row: Vec<String> = hypotheses
+                    .iter()
+                    .map(|&h| {
+                        let nm = NetworkModelNC::new().with_qe(bursty(h));
+                        let first_dead = windows.iter().position(|w| !nm.window_feasible(w));
+                        format!("K={}:{}", h, first_dead.map_or("alive".to_string(), |i| format!("dead@{}", i)))
+                    })
+                    .collect();
+                println!("true k={:>2} b={:>3} {:?}: {}", k, b, policy, row.join(" "));
+            }
+        }
+    }
+
+    /// Burst patterns for the forward simulator: (name, choice at step i).
+    fn link_patterns() -> Vec<(&'static str, fn(usize) -> LinkChoice)> {
+        fn none(_: usize) -> LinkChoice {
+            LinkChoice { burst: 0.into(), service: 1.into() }
+        }
+        fn max(_: usize) -> LinkChoice {
+            LinkChoice { burst: 1.into(), service: 0.into() }
+        }
+        fn random(i: usize) -> LinkChoice {
+            LinkChoice {
+                burst: RealNumRep::new((i as RealNumInt * 7) % 16, 16),
+                service: RealNumRep::new((i as RealNumInt * 11 + 3) % 16, 16),
+            }
+        }
+        fn alternate(i: usize) -> LinkChoice {
+            LinkChoice { burst: ((i % 2) as RealNumInt).into(), service: RealNumRep::new(1, 2) }
+        }
+        vec![("none", none), ("max", max), ("random", random), ("alternate", alternate)]
+    }
+
+    /// Seven-observation windows from the forward simulator.
+    fn forward_windows(k: RealNumInt, b: RealNumInt, choose: fn(usize) -> LinkChoice, rates: &[RealNumInt]) -> Vec<Vec<ObservationNC>> {
+        let nm = NetworkModelNC::new().with_qe(bursty(k));
+        let mut history = nm.get_initial_history();
+        let mut sim = BurstyLinkSim::new(SIM_C.into(), b.into(), k.into(), history.len());
+        let mut ret = vec![];
+        for (i, &rate) in rates.iter().enumerate() {
+            let move_cca = Some(CCAAction { rate: rate.into() });
+            let na = sim.step(history.last().unwrap().a, history.len(), choose(i));
+            let obs = nm.compute_observation(history.last().unwrap(), &na, &move_cca);
+            history.push(obs);
+            ret.push(history[history.len() - HISTORY_SIZE..].to_vec());
+        }
+        ret
+    }
+
+    const LONG_RATES: [RealNumInt; 32] = [
+        5, 15, 10, 25, 30, 20, 35, 15, 25, 40, 10, 30, 45, 5, 20, 25,
+        1, 1, 1, 1, 1, 1, 1, 1, 30, 30, 30, 30, 0, 0, 22, 22,
+    ];
+
+    /// Forward-simulated traces must never rule out the true K.
+    #[test]
+    fn test_forward_sim_true_k_is_feasible() {
+        for (k, b) in [(1, 5), (4, 9), (16, 33), (1, 100)] {
+            for (name, choose) in link_patterns() {
+                let nm = NetworkModelNC::new().with_qe(bursty(k));
+                for (i, window) in forward_windows(k, b, choose, &LONG_RATES).iter().enumerate() {
+                    assert!(nm.window_feasible(window), "k={} b={} {} window {}", k, b, name, i);
+                }
+            }
+        }
+    }
+
+    /// Exploratory: like `print_k_feasibility`, for forward-simulated traces.
+    #[test]
+    #[ignore]
+    fn print_forward_k_feasibility() {
+        let hypotheses = [1, 4, 16, 64];
+        for (k, b) in [(1, 5), (1, 200), (4, 9), (16, 33), (64, 129)] {
+            for (name, choose) in link_patterns() {
+                let windows = forward_windows(k, b, choose, &LONG_RATES);
+                let row: Vec<String> = hypotheses
+                    .iter()
+                    .map(|&h| {
+                        let nm = NetworkModelNC::new().with_qe(bursty(h));
+                        let first_dead = windows.iter().position(|w| !nm.window_feasible(w));
+                        format!("K={}:{}", h, first_dead.map_or("alive".to_string(), |i| format!("dead@{}", i)))
+                    })
+                    .collect();
+                println!("fwd true k={:>2} b={:>3} {:>9}: {}", k, b, name, row.join(" "));
+            }
+        }
+    }
+
+    /// Debug: dump forward-simulated windows (K=4, B=9) for the z3 check.
+    #[test]
+    #[ignore]
+    fn dump_forward_windows() {
+        let py = |v: &[RealNumRep]| format!("[{}]", v.iter().map(|x| format!("F({}, {})", x.numer(), x.denom())).collect::<Vec<_>>().join(", "));
+        for (name, choose) in link_patterns() {
+            for w in forward_windows(4, 9, choose, &LONG_RATES) {
+                let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(&w, &None);
+                println!("W dict(a={}, l={}, s={}, l0=F({}, {}), name='{}')", py(&a), py(&l), py(&s), l0.numer(), l0.denom(), name);
+            }
+        }
+    }
+
+    /// Debug: dump the QE inputs of every window of a K=4, B=9 `Min` trace
+    /// as Python literals, to check them against the z3 model directly.
+    #[test]
+    #[ignore]
+    fn dump_min_policy_windows() {
+        let mut rates = vec![];
+        for _ in 0..4 {
+            rates.extend([RealNumRep::from(11), 0.into(), 0.into(), 1.into(), RealNumRep::new(161, 16)]);
+        }
+        rates.extend(std::iter::repeat(RealNumRep::from(1)).take(20));
+        let mut nm = NetworkModelNC::new().with_qe(bursty(4));
+        nm.setup_network_move_sim(false, SIM_C.into(), 9.into());
+        let mut history = nm.get_initial_history();
+        let py = |v: &[RealNumRep]| format!("[{}]", v.iter().map(|x| format!("F({}, {})", x.numer(), x.denom())).collect::<Vec<_>>().join(", "));
+        for rate in rates {
+            let move_cca = Some(CCAAction { rate });
+            let rh = &history[history.len() - FEASIBLE_SIZE..];
+            let na = nm.get_network_move_sim_policy(rh, &move_cca, SimPolicy::Min, 0.into()).unwrap();
+            let obs = nm.compute_observation(history.last().unwrap(), &na, &move_cca);
+            history.push(obs);
+            let w = &history[history.len() - HISTORY_SIZE..];
+            let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(w, &None);
+            println!("W dict(a={}, l={}, s={}, l0=F({}, {}))", py(&a), py(&l), py(&s), l0.numer(), l0.denom());
+        }
+    }
+
+    /// Debug: why the true K=1 is ruled out on a B=5 random trace.
+    #[test]
+    #[ignore]
+    fn debug_true_k_infeasible() {
+        let windows = bursty_windows(1, 5, SimPolicy::Random, &PROBE_RATES);
+        let nm = NetworkModelNC::new().with_qe(bursty(1));
+        for (i, w) in windows.iter().enumerate() {
+            let (a, l, s, l0) = NetworkModelNC::get_observation_vectors(w, &None);
+            let (t, n) = (a.len() as i32, l.len() as i32);
+            let (c, _) = nm.c_from_partial_results(w, t, n, &a, &l, &s, l0);
+            let from_b = nm.qe.c_from_b(t, n, &a, &l, &s, l0);
+            let b_true = nm.qe.b(t, n, &a, &l, &s, l0, SIM_C.into());
+            println!(
+                "w{} feasible={} a={:?} s={:?} l={:?} l0={}\n   c={:?}\n   c_from_b={:?}\n   B(C=20)={:?}",
+                i,
+                nm.window_feasible(w),
+                a.iter().map(|x| x.to_f64().unwrap()).collect::<Vec<_>>(),
+                s.iter().map(|x| x.to_f64().unwrap()).collect::<Vec<_>>(),
+                l.iter().map(|x| x.to_f64().unwrap()).collect::<Vec<_>>(),
+                l0,
+                c,
+                from_b,
+                b_true
+            );
         }
     }
 
