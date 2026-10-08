@@ -21,7 +21,8 @@ use network_model_nc::{BurstyLinkSim, BurstyQe, LinkChoice, NetworkActionNC, Net
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
-    record_action, state_policy, update_k, CandidateAction, InconsistentQeWindows, KPolicy, PlannerState,
+    record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
+    PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
     K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
 };
@@ -262,11 +263,12 @@ struct CongCtrlState<NM: NetworkModel> {
     qe_ks: Option<Vec<RealNumInt>>,
     /// Belief bounds of committed QE windows, which never change for a given
     /// K set.  Speculative windows are not cached.
-    window_cache: RefCell<HashMap<Vec<NM::O>, BeliefBounds>>,
+    window_cache: RefCell<HashMap<Vec<NM::O>, Option<BeliefBounds>>>,
     /// The last committed belief and the K set it assumed.  C and B are
     /// static, so a later belief is intersected with it rather than allowed
     /// to get broader; see `retained_prior`.
-    retained: Option<(Option<Vec<RealNumInt>>, BeliefBounds)>,
+    /// The K set, the bounds and `PlannerState::belief_start` they came from.
+    retained: Option<(Option<Vec<RealNumInt>>, BeliefBounds, usize)>,
     /// `--belief-history N` (`None`: whole-history beliefs, which retain the
     /// prior belief on every RTT).
     belief_history: Option<usize>,
@@ -481,7 +483,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 warn!("committed belief {} disagrees with the retained {}; keeping the newer bound there", bounds, prior);
             }
         }
-        self.retained = Some((self.qe_ks.clone(), bounds));
+        self.retained = Some((self.qe_ks.clone(), bounds, self.planner.belief_start));
         self.belief_bounds = bounds;
         self.move_choices_cca_stack.push(self.compute_cca_moves());
     }
@@ -787,7 +789,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let window_count = history.len() - QE_WINDOW_OBSERVATIONS + 1;
         // Observations at index >= n_committed are speculative.
         let n_committed = history.len() - std::cmp::min(self.history_stack.len(), history.len());
-        let window_bounds = |idx: usize, window: &[NM::O]| {
+        // `None`: no static link explains the window (it straddles a change).
+        let window_bounds = |idx: usize, window: &[NM::O]| -> Option<BeliefBounds> {
             // An outstanding CCA action belongs only to the newest window.
             let action = if idx + 1 == window_count {
                 &self.move_cca
@@ -795,35 +798,52 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 &None
             };
             if action.is_some() || idx + QE_WINDOW_OBSERVATIONS > n_committed {
-                return self.network_model.compute_belief_bounds(window, action);
+                return self.network_model.try_compute_belief_bounds(window, action);
             }
             if let Some(bounds) = self.window_cache.borrow().get(window) {
                 return *bounds;
             }
-            let bounds = self.network_model.compute_belief_bounds(window, action);
+            let bounds = self.network_model.try_compute_belief_bounds(window, action);
             self.window_cache.borrow_mut().insert(window.to_vec(), bounds);
             bounds
         };
-        let mut windows = history.windows(QE_WINDOW_OBSERVATIONS).enumerate();
-        let (first_idx, first) = windows.next().unwrap();
-        let mut bounds = window_bounds(first_idx, first);
+        // Until the first explainable window, the committed belief stands in.
+        let mut bounds: Option<BeliefBounds> = None;
         let mut conflicts = 0;
-        for (idx, window) in windows {
-            let next = window_bounds(idx, window);
+        for (idx, window) in history.windows(QE_WINDOW_OBSERVATIONS).enumerate() {
+            let Some(next) = window_bounds(idx, window) else {
+                if !lenient {
+                    return Err(InconsistentQeWindows {
+                        history_observations: history.len(),
+                        window_index: idx,
+                        accumulated: bounds.unwrap_or(self.belief_bounds),
+                        next_window: bounds.unwrap_or(self.belief_bounds),
+                        infeasible: true,
+                    });
+                }
+                conflicts += 1;
+                continue;
+            };
+            if bounds.is_none() {
+                bounds = Some(next);
+                continue;
+            }
+            let bounds = bounds.as_mut().unwrap();
 
             // C and B are persistent parameters, so intersect their bounds.
             // Generated QE uses finite discretization, however, and individual
             // windows can occasionally disagree by more than its numerical
             // slack.  Do not turn that approximation artifact into a runtime
             // crash or an empty belief: retain the prior consistent result.
-            let mut merged = bounds;
+            let mut merged = *bounds;
             if intersect_c_b(&mut merged, &next) {
                 if !lenient {
                     return Err(InconsistentQeWindows {
                         history_observations: history.len(),
                         window_index: idx,
-                        accumulated: bounds,
+                        accumulated: *bounds,
                         next_window: next,
+                        infeasible: false,
                     });
                 }
                 conflicts += 1;
@@ -843,7 +863,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 bounds.max_if = next.max_if;
             }
         }
-        Ok((bounds, conflicts))
+        Ok((bounds.unwrap_or(self.belief_bounds), conflicts))
     }
 
     fn try_compute_belief_bounds(&self, history_len: usize) -> Result<BeliefBounds, InconsistentQeWindows> {
@@ -875,7 +895,12 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     /// proved, so the prior is only dropped once the window holds nothing
     /// but busy RTTs.
     fn retained_prior(&self) -> Option<BeliefBounds> {
-        let (ks, prior) = self.retained.as_ref()?;
+        let (ks, prior, start) = self.retained.as_ref()?;
+        if *start != self.planner.belief_start {
+            // The belief restarted because the link changed: the older
+            // bounds describe a different link.
+            return None;
+        }
         let narrowed = match (ks, &self.qe_ks) {
             (Some(old), Some(new)) => new.iter().all(|k| old.contains(k)),
             (old, new) => old.is_none() && new.is_none(),
@@ -961,7 +986,16 @@ impl CongCtrlState<NetworkModelNC> {
             let mut planner = std::mem::take(&mut self.planner);
             let n = self.history.len();
             let delivered = self.history[n - 1].s - self.history[n - 2].s;
-            let ks = update_k(&mut planner, timestep, delivered, &feasible);
+            let start_before = planner.belief_start;
+            let ks = update_k(&mut planner, timestep, delivered, &intervals.strategy, &feasible);
+            if planner.belief_start != start_before {
+                // The link changed: what the committed belief says about C and
+                // B described the old link.
+                self.belief_bounds.min_c = SMALLEST_BW.into();
+                self.belief_bounds.max_c = LARGEST_BW.into();
+                self.belief_bounds.min_b = SMALLEST_BW.into();
+                self.belief_bounds.max_b = LARGEST_BW.into();
+            }
             self.planner = planner;
             if self.qe_ks.as_ref() != Some(&ks) {
                 info!("t={}: belief uses K in {:?}", timestep, ks);
@@ -996,6 +1030,11 @@ impl CongCtrlState<NetworkModelNC> {
             probe_interval_rtts: intervals.probe,
             drain_interval_rtts: intervals.drain,
             belief_history: intervals.belief_history,
+            strategy: intervals.strategy,
+            newest_window_feasible: self
+                .network_model
+                .try_compute_belief_bounds(&self.history[self.history.len() - QE_WINDOW_OBSERVATIONS..], &None)
+                .is_some(),
         };
         let mut planner = self.planner.clone();
         let mut policy = state_policy(&state, &mut planner);
@@ -1038,6 +1077,7 @@ struct PlannerIntervals {
     probe: usize,
     drain: usize,
     belief_history: Option<usize>,
+    strategy: BeliefStrategy,
 }
 
 /// Intersect the persistent C and B bounds of `next` into `acc`, one
@@ -1153,6 +1193,42 @@ struct Args {
     /// sends `min(its rate, buffered app data)`.
     #[arg(long, default_value = "backlogged")]
     app: AppModel,
+
+    /// Time-varying link: `T:C,T:C,...` sets the simulated C from RTT T on.
+    #[arg(long, value_parser = parse_schedule)]
+    sim_c_schedule: Option<Schedule>,
+
+    /// Belief strategy (`BeliefStrategy`): RTTs to confirm the smallest K.
+    #[arg(long)]
+    k_confirm: Option<usize>,
+    /// Assume the smallest alive K from the start.
+    #[arg(long)]
+    k_optimistic: bool,
+    /// Restart the belief when the evidence says the link changed.
+    #[arg(long)]
+    change_restart: bool,
+    /// Let minimax choose (with `qdel`) instead of forcing drains in Explore.
+    #[arg(long)]
+    explore_free: bool,
+    /// Only the newest N RTTs bound C from above for the planner.
+    #[arg(long)]
+    c_upper_rtts: Option<usize>,
+}
+
+/// `--sim-c-schedule`: (from RTT, link rate) pairs.
+#[derive(Clone, Debug)]
+struct Schedule(Vec<(u32, RealNumRep)>);
+
+fn parse_schedule(s: &str) -> Result<Schedule, String> {
+    s.split(',')
+        .map(|part| {
+            let (t, c) = part.split_once(':').ok_or(format!("{part}: expected T:C"))?;
+            let t = t.parse::<u32>().map_err(|e| format!("{part}: {e}"))?;
+            let c = c.parse::<RealNumInt>().map_err(|e| format!("{part}: {e}"))?;
+            Ok((t, c.into()))
+        })
+        .collect::<Result<_, _>>()
+        .map(Schedule)
 }
 
 /// `--app`: what the application gives the CCA to send.
@@ -1293,6 +1369,21 @@ fn get_sim_tag(args: &Args) -> String {
     if args.app != AppModel::Backlogged {
         ret.push_str(&format!("_app{}", args.app));
     }
+    if let Some(Schedule(sched)) = &args.sim_c_schedule {
+        let parts: Vec<String> = sched.iter().map(|(t, c)| format!("{t}-{c}")).collect();
+        ret.push_str(&format!("_sched{}", parts.join("-")));
+    }
+    if let Some(n) = args.c_upper_rtts {
+        ret.push_str(&format!("_cup{n}"));
+    }
+    if let Some(k) = args.k_confirm {
+        ret.push_str(&format!("_kc{k}"));
+    }
+    for (on, name) in [(args.k_optimistic, "kopt"), (args.change_restart, "chg"), (args.explore_free, "xfree")] {
+        if on {
+            ret.push_str(&format!("_{name}"));
+        }
+    }
     ret
 }
 
@@ -1399,7 +1490,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wtr.write_record([
             "time", "r", "a", "ld", "s", "qdel", "min_c", "max_c", "min_b", "max_b", "min_q",
             "max_q", "min_if", "max_if", "mode", "action", "loss_tol", "sim", "qe_ks", "alive_ks",
-            "sent", "app_limited", "candidates",
+            "sent", "app_limited", "candidates", "true_c", "belief_start", "restarts",
         ])?;
         some_wtr = Some(wtr);
     }
@@ -1428,6 +1519,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         probe: args.probe_interval.unwrap_or(PROBE_INTERVAL_RTTS),
         drain: args.drain_interval.unwrap_or(DRAIN_INTERVAL_RTTS),
         belief_history: args.belief_history,
+        strategy: BeliefStrategy {
+            k_confirm_rtts: args.k_confirm.unwrap_or(K_CONFIRM_RTTS),
+            k_optimistic: args.k_optimistic,
+            change_restart: args.change_restart,
+            explore_free: args.explore_free,
+            c_upper_rtts: args.c_upper_rtts,
+        },
     };
 
     network_model.init();
@@ -1460,7 +1558,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mixed_choice = SimChoice::Max;
     let mut app = AppSource::new(args.app, args.sim_c);
     let tsteps = args.steps;
+    let mut true_c = args.sim_c;
     for t in 0..tsteps {
+        let change = args.sim_c_schedule.as_ref().and_then(|Schedule(s)| s.iter().find(|(at, _)| *at == t));
+        if let Some((_, c)) = change {
+            true_c = *c;
+            if let Some(sim) = link_sim.as_mut() {
+                sim.c = true_c;
+            }
+            info!("t={}: simulated link rate is now {}", t, true_c);
+        }
         let mode = ccs.policy.mode;
         let loss_tol = ccs.policy.loss_tolerance_abs;
         info!("Step {}: searching...", t);
@@ -1606,6 +1713,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{:.2}", sent.to_f64().unwrap()),
                 format!("{}", ccs.planner.app_limited),
                 format!("{}", root_moves.len()),
+                format!("{:.2}", true_c.to_f64().unwrap()),
+                format!("{}", ccs.planner.belief_start),
+                format!("{}", ccs.planner.restarts),
             ])?;
             wtr.flush()?;
         }

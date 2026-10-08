@@ -598,6 +598,14 @@ impl NetworkModel for NetworkModelNC {
         // Some(max_rate)
     }
 
+    fn try_compute_belief_bounds(
+        &self,
+        relevant_history: &[Self::O],
+        move_cca: &Option<CCAAction>,
+    ) -> Option<BeliefBounds> {
+        qe_tables::quietly_catch(|| self.compute_belief_bounds(relevant_history, move_cca))
+    }
+
     fn compute_belief_bounds(
         &self,
         relevant_history: &[Self::O],
@@ -1565,7 +1573,11 @@ impl NetworkModelNC {
                 Bound::Included(0.into()),
                 Bound::Included(LARGEST_BW.into()),
             ));
-            assert!(!b_interval.is_empty());
+            // Empty when no static link explains the window (it straddles a
+            // change in the link); the planner then avoids the search.
+            if b_interval.is_empty() {
+                continue;
+            }
             ret.push((c_val, my_min(&b_interval)));
             ret.push((c_val, my_max(&b_interval)));
         }

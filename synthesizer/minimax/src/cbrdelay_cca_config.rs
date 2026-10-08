@@ -175,6 +175,56 @@ pub const INFORMATIVE_LOAD: RealNumRep = RealNumRep::new_raw(1, 2);
 /// Loss budget (packets per probe) when cautious.
 pub const CAUTIOUS_LOSS_BUDGET: RealNumRep = RealNumRep::new_raw(1, 1);
 
+/// How the belief is maintained across RTTs.  These are experiment switches
+/// (`--k-confirm`, `--k-optimistic`, `--change-restart`, `--explore-free`);
+/// the defaults reproduce the original behaviour.
+#[derive(Clone, Copy, Debug)]
+pub struct BeliefStrategy {
+    /// `K_CONFIRM_RTTS`: informative RTTs before the smallest alive K is
+    /// assumed alone.
+    pub k_confirm_rtts: usize,
+    /// Assume the smallest alive K from the start.  A wrong K is ruled out
+    /// by the windows it cannot explain, so this is still sound in the
+    /// limit, but it trusts the small K before any evidence for it.
+    pub k_optimistic: bool,
+    /// Treat evidence against a static link as a change of the link: when a
+    /// confirmed K is ruled out by disagreeing windows, or the belief's
+    /// windows disagree by more than QE slack, restart the belief at the
+    /// newest window (instead of escalating K or keeping the older bound).
+    pub change_restart: bool,
+    /// In Explore, do not force `DrainQueue` when the queue may exceed
+    /// `EXPLORE_MAX_QUEUE_BDP`: let minimax choose, with `qdel` among its
+    /// objectives (`EXPLORE_FREE_OBJECTIVE_ORDER`).
+    pub explore_free: bool,
+    /// The upper bound on C expires: only the newest this many observations'
+    /// windows bound `max_c` for the planner.  A rise in C is invisible to a
+    /// sender at the old rate, so no observation can ever contradict the old
+    /// `max_c`; forgetting it is the only way to let the CCA look again.
+    /// While the link stays busy the recent windows keep `max_c` tight, so
+    /// this only loosens it once the queue has emptied.
+    pub c_upper_rtts: Option<usize>,
+}
+
+impl Default for BeliefStrategy {
+    fn default() -> Self {
+        Self {
+            k_confirm_rtts: K_CONFIRM_RTTS,
+            k_optimistic: false,
+            change_restart: false,
+            explore_free: false,
+            c_upper_rtts: None,
+        }
+    }
+}
+
+/// `explore_free`: the objective once the queue may exceed
+/// `EXPLORE_MAX_QUEUE_BDP`, where the planner would otherwise force a drain.
+pub const EXPLORE_FREE_OBJECTIVE_ORDER: &[&str] = &["lt", "qdel", "schadd", "ttscbadd", "scb", "c", "l"];
+
+/// `change_restart`: windows a shadow belief (`KShadow`) must fit before the
+/// CCA concludes that the link changed.
+pub const SHADOW_WINDOWS: usize = 3;
+
 // ------------------------------------------------------------------------------------------
 
 /// A non-overlap encountered while intersecting fixed-size QE windows.
@@ -204,6 +254,9 @@ pub struct InconsistentQeWindows {
     pub accumulated: BeliefBounds,
     /// Bounds returned by the window that conflicts with `accumulated`.
     pub next_window: BeliefBounds,
+    /// No static link explains the window at all (it straddles a change);
+    /// `next_window` is then meaningless.
+    pub infeasible: bool,
 }
 
 /// Runs QE on the newest requested history and intersects its C/B bounds.
@@ -226,6 +279,11 @@ pub struct StateQuantities<'a> {
     /// `--belief-history`: observations whose overlapping QE windows are
     /// intersected for the belief (`None`: the whole history).
     pub belief_history: Option<usize>,
+    pub strategy: BeliefStrategy,
+    /// Some static link (under the assumed K) explains the newest QE window.
+    /// For a few RTTs after the link changes, none does, and the model gives
+    /// minimax nothing to search with.
+    pub newest_window_feasible: bool,
 }
 
 /// What the planner is doing this RTT.  Logged in the CSV.
@@ -257,6 +315,22 @@ pub struct KTracker {
     pub stable_rtts: usize,
     /// The K set the belief currently uses.
     pub assumed: Vec<RealNumInt>,
+    pub shadow: Option<KShadow>,
+}
+
+/// `change_restart`: when the confirmed K stops fitting, either the link is
+/// burstier than K or it changed.  K escalates as usual, and in parallel a
+/// belief under the confirmed K is built from windows that start after the
+/// conflict only.  If `SHADOW_WINDOWS` of them fit, the old windows were the
+/// problem: the link changed, and the belief restarts there.  If one does not
+/// fit, the link really is burstier, and the shadow is dropped.
+#[derive(Clone, Debug)]
+pub struct KShadow {
+    pub k: RealNumInt,
+    /// First observation the shadow's windows may contain.
+    pub from: usize,
+    pub windows: usize,
+    pub bounds: Option<BeliefBounds>,
 }
 
 /// Planner memory that persists across RTTs.  Unlike `StatePolicy`, it is
@@ -276,6 +350,10 @@ pub struct PlannerState {
     /// `min_c` of the last belief, for `INFORMATIVE_LOAD`.
     pub last_min_c: RealNumRep,
     pub k: KTracker,
+    /// Index of the first observation the belief uses (`change_restart`).
+    pub belief_start: usize,
+    /// Times the belief was restarted because the link changed.
+    pub restarts: usize,
 }
 
 /// Settings selected once at the beginning of a state.  They remain immutable
@@ -325,6 +403,30 @@ fn names(objectives: &[&str]) -> Vec<String> {
 /// rules a K out.
 pub const K_WINDOW_DISAGREEMENT_TOL: RealNumRep = RealNumRep::new_raw(1, 1);
 
+/// Intersect a window's C/B bounds into `acc`, within
+/// `K_WINDOW_DISAGREEMENT_TOL` (QE slack); `None` if they disagree by more.
+fn merge_window(acc: Option<BeliefBounds>, next: BeliefBounds) -> Option<BeliefBounds> {
+    let Some(prev) = acc else { return Some(next) };
+    let mut merged = BeliefBounds {
+        min_c: std::cmp::max(prev.min_c, next.min_c),
+        max_c: std::cmp::min(prev.max_c, next.max_c),
+        min_b: std::cmp::max(prev.min_b, next.min_b),
+        max_b: std::cmp::min(prev.max_b, next.max_b),
+        ..next
+    };
+    let tol = K_WINDOW_DISAGREEMENT_TOL;
+    if merged.min_c > merged.max_c + tol || merged.min_b > merged.max_b + tol {
+        return None;
+    }
+    if merged.min_c > merged.max_c {
+        (merged.min_c, merged.max_c) = (next.min_c, next.max_c);
+    }
+    if merged.min_b > merged.max_b {
+        (merged.min_b, merged.max_b) = (next.min_b, next.max_b);
+    }
+    Some(merged)
+}
+
 /// Bursty model, `KPolicy::Hypotheses` only: update which K are still
 /// consistent and return the K set the belief should use.  Called once per
 /// committed observation, before `state_policy`.  `window_belief(k)` is the
@@ -339,6 +441,7 @@ pub fn update_k(
     planner: &mut PlannerState,
     timestep: usize,
     delivered: RealNumRep,
+    strategy: &BeliefStrategy,
     window_belief: &dyn Fn(RealNumInt) -> Option<BeliefBounds>,
 ) -> Vec<RealNumInt> {
     let hypotheses = match K_POLICY {
@@ -353,11 +456,40 @@ pub fn update_k(
     }
     let smallest = |alive: &[(RealNumInt, bool)]| alive.iter().find(|(_, a)| *a).map(|(k, _)| *k);
     let smallest_before = smallest(&tracker.alive);
+    // `change_restart`: a K that explained every window for
+    // `k_confirm_rtts` informative RTTs and then stops doing so is evidence
+    // that the link changed, not that it was burstier all along.
+    let confirmed = (strategy.change_restart && tracker.stable_rtts >= strategy.k_confirm_rtts)
+        .then_some(smallest_before)
+        .flatten();
+    let mut conflicted = None;
+    // The shadow takes the newest window once it starts after the conflict.
+    let mut adopt = None;
+    if let Some(sh) = tracker.shadow.as_mut() {
+        if timestep >= sh.from {
+            match window_belief(sh.k).and_then(|next| merge_window(sh.bounds, next)) {
+                Some(b) => {
+                    sh.bounds = Some(b);
+                    sh.windows += 1;
+                    if sh.windows >= SHADOW_WINDOWS {
+                        adopt = tracker.shadow.take();
+                    }
+                }
+                None => {
+                    info!("t={}: fresh windows do not fit K={} either: burstier, not changed", timestep, sh.k);
+                    tracker.shadow = None;
+                }
+            }
+        }
+    }
     for ((k, alive), acc) in tracker.alive.iter_mut().zip(tracker.bounds.iter_mut()) {
         if !*alive {
             continue;
         }
         let Some(next) = window_belief(*k) else {
+            if confirmed == Some(*k) {
+                conflicted = Some(*k);
+            }
             info!("t={}: K={} ruled out (window infeasible)", timestep, k);
             *alive = false;
             continue;
@@ -374,6 +506,9 @@ pub fn update_k(
         };
         let tol = K_WINDOW_DISAGREEMENT_TOL;
         if merged.min_c > merged.max_c + tol || merged.min_b > merged.max_b + tol {
+            if confirmed == Some(*k) {
+                conflicted = Some(*k);
+            }
             info!(
                 "t={}: K={} ruled out (windows disagree: c=[{}, {}], b=[{}, {}])",
                 timestep, k, merged.min_c, merged.max_c, merged.min_b, merged.max_b
@@ -392,9 +527,41 @@ pub fn update_k(
         }
         *acc = Some(merged);
     }
+    if let Some(k) = conflicted {
+        if !tracker.alive.iter().any(|(_, a)| *a) {
+            // No K explains the old windows with this one, while the
+            // confirmed K did until now: the link changed.  The belief starts
+            // over at the newest window (one straddling the change fits no K;
+            // the next ones will), and K stays confirmed.
+            info!("t={}: no K fits since confirmed K={} stopped fitting: link changed", timestep, k);
+            adopt = Some(KShadow { k, from: timestep, windows: 0, bounds: None });
+        } else if tracker.shadow.is_none() && adopt.is_none() {
+            info!("t={}: confirmed K={} stopped fitting; checking fresh windows for a change", timestep, k);
+            tracker.shadow = Some(KShadow {
+                k,
+                from: timestep + QE_WINDOW_OBSERVATIONS - 1,
+                windows: 0,
+                bounds: None,
+            });
+        }
+    }
+    let mut adopted = false;
+    if let Some(sh) = adopt {
+        info!("t={}: link changed; belief restarts at observation {} with K={}", timestep, sh.from, sh.k);
+        for ((k, alive), acc) in tracker.alive.iter_mut().zip(tracker.bounds.iter_mut()) {
+            *alive = *k >= sh.k;
+            *acc = if *k == sh.k { sh.bounds } else { None };
+        }
+        tracker.shadow = None;
+        tracker.stable_rtts = tracker.stable_rtts.max(strategy.k_confirm_rtts);
+        planner.belief_start = sh.from;
+        planner.restarts += 1;
+        adopted = true;
+    }
+    let tracker = &mut planner.k;
     // Ruling out a large K (e.g. by a small buffer) is no evidence against
     // the smallest K, so only restart its confirmation when it changes.
-    if smallest(&tracker.alive) != smallest_before {
+    if smallest(&tracker.alive) != smallest_before && !adopted {
         tracker.stable_rtts = 0;
     }
     let mut alive: Vec<RealNumInt> =
@@ -411,7 +578,7 @@ pub fn update_k(
     if delivered >= planner.last_min_c * INFORMATIVE_LOAD {
         tracker.stable_rtts += 1;
     }
-    tracker.assumed = if tracker.stable_rtts >= K_CONFIRM_RTTS {
+    tracker.assumed = if strategy.k_optimistic || tracker.stable_rtts >= strategy.k_confirm_rtts {
         vec![alive[0]]
     } else {
         alive
@@ -447,16 +614,35 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     // history (the engine caches committed windows, and C and B are static,
     // so nothing learned is forgotten), falling back to the windows before
     // the first inconsistent one.
-    let default_history_len = state
+    let n_obs = state.history.len();
+    let since_start = n_obs.saturating_sub(planner.belief_start);
+    let mut default_history_len = state
         .belief_history
-        .map_or(state.history.len(), |n| n.clamp(QE_WINDOW_OBSERVATIONS, state.history.len()));
-    let (_history_len, belief) = match (state.belief_bounds_for_history)(default_history_len) {
-        Ok(belief) => (default_history_len, belief),
-        Err(conflict) => (
-            conflict.history_observations - conflict.window_index - 1,
-            conflict.accumulated,
-        ),
+        .map_or(since_start, |n| n.min(since_start))
+        .clamp(QE_WINDOW_OBSERVATIONS, n_obs);
+    let belief = loop {
+        match (state.belief_bounds_for_history)(default_history_len) {
+            Ok(belief) => break belief,
+            // Changes are detected per K, in `update_k`.
+            Err(conflict) => {
+                break conflict.accumulated;
+            }
+        }
     };
+    let mut belief = belief;
+    if let Some(n) = state.strategy.c_upper_rtts {
+        let recent_len = (n + QE_WINDOW_OBSERVATIONS - 1).min(default_history_len);
+        if recent_len < default_history_len {
+            let recent = match (state.belief_bounds_for_history)(recent_len) {
+                Ok(b) => b,
+                Err(conflict) => conflict.accumulated,
+            };
+            if recent.max_c > belief.max_c {
+                info!("t={}: max_c {} expired; the newest {} RTTs only bound it by {}", state.timestep, belief.max_c, n, recent.max_c);
+                belief.max_c = recent.max_c;
+            }
+        }
+    }
     let t = state.timestep;
     planner.last_min_c = belief.min_c;
 
@@ -500,12 +686,35 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         Mode::Cruise
     };
     planner.mode = mode;
+    if !state.newest_window_feasible {
+        // No static link explains the newest window: there are no feasible
+        // network moves to search over.  Drain on the (restarted) belief
+        // until windows after the change exist.
+        return StatePolicy {
+            belief_history_observations: default_history_len,
+            loss_tolerance_abs: CAUTIOUS_LOSS_BUDGET,
+            delay_tolerance_frac: 3.into(),
+            objective_order: names(OBJECTIVE_ORDER),
+            candidate_actions: vec![CandidateAction::DrainQueue],
+            mode,
+            queue_target: DRAIN_MAX_Q + k_max,
+        };
+    }
 
     let aggressive_budget = std::cmp::max(belief.min_c, 2.into());
+    let queue_high = belief.max_q > belief.min_c * EXPLORE_MAX_QUEUE_BDP;
+    let mut objective_order = names(OBJECTIVE_ORDER);
     let (candidate_actions, loss_tolerance_abs) = match mode {
-        Mode::Explore if belief.max_q > belief.min_c * EXPLORE_MAX_QUEUE_BDP => {
-            (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET)
+        Mode::Explore if queue_high && state.strategy.explore_free => {
+            objective_order = names(EXPLORE_FREE_OBJECTIVE_ORDER);
+            let actions = vec![
+                CandidateAction::MaxAllowedRate,
+                CandidateAction::DrainQueue,
+                CandidateAction::ProbeAboveLimit,
+            ];
+            (actions, CAUTIOUS_LOSS_BUDGET)
         }
+        Mode::Explore if queue_high => (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET),
         Mode::Explore => {
             // Capturing bandwidth fast matters most while C is loose; only
             // a buffer proven small makes the CCA ration its probes.
@@ -529,7 +738,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         belief_history_observations: default_history_len,
         loss_tolerance_abs,
         delay_tolerance_frac: 3.into(),
-        objective_order: names(OBJECTIVE_ORDER),
+        objective_order,
         candidate_actions,
         mode,
         queue_target: DRAIN_MAX_Q + k_max,

@@ -190,6 +190,16 @@ pub trait NetworkModel: Debug + Sized {
         move_cca: &Option<CCAAction>,
     ) -> BeliefBounds;
 
+    /// `compute_belief_bounds`, or `None` if no link of the model explains
+    /// the history (e.g. the link changed within it).
+    fn try_compute_belief_bounds(
+        &self,
+        relevant_history: &[Self::O],
+        move_cca: &Option<CCAAction>,
+    ) -> Option<BeliefBounds> {
+        Some(self.compute_belief_bounds(relevant_history, move_cca))
+    }
+
     fn get_network_move_sim(
         &self,
         relevant_history: &[Self::O],

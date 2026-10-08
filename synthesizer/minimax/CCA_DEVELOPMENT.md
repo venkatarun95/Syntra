@@ -292,6 +292,64 @@ max/min/random/mixed links, backlogged/on-off/rate/random apps):
   with tight C show up as repeated `ProbeAboveLimit`, because an unsent
   probe does not reset the probe timer.
 
+## Changing links and convergence
+
+`--sim-c-schedule T:C,...` changes the simulated link rate from RTT T on;
+the CSV has `true_c`, `belief_start` and `restarts`, and
+`scripts/convergence_cca.py RUN_DIR...` reports, per run and per segment
+between changes, the RTTs until the belief holds the true C tightly,
+utilization against the true C, and loss.
+
+A QE window that straddles a change has no static explanation at all.
+`NetworkModel::try_compute_belief_bounds` returns `None` for it: the lenient
+fold skips it, the strict fold reports it as an `infeasible` conflict, and
+while the newest window is infeasible `state_policy` offers only
+`DrainQueue` (there are no feasible network moves to search over).  Before
+this, any rate change crashed the binary a few RTTs later.
+
+Belief strategies (`BeliefStrategy`, CLI switches; defaults are unchanged):
+
+* `--change-restart`: a confirmed K that stops fitting is either a burstier
+  link or a changed one.  K escalates as before, and a shadow belief under
+  the confirmed K is built from windows that start after the conflict.  If
+  `SHADOW_WINDOWS` of them fit, the link changed: the belief restarts there
+  (`belief_start`), K stays confirmed, and the committed C/B bounds reset.
+  If one does not fit, the shadow is dropped.  If no K fits at all, the
+  restart is immediate.  Restarting on any disagreement (the first version)
+  is not usable: in the cc_sim port bursts triggered hundreds of restarts.
+* `--c-upper-rtts N`: only the newest N RTTs bound `max_c` for the planner.
+  Meant for rises in C that probes at the old `max_c` cannot reveal; it
+  never triggered in these runs (the link stayed busy), so it is unproven.
+* `--k-confirm N`, `--k-optimistic`: confirm the smallest K sooner, or
+  assume it from the start.  Both are unsafe: on a K=4 random link the K=1
+  belief settled on C in [12.4, 12.5] with true C=50 and never re-explored
+  (0.19 utilization over 40 RTTs); with N=5, C=50 became tight at RTT 38
+  instead of 16 and C=100 lost 22%.  The 20-RTT confirmation is a safety
+  margin, not the convergence bottleneck.
+* `--explore-free` (an objective change): do not force `DrainQueue` once the
+  queue may exceed one BDP; minimax chooses with `qdel` second in the order.
+  It then picks `ProbeAboveLimit` with the cautious 1-packet budget every
+  RTT: a standing queue instead of probe/drain pulses.  C=20 B=20: 3.3% loss
+  instead of 10% and 0.95 utilization instead of 0.91, but C tight at RTT 24
+  instead of 10; C=50 B=100 (bursty) was far slower.  Not adopted.
+
+Results (60 RTTs, sim K=1, `max` link unless noted; `summary.txt` of
+`cc_sim/experiments/minimax/minimax_runs` has every run):
+
+| scenario | strategy | after the change |
+| --- | --- | --- |
+| C 20 -> 50 at RTT 25 | none | `max_c` stuck at the old C, 0.40 utilization |
+| | `--belief-history 20` | 0.84, 131 packets lost |
+| | `--change-restart` | detected the next RTT (no K fits), 0.83, 68 lost |
+| C 50 -> 20 at RTT 25 | none | C never tight again, 137 lost |
+| | `--change-restart` | shadow confirmed after 8 RTTs, C tight 9 RTTs after the change, 120 lost |
+| C 20 -> 40 -> 20 | none | 0.50 after the rise |
+| | `--change-restart` | 3 restarts; 0.62 after the rise, C tight 4 RTTs after the fall |
+| C=50 B=100 K=4 random, static | `--change-restart` | identical to the default: no false restarts |
+
+On a `random` link (which may under-serve) a rise in C cannot be told from
+a link withholding service, and no strategy detected it.
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in
