@@ -15,7 +15,13 @@ import statistics
 import sys
 
 MODE_LETTER = {"Explore": "E", "Cruise": "c", "Probe": "P", "Drain": "D"}
-ACTION_LETTER = {"MaxAllowedRate": "m", "DrainQueue": "d", "ProbeAboveLimit": "p", "none": "?"}
+ACTION_LETTER = {
+    "MaxAllowedRate": "m",
+    "DrainQueue": "d",
+    "ProbeAboveLimit": "p",
+    "HoldQueue": "h",
+    "none": "?",
+}
 
 
 def runs(seq):
