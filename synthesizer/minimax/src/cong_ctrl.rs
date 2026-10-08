@@ -263,6 +263,15 @@ struct CongCtrlState<NM: NetworkModel> {
     /// Belief bounds of committed QE windows, which never change for a given
     /// K set.  Speculative windows are not cached.
     window_cache: RefCell<HashMap<Vec<NM::O>, BeliefBounds>>,
+    /// The last committed belief and the K set it assumed.  C and B are
+    /// static, so a later belief is intersected with it rather than allowed
+    /// to get broader; see `retained_prior`.
+    retained: Option<(Option<Vec<RealNumInt>>, BeliefBounds)>,
+    /// `--belief-history N` (`None`: whole-history beliefs, which retain the
+    /// prior belief on every RTT).
+    belief_history: Option<usize>,
+    /// Per committed RTT, whether it was app-limited.
+    app_limited_rtts: Vec<bool>,
     /// The candidate that produced the last committed CCA move.
     last_action: Option<CandidateAction>,
 
@@ -466,7 +475,14 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     }
 
     fn prepare_speculation(&mut self) {
-        self.belief_bounds = self.compute_belief_bounds();
+        let mut bounds = self.compute_belief_bounds();
+        if let Some(prior) = self.retained_prior() {
+            if intersect_c_b(&mut bounds, &prior) {
+                warn!("committed belief {} disagrees with the retained {}; keeping the newer bound there", bounds, prior);
+            }
+        }
+        self.retained = Some((self.qe_ks.clone(), bounds));
+        self.belief_bounds = bounds;
         self.move_choices_cca_stack.push(self.compute_cca_moves());
     }
 
@@ -755,7 +771,16 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         ret
     }
 
-    fn try_compute_belief_bounds(&self, history_len: usize) -> Result<BeliefBounds, InconsistentQeWindows> {
+    /// Intersect the C/B bounds of every QE window in the newest
+    /// `history_len` observations.  On the first window whose bounds do not
+    /// overlap the accumulated ones, a strict call returns the conflict;
+    /// a `lenient` one keeps the accumulated (older, multi-window) bound for
+    /// that dimension and carries on, counting the conflicts.
+    fn fold_belief_windows(
+        &self,
+        history_len: usize,
+        lenient: bool,
+    ) -> Result<(BeliefBounds, usize), InconsistentQeWindows> {
         let history = self.get_relevant_history(Some(history_len));
         assert!(history.len() >= QE_WINDOW_OBSERVATIONS);
 
@@ -782,32 +807,31 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let mut windows = history.windows(QE_WINDOW_OBSERVATIONS).enumerate();
         let (first_idx, first) = windows.next().unwrap();
         let mut bounds = window_bounds(first_idx, first);
+        let mut conflicts = 0;
         for (idx, window) in windows {
             let next = window_bounds(idx, window);
-            let min_c = std::cmp::max(bounds.min_c, next.min_c);
-            let max_c = std::cmp::min(bounds.max_c, next.max_c);
-            let min_b = std::cmp::max(bounds.min_b, next.min_b);
-            let max_b = std::cmp::min(bounds.max_b, next.max_b);
 
             // C and B are persistent parameters, so intersect their bounds.
             // Generated QE uses finite discretization, however, and individual
             // windows can occasionally disagree by more than its numerical
             // slack.  Do not turn that approximation artifact into a runtime
-            // crash or an empty belief: retain the prior consistent result and
-            // make the ignored window visible in the experiment log.
-            if min_c <= max_c && min_b <= max_b {
-                bounds.min_c = min_c;
-                bounds.max_c = max_c;
-                bounds.min_b = min_b;
-                bounds.max_b = max_b;
-            } else {
-                return Err(InconsistentQeWindows {
-                    history_observations: history.len(),
-                    window_index: idx,
-                    accumulated: bounds,
-                    next_window: next,
-                });
+            // crash or an empty belief: retain the prior consistent result.
+            let mut merged = bounds;
+            if intersect_c_b(&mut merged, &next) {
+                if !lenient {
+                    return Err(InconsistentQeWindows {
+                        history_observations: history.len(),
+                        window_index: idx,
+                        accumulated: bounds,
+                        next_window: next,
+                    });
+                }
+                conflicts += 1;
             }
+            bounds.min_c = merged.min_c;
+            bounds.max_c = merged.max_c;
+            bounds.min_b = merged.min_b;
+            bounds.max_b = merged.max_b;
 
             // Q and inflight are state variables at the end of a window, not
             // persistent model parameters.  The newest window is the one
@@ -819,27 +843,48 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 bounds.max_if = next.max_if;
             }
         }
-        Ok(bounds)
+        Ok((bounds, conflicts))
+    }
+
+    fn try_compute_belief_bounds(&self, history_len: usize) -> Result<BeliefBounds, InconsistentQeWindows> {
+        self.fold_belief_windows(history_len, false).map(|(bounds, _)| bounds)
     }
 
     fn compute_belief_bounds(&self) -> BeliefBounds {
         let history_len = self.policy.belief_history_observations + self.history_stack.len();
-        match self.try_compute_belief_bounds(history_len) {
-            Ok(bounds) => bounds,
-            Err(conflict) => {
-                // The root-state policy can preflight this condition and pick
-                // another length.  A speculative branch has no such callback,
-                // so use its newest valid QE window rather than crash.
-                warn!(
-                    "QE windows conflict at {} of {} (accumulated={}, next={}); using newest window for this speculative state",
-                    conflict.window_index + 1,
-                    conflict.history_observations - QE_WINDOW_OBSERVATIONS + 1,
-                    conflict.accumulated,
-                    conflict.next_window,
-                );
-                conflict.next_window
-            }
+        // Conflicting windows keep the older accumulated bound rather than
+        // replacing the whole history by the newest window, which would
+        // discard everything learned about C and B.
+        let (mut bounds, conflicts) = self.fold_belief_windows(history_len, true).unwrap();
+        if conflicts > 0 {
+            debug!("{} QE window(s) conflicted; kept the accumulated bounds there", conflicts);
         }
+        if !self.history_stack.is_empty() {
+            // A speculative state is never broader than the committed belief
+            // it extends: the K set is fixed for the whole tree.
+            intersect_c_b(&mut bounds, &self.belief_bounds);
+        }
+        bounds
+    }
+
+    /// The previous committed belief, if it may still constrain the new one:
+    /// it assumed a superset of the current K set (C and B are static, so its
+    /// bounds stay sound), and either beliefs use the whole history or an
+    /// RTT in the `--belief-history` window was app-limited.  App-limited
+    /// RTTs say too little about the link to push out what older RTTs
+    /// proved, so the prior is only dropped once the window holds nothing
+    /// but busy RTTs.
+    fn retained_prior(&self) -> Option<BeliefBounds> {
+        let (ks, prior) = self.retained.as_ref()?;
+        let narrowed = match (ks, &self.qe_ks) {
+            (Some(old), Some(new)) => new.iter().all(|k| old.contains(k)),
+            (old, new) => old.is_none() && new.is_none(),
+        };
+        let retain = match self.belief_history {
+            None => true,
+            Some(n) => self.app_limited_rtts.iter().rev().take(n).any(|&a| a),
+        };
+        (narrowed && retain).then_some(*prior)
     }
 
     fn get_network_move_sim(&self, args: &Args) -> Option<CCMove<NM::NA>> {
@@ -885,6 +930,9 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             planner: PlannerState::default(),
             qe_ks: None,
             window_cache: RefCell::new(HashMap::new()),
+            retained: None,
+            belief_history: None,
+            app_limited_rtts: Vec::new(),
             last_action: None,
             n_nodes_explored: 0,
             parallel_binary_search: false,
@@ -922,8 +970,23 @@ impl CongCtrlState<NetworkModelNC> {
                 self.qe_ks = Some(ks);
             }
         }
+        // The planner sees the same retained belief `prepare_speculation`
+        // commits, not a fresh one that may be broader.
+        self.belief_history = intervals.belief_history;
+        let prior = self.retained_prior();
+        let retain = |mut bounds: BeliefBounds| {
+            if let Some(prior) = &prior {
+                intersect_c_b(&mut bounds, prior);
+            }
+            bounds
+        };
         let belief_bounds_for_history = |history_observations| {
             self.try_compute_belief_bounds(history_observations)
+                .map(retain)
+                .map_err(|conflict| InconsistentQeWindows {
+                    accumulated: retain(conflict.accumulated),
+                    ..conflict
+                })
         };
         let state = StateQuantities {
             timestep,
@@ -965,6 +1028,7 @@ impl CongCtrlState<NetworkModelNC> {
             .find(|(_, rate)| *rate == a.rate)
             .map(|(candidate, _)| candidate);
         record_action(&mut self.planner, timestep, action, a.rate, sent);
+        self.app_limited_rtts.push(self.planner.app_limited);
         self.last_action = action;
     }
 }
@@ -974,6 +1038,29 @@ struct PlannerIntervals {
     probe: usize,
     drain: usize,
     belief_history: Option<usize>,
+}
+
+/// Intersect the persistent C and B bounds of `next` into `acc`, one
+/// dimension at a time.  A dimension whose intervals do not overlap (QE
+/// discretization) keeps `acc`'s interval.  Returns whether one crossed.
+/// Q and inflight are state, not parameters, and are left alone.
+fn intersect_c_b(acc: &mut BeliefBounds, next: &BeliefBounds) -> bool {
+    let mut crossed = false;
+    let min_c = std::cmp::max(acc.min_c, next.min_c);
+    let max_c = std::cmp::min(acc.max_c, next.max_c);
+    if min_c <= max_c {
+        (acc.min_c, acc.max_c) = (min_c, max_c);
+    } else {
+        crossed = true;
+    }
+    let min_b = std::cmp::max(acc.min_b, next.min_b);
+    let max_b = std::cmp::min(acc.max_b, next.max_b);
+    if min_b <= max_b {
+        (acc.min_b, acc.max_b) = (min_b, max_b);
+    } else {
+        crossed = true;
+    }
+    crossed
 }
 
 fn union_bursty_qe(ks: &[RealNumInt]) -> std::sync::Arc<UnionBurstyQe> {
@@ -1312,7 +1399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wtr.write_record([
             "time", "r", "a", "ld", "s", "qdel", "min_c", "max_c", "min_b", "max_b", "min_q",
             "max_q", "min_if", "max_if", "mode", "action", "loss_tol", "sim", "qe_ks", "alive_ks",
-            "sent", "app_limited",
+            "sent", "app_limited", "candidates",
         ])?;
         some_wtr = Some(wtr);
     }
@@ -1518,6 +1605,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ),
                 format!("{:.2}", sent.to_f64().unwrap()),
                 format!("{}", ccs.planner.app_limited),
+                format!("{}", root_moves.len()),
             ])?;
             wtr.flush()?;
         }

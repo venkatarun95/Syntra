@@ -217,6 +217,18 @@ rate:
   cannot rule out a burstiness, so silence is not evidence for small K.
   Ruling K out still uses every RTT (that is always sound).
 
+* The committed belief never gets broader while the evidence for it
+  stands (`retained_prior` in `cong_ctrl.rs`): each RTT's C/B bounds are
+  intersected with the previous committed ones, provided the K set did not
+  grow (a K that was ruled out may have produced the older bounds).  With
+  the default whole-history belief this applies every RTT; with
+  `--belief-history N` while any of the last N RTTs was app-limited, so
+  idle RTTs cannot push out what busy ones proved: the window forgets only
+  once N busy RTTs have refilled it.  `state_policy`'s belief query, speculative
+  tree states (intersected with the committed root) and window conflicts
+  (which keep the older accumulated bound per dimension, instead of the
+  newest window alone) follow the same rule.
+
 The minimax tree still assumes a backlogged source (`APP_IS_BACKLOGGED`);
 set it to `false` to let the adversary also choose the app supply.  The CSV
 has `sent` and `app_limited`; `summarize_cca.py` reports utilization over
@@ -252,6 +264,16 @@ python3 scripts/summarize_cca.py OUT
 Each scenario is `C,B,SIM_K,POLICY[,SEED]`.  The summary prints one compact
 block per run (convergence, utilization, loss gaps, queue, drains, mode and
 K timelines), which is small enough to hand to a cheaper model.
+
+```bash
+python3 scripts/train_cca_tree.py OUT [--searched-only] [--label action|mode|rate]
+```
+
+fits a scikit-learn decision tree from the belief before each RTT (row t-1,
+mostly as multiples of `min_c`) to that RTT's choice (row t), and reports
+leave-one-run-out accuracy.  The CSV's `candidates` column is the number of
+root moves; `--searched-only` keeps the RTTs where minimax, not the
+planner, made the choice.
 
 ## QE/transpilation boundary
 
