@@ -952,8 +952,9 @@ impl CongCtrlState<NetworkModelNC> {
         self.planner = planner;
     }
 
-    /// Commit `m` (the CCA move just chosen at the root) to the planner.
-    fn record_cca_move(&mut self, m: &CCMove<NetworkActionNC>) {
+    /// Commit `m` (the CCA move just chosen at the root) to the planner;
+    /// the application let `sent` of its rate be sent.
+    fn record_cca_move(&mut self, m: &CCMove<NetworkActionNC>, sent: RealNumRep) {
         let CCMove::CCA(a) = m else { return };
         let timestep = self.history.len().saturating_sub(QE_WINDOW_OBSERVATIONS);
         let action = self
@@ -961,7 +962,7 @@ impl CongCtrlState<NetworkModelNC> {
             .into_iter()
             .find(|(_, rate)| *rate == a.rate)
             .map(|(candidate, _)| candidate);
-        record_action(&mut self.planner, timestep, action);
+        record_action(&mut self.planner, timestep, action, a.rate, sent);
         self.last_action = action;
     }
 }
@@ -1056,6 +1057,86 @@ struct Args {
     /// belief (default: the whole history).
     #[arg(long)]
     belief_history: Option<usize>,
+
+    /// Simulated application: `backlogged`, `rate:X` (X pkts/RTT into an
+    /// app buffer), `onoff:ON:OFF` (backlogged for ON RTTs, idle for OFF) or
+    /// `random` (supply uniform in [0, 2 sim_c) each RTT, buffered).  The CCA
+    /// sends `min(its rate, buffered app data)`.
+    #[arg(long, default_value = "backlogged")]
+    app: AppModel,
+}
+
+/// `--app`: what the application gives the CCA to send.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum AppModel {
+    Backlogged,
+    Rate(RealNumRep),
+    OnOff(u32, u32),
+    Random,
+}
+
+impl std::str::FromStr for AppModel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = s.split(':').collect();
+        let num = |x: &str| x.parse::<u32>().map_err(|e| format!("{s}: {e}"));
+        match parts.as_slice() {
+            ["backlogged"] => Ok(Self::Backlogged),
+            ["random"] => Ok(Self::Random),
+            ["rate", x] => Ok(Self::Rate((num(x)? as RealNumInt).into())),
+            ["onoff", on, off] => Ok(Self::OnOff(num(on)?, num(off)?)),
+            _ => Err(format!("unknown --app {s}")),
+        }
+    }
+}
+
+impl Display for AppModel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Backlogged => write!(f, "backlogged"),
+            Self::Rate(x) => write!(f, "rate{}", x),
+            Self::OnOff(on, off) => write!(f, "onoff{}-{}", on, off),
+            Self::Random => write!(f, "random"),
+        }
+    }
+}
+
+/// The simulated application's buffer of data waiting to be sent.
+struct AppSource {
+    model: AppModel,
+    buffered: RealNumRep,
+    /// Cap on `buffered`, so a long idle CCA does not build an unbounded
+    /// backlog (an app producing data at a fixed rate keeps only so much).
+    cap: RealNumRep,
+}
+
+impl AppSource {
+    fn new(model: AppModel, sim_c: RealNumRep) -> Self {
+        let cap = match model {
+            AppModel::Rate(x) => x * 2,
+            _ => sim_c * 4,
+        };
+        Self { model, buffered: 0.into(), cap }
+    }
+
+    /// How much of `intended` the application lets the CCA send at RTT `t`.
+    fn send(&mut self, t: u32, intended: RealNumRep, sim_c: RealNumRep, rng: &mut SimRng) -> RealNumRep {
+        let supply = match self.model {
+            AppModel::Backlogged => return intended,
+            AppModel::OnOff(on, off) => {
+                if t % (on + off) < on {
+                    return intended;
+                }
+                0.into()
+            }
+            AppModel::Rate(x) => x,
+            AppModel::Random => rng.fraction() * sim_c * 2,
+        };
+        self.buffered = std::cmp::min(self.buffered + supply, self.cap);
+        let sent = std::cmp::min(intended, self.buffered);
+        self.buffered = self.buffered - sent;
+        sent
+    }
 }
 
 /// `--sim-policy`.  With the bursty model, `max`/`min`/`random`/`alternate`
@@ -1119,6 +1200,9 @@ fn get_sim_tag(args: &Args) -> String {
     }
     if let Some(n) = args.belief_history {
         ret.push_str(&format!("_bh{}", n));
+    }
+    if args.app != AppModel::Backlogged {
+        ret.push_str(&format!("_app{}", args.app));
     }
     ret
 }
@@ -1226,6 +1310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wtr.write_record([
             "time", "r", "a", "ld", "s", "qdel", "min_c", "max_c", "min_b", "max_b", "min_q",
             "max_q", "min_if", "max_if", "mode", "action", "loss_tol", "sim", "qe_ks", "alive_ks",
+            "sent", "app_limited",
         ])?;
         some_wtr = Some(wtr);
     }
@@ -1284,6 +1369,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         BurstyLinkSim::new(args.sim_c, args.sim_b, args.sim_k.into(), ccs.history.len())
     });
     let mut mixed_choice = SimChoice::Max;
+    let mut app = AppSource::new(args.app, args.sim_c);
     let tsteps = args.steps;
     for t in 0..tsteps {
         let mode = ccs.policy.mode;
@@ -1305,7 +1391,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (ret, _, _) = search.best_move(&mut ccs, Some(SEARCH_DEPTH), None);
             ret
         };
-        ccs.record_cca_move(best_cc_move.as_ref().unwrap());
+        // The CCA chose a rate; the application decides how much of it is
+        // sent.  Only what is sent reaches the link and the QE history.
+        let intended = match best_cc_move.as_ref().unwrap() {
+            CCMove::CCA(a) => a.rate,
+            _ => panic!("Expecting CCA move"),
+        };
+        let sent = app.send(t, intended, args.sim_c, &mut rng);
+        ccs.record_cca_move(best_cc_move.as_ref().unwrap(), sent);
+        let best_cc_move = Some(CCMove::CCA(CCAAction { rate: sent }));
 
         if args.tree {
             let mut file =
@@ -1390,10 +1484,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if some_wtr.is_some() {
             let wtr = some_wtr.as_mut().unwrap();
-            let rate = match best_cc_move.as_ref().unwrap() {
-                CCMove::CCA(a) => a.rate.to_f64().unwrap(),
-                _ => panic!("Expecting CCA move"),
-            };
+            let rate = intended.to_f64().unwrap();
             wtr.write_record(&[
                 format!("{:.2?}", start.elapsed()),
                 format!("{:.2}", rate),
@@ -1423,6 +1514,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|(k, _)| *k)
                         .collect::<Vec<_>>(),
                 ),
+                format!("{:.2}", sent.to_f64().unwrap()),
+                format!("{}", ccs.planner.app_limited),
             ])?;
             wtr.flush()?;
         }

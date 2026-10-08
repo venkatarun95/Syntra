@@ -201,6 +201,27 @@ withhold bursts), `random` (seeded by `--seed`), `adversary` (replay the
 reply minimax expected, which is feasible for the CCA's belief rather than
 the true C/B) or `mixed` (switch among those every `--mixed-period` RTTs).
 
+### Application-limited senders
+
+`--app` simulates an application the CCA does not control: `backlogged`,
+`rate:X`, `onoff:ON:OFF` or `random`.  The CCA sends `min(its rate,
+buffered app data)`, and that *sent* rate is what is committed as the CCA's
+move, so the QE history always holds the real arrivals and beliefs stay
+sound.  The planner (`record_action`) sees both the intended and the sent
+rate:
+
+* An RTT with `sent < intended` is app-limited.  A probe that was not sent
+  does not reset the probe timer, so the CCA probes once data returns.
+* An RTT that sent less than `INFORMATIVE_LOAD * min_c` does not count
+  towards confirming a small K (`KTracker::stable_rtts`): an idle link
+  cannot rule out a burstiness, so silence is not evidence for small K.
+  Ruling K out still uses every RTT (that is always sound).
+
+The minimax tree still assumes a backlogged source (`APP_IS_BACKLOGGED`);
+set it to `false` to let the adversary also choose the app supply.  The CSV
+has `sent` and `app_limited`; `summarize_cca.py` reports utilization over
+RTTs that were not app-limited.
+
 ### Belief soundness (bursty)
 
 Forward-simulated traces (`BurstyLinkSim`) are feasible for the true

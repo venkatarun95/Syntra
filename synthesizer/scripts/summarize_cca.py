@@ -72,11 +72,22 @@ def summarize(path):
         f"{'' if b_sound else '  ** true B OUTSIDE final bound **'}"
     )
 
+    app_limited = [r.get("app_limited") == "true" for r in rows]
     if true_c:
         util = (s[-1] - s[0]) / (true_c * (n - 1)) if n > 1 else 0
         half = n // 2
         util2 = (s[-1] - s[half]) / (true_c * (n - 1 - half)) if n - 1 > half else 0
-        out.append(f"util: all {util:.2f}, last half {util2:.2f}")
+        line = f"util: all {util:.2f}, last half {util2:.2f}"
+        if any(app_limited):
+            # Delivery in RTTs after one where the app supplied enough data
+            # (service lags sending by about one RTT).
+            ok = [i for i in range(1, n) if not app_limited[i - 1]]
+            sent_ok = sum(s[i] - s[i - 1] for i in ok)
+            line += (
+                f"; app-limited {sum(app_limited)}/{n} RTTs,"
+                f" util when not app-limited {sent_ok / (true_c * len(ok)) if ok else 0:.2f}"
+            )
+        out.append(line)
 
     loss_steps = [i for i in range(1, n) if ld[i] > ld[i - 1] + 1e-9]
     gaps = [b - a for a, b in zip(loss_steps, loss_steps[1:])]

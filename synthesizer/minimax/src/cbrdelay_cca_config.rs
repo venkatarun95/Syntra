@@ -163,6 +163,13 @@ pub const DRAIN_MAX_Q: RealNumRep = RealNumRep::new_raw(1, 1);
 /// Give up a drain that has not been proven complete after this many RTTs.
 pub const MAX_DRAIN_RTTS: usize = 3;
 
+/// The CCA counts as app-limited when it sent this much less than its rate.
+pub const APP_LIMITED_SLACK: RealNumRep = RealNumRep::new_raw(1, 16);
+
+/// An RTT is evidence for confirming a small K only if the CCA sent at least
+/// this fraction of `min_c`.
+pub const INFORMATIVE_LOAD: RealNumRep = RealNumRep::new_raw(1, 2);
+
 /// Loss budget (packets per probe) when cautious.
 pub const CAUTIOUS_LOSS_BUDGET: RealNumRep = RealNumRep::new_raw(1, 1);
 
@@ -242,8 +249,10 @@ pub struct KTracker {
     /// under it.  C and B are static, so an empty intersection rules the
     /// hypothesis out even if each window alone is feasible.
     pub bounds: Vec<Option<BeliefBounds>>,
-    /// Timestep since which no K was ruled out.
-    pub stable_since: usize,
+    /// Informative RTTs (see `INFORMATIVE_LOAD`) since the smallest alive K
+    /// last changed.  Idle RTTs cannot rule a K out, so they do not count
+    /// towards confirming it.
+    pub stable_rtts: usize,
     /// The K set the belief currently uses.
     pub assumed: Vec<RealNumInt>,
 }
@@ -260,6 +269,12 @@ pub struct PlannerState {
     pub last_drained: usize,
     /// Timestep at which the current (or last) drain began.
     pub drain_started: usize,
+    /// The application sent less than the CCA's last rate.
+    pub app_limited: bool,
+    /// The last RTT loaded the link enough to count as evidence for K.
+    pub last_informative: bool,
+    /// `min_c` of the last belief, for `INFORMATIVE_LOAD`.
+    pub last_min_c: RealNumRep,
     pub k: KTracker,
 }
 
@@ -332,7 +347,7 @@ pub fn update_k(
     if tracker.alive.is_empty() {
         tracker.alive = hypotheses.iter().map(|&k| (k, true)).collect();
         tracker.bounds = vec![None; hypotheses.len()];
-        tracker.stable_since = timestep;
+        tracker.stable_rtts = 0;
     }
     let smallest = |alive: &[(RealNumInt, bool)]| alive.iter().find(|(_, a)| *a).map(|(k, _)| *k);
     let smallest_before = smallest(&tracker.alive);
@@ -378,7 +393,7 @@ pub fn update_k(
     // Ruling out a large K (e.g. by a small buffer) is no evidence against
     // the smallest K, so only restart its confirmation when it changes.
     if smallest(&tracker.alive) != smallest_before {
-        tracker.stable_since = timestep;
+        tracker.stable_rtts = 0;
     }
     let mut alive: Vec<RealNumInt> =
         tracker.alive.iter().filter(|(_, a)| *a).map(|(k, _)| *k).collect();
@@ -388,10 +403,13 @@ pub fn update_k(
         warn!("t={}: every K hypothesis was ruled out; reviving all", timestep);
         tracker.alive = hypotheses.iter().map(|&k| (k, true)).collect();
         tracker.bounds = vec![None; hypotheses.len()];
-        tracker.stable_since = timestep;
+        tracker.stable_rtts = 0;
         alive = hypotheses.to_vec();
     }
-    tracker.assumed = if timestep >= tracker.stable_since + K_CONFIRM_RTTS {
+    if planner.last_informative {
+        tracker.stable_rtts += 1;
+    }
+    tracker.assumed = if tracker.stable_rtts >= K_CONFIRM_RTTS {
         vec![alive[0]]
     } else {
         alive
@@ -399,9 +417,23 @@ pub fn update_k(
     tracker.assumed.clone()
 }
 
-/// Called after the engine commits the chosen action at `timestep`.
-pub fn record_action(planner: &mut PlannerState, timestep: usize, action: Option<CandidateAction>) {
-    if planner.mode == Mode::Probe || action == Some(CandidateAction::ProbeAboveLimit) {
+/// Called after the engine commits the chosen action at `timestep`: the
+/// CCA asked for `intended`, and the application let `sent` be sent.
+///
+/// An app-limited RTT (`sent < intended`) says little about the link: a
+/// probe that was not sent is no probe, and too little traffic cannot rule
+/// out a burstiness, so it does not count towards confirming one.
+pub fn record_action(
+    planner: &mut PlannerState,
+    timestep: usize,
+    action: Option<CandidateAction>,
+    intended: RealNumRep,
+    sent: RealNumRep,
+) {
+    planner.app_limited = sent + APP_LIMITED_SLACK < intended;
+    planner.last_informative = sent >= planner.last_min_c * INFORMATIVE_LOAD;
+    let probed = planner.mode == Mode::Probe || action == Some(CandidateAction::ProbeAboveLimit);
+    if probed && !planner.app_limited {
         planner.last_probe = Some(timestep);
     }
 }
@@ -426,6 +458,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         ),
     };
     let t = state.timestep;
+    planner.last_min_c = belief.min_c;
 
     let k_max: RealNumRep = match K_POLICY {
         KPolicy::Fixed(k) => k,
