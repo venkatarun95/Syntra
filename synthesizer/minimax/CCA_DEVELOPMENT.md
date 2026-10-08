@@ -212,7 +212,7 @@ rate:
 
 * An RTT with `sent < intended` is app-limited.  A probe that was not sent
   does not reset the probe timer, so the CCA probes once data returns.
-* An RTT that sent less than `INFORMATIVE_LOAD * min_c` does not count
+* An RTT that delivered less than `INFORMATIVE_LOAD * min_c` does not count
   towards confirming a small K (`KTracker::stable_rtts`): an idle link
   cannot rule out a burstiness, so silence is not evidence for small K.
   Ruling K out still uses every RTT (that is always sound).

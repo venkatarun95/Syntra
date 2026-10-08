@@ -166,8 +166,10 @@ pub const MAX_DRAIN_RTTS: usize = 3;
 /// The CCA counts as app-limited when it sent this much less than its rate.
 pub const APP_LIMITED_SLACK: RealNumRep = RealNumRep::new_raw(1, 16);
 
-/// An RTT is evidence for confirming a small K only if the CCA sent at least
-/// this fraction of `min_c`.
+/// An RTT is evidence for confirming a small K only if the link delivered
+/// at least this fraction of `min_c` in it: bursts only show on a link that
+/// carries traffic.  (Delivery, not sending: a drain RTT sends nothing but
+/// keeps the link busy, while an idle app leaves it empty.)
 pub const INFORMATIVE_LOAD: RealNumRep = RealNumRep::new_raw(1, 2);
 
 /// Loss budget (packets per probe) when cautious.
@@ -271,8 +273,6 @@ pub struct PlannerState {
     pub drain_started: usize,
     /// The application sent less than the CCA's last rate.
     pub app_limited: bool,
-    /// The last RTT loaded the link enough to count as evidence for K.
-    pub last_informative: bool,
     /// `min_c` of the last belief, for `INFORMATIVE_LOAD`.
     pub last_min_c: RealNumRep,
     pub k: KTracker,
@@ -329,7 +329,8 @@ pub const K_WINDOW_DISAGREEMENT_TOL: RealNumRep = RealNumRep::new_raw(1, 1);
 /// consistent and return the K set the belief should use.  Called once per
 /// committed observation, before `state_policy`.  `window_belief(k)` is the
 /// newest QE window's belief under burstiness `k`, or `None` if the window
-/// is infeasible for it.
+/// is infeasible for it.  `delivered` is the newest RTT's service; only RTTs
+/// that delivered `INFORMATIVE_LOAD * min_c` count towards confirming a K.
 ///
 /// K feasibility is not monotone, so every hypothesis is tested.  While the
 /// smallest alive K is unconfirmed, the belief is the union over every
@@ -337,6 +338,7 @@ pub const K_WINDOW_DISAGREEMENT_TOL: RealNumRep = RealNumRep::new_raw(1, 1);
 pub fn update_k(
     planner: &mut PlannerState,
     timestep: usize,
+    delivered: RealNumRep,
     window_belief: &dyn Fn(RealNumInt) -> Option<BeliefBounds>,
 ) -> Vec<RealNumInt> {
     let hypotheses = match K_POLICY {
@@ -406,7 +408,7 @@ pub fn update_k(
         tracker.stable_rtts = 0;
         alive = hypotheses.to_vec();
     }
-    if planner.last_informative {
+    if delivered >= planner.last_min_c * INFORMATIVE_LOAD {
         tracker.stable_rtts += 1;
     }
     tracker.assumed = if tracker.stable_rtts >= K_CONFIRM_RTTS {
@@ -421,8 +423,7 @@ pub fn update_k(
 /// CCA asked for `intended`, and the application let `sent` be sent.
 ///
 /// An app-limited RTT (`sent < intended`) says little about the link: a
-/// probe that was not sent is no probe, and too little traffic cannot rule
-/// out a burstiness, so it does not count towards confirming one.
+/// probe that was not sent is no probe.
 pub fn record_action(
     planner: &mut PlannerState,
     timestep: usize,
@@ -431,7 +432,6 @@ pub fn record_action(
     sent: RealNumRep,
 ) {
     planner.app_limited = sent + APP_LIMITED_SLACK < intended;
-    planner.last_informative = sent >= planner.last_min_c * INFORMATIVE_LOAD;
     let probed = planner.mode == Mode::Probe || action == Some(CandidateAction::ProbeAboveLimit);
     if probed && !planner.app_limited {
         planner.last_probe = Some(timestep);

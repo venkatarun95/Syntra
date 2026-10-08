@@ -911,7 +911,9 @@ impl CongCtrlState<NetworkModelNC> {
                 nm.try_window_belief(window)
             };
             let mut planner = std::mem::take(&mut self.planner);
-            let ks = update_k(&mut planner, timestep, &feasible);
+            let n = self.history.len();
+            let delivered = self.history[n - 1].s - self.history[n - 2].s;
+            let ks = update_k(&mut planner, timestep, delivered, &feasible);
             self.planner = planner;
             if self.qe_ks.as_ref() != Some(&ks) {
                 info!("t={}: belief uses K in {:?}", timestep, ks);
