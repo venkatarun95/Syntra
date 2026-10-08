@@ -275,6 +275,23 @@ leave-one-run-out accuracy.  The CSV's `candidates` column is the number of
 root moves; `--searched-only` keeps the RTTs where minimax, not the
 planner, made the choice.
 
+First results (32 runs × 60 RTTs: C 10-100, B 0.25-8 BDP, sim K 1-16,
+max/min/random/mixed links, backlogged/on-off/rate/random apps):
+
+* Minimax's own choices are nearly constant.  Of 491 searched (Explore)
+  RTTs it chose `ProbeAboveLimit` in 479, `DrainQueue` in 8 and
+  `MaxAllowedRate` in 4; no tree beats the majority class
+  (leave-one-run-out 0.976).  The only split worth having is
+  `max_b <= 0.75 min_c` -> `DrainQueue`.  With the current objective
+  order (`lt` then `schadd`), the depth-4 search in Explore is therefore
+  close to the fixed rule "probe unless the buffer is proven small".
+* Over every RTT, a depth-4 tree reaches 0.94 leave-one-run-out (baseline
+  0.37), but it relearns the planner: `max_q > 1.0 min_c` ->
+  `DrainQueue` (`EXPLORE_MAX_QUEUE_BDP`), `max_c / min_c` around 1.4 for
+  C tightness, and `HoldQueue` persisting in Cruise.  App-limited RTTs
+  with tight C show up as repeated `ProbeAboveLimit`, because an unsent
+  probe does not reset the probe timer.
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in
