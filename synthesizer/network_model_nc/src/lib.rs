@@ -1309,8 +1309,13 @@ impl NetworkModelNC {
         }
         let feasible = |x: RealNumRep| self.b_feasible_at(&c, x, tsteps, n_losses_observed, a, l, s, l0);
         let candidates = c_candidates(&c, a, s, &self.qe.k_values());
-        let ok: Vec<bool> = candidates.iter().map(|&x| feasible(x)).collect();
-        let (Some(first), Some(last)) = (ok.iter().position(|&f| f), ok.iter().rposition(|&f| f)) else {
+        // Only the lowest and highest feasible candidates matter, so search
+        // inwards from each end (cheap when C is loose and its ends feasible).
+        let first = candidates.iter().position(|&x| feasible(x));
+        let last = first.and_then(|first| {
+            (first..candidates.len()).rev().find(|&i| i == first || feasible(candidates[i]))
+        });
+        let (Some(first), Some(last)) = (first, last) else {
             warn!("No feasible C found in {:?} at T={}; keeping it untightened", c, tsteps);
             return c;
         };
