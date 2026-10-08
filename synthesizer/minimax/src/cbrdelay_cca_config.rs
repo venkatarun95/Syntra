@@ -76,6 +76,10 @@ pub enum CandidateAction {
     DrainQueue,
     /// `loss_tolerance_abs` above `MaxAllowedRate`.
     ProbeAboveLimit,
+    /// `min_c`, less whatever the queue may exceed `queue_target` by: hold
+    /// the queue near the smallest provable size (about K under bursts)
+    /// rather than paying ~K packets/RTT of throughput to aim at zero.
+    HoldQueue,
 }
 
 /// Lexicographic objective, from most important to least important.  Pass
@@ -125,8 +129,12 @@ pub const QE_WINDOW_OBSERVATIONS: usize = 7;
 // Planner constants.  These are starting points for experiments, not tuned
 // values; `--probe-interval` and `--drain-interval` override two of them.
 
-/// The capacity belief counts as tight once `max_c <= C_TIGHT_RATIO * min_c`.
+/// The capacity belief counts as tight once
+/// `max_c <= C_TIGHT_RATIO * min_c + C_TIGHT_PER_K * K`.
 pub const C_TIGHT_RATIO: RealNumRep = RealNumRep::new_raw(5, 4);
+
+/// ... plus this many packets/RTT per unit of the largest assumed K.
+pub const C_TIGHT_PER_K: RealNumRep = RealNumRep::new_raw(1, 2);
 
 /// The buffer counts as small once `max_b < SMALL_BUFFER_BDP * min_c`.
 pub const SMALL_BUFFER_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
@@ -271,6 +279,8 @@ pub struct StatePolicy {
     /// skips the search.
     pub candidate_actions: Vec<CandidateAction>,
     pub mode: Mode,
+    /// Queue `HoldQueue` aims for.
+    pub queue_target: RealNumRep,
 }
 
 impl Default for StatePolicy {
@@ -286,6 +296,7 @@ impl Default for StatePolicy {
                 CandidateAction::ProbeAboveLimit,
             ],
             mode: Mode::Explore,
+            queue_target: DRAIN_MAX_Q,
         }
     }
 }
@@ -416,18 +427,20 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     };
     let t = state.timestep;
 
-    let c_tight = belief.max_c <= belief.min_c * C_TIGHT_RATIO;
+    let k_max: RealNumRep = match K_POLICY {
+        KPolicy::Fixed(k) => k,
+        KPolicy::Hypotheses(_) => planner.k.assumed.iter().copied().max().unwrap_or(0),
+    }
+    .into();
+    // Bursts of up to K blur each window's view of C, so the achievable
+    // width grows with K.
+    let c_tight = belief.max_c <= belief.min_c * C_TIGHT_RATIO + k_max * C_TIGHT_PER_K;
     let small_buffer = belief.max_b < belief.min_c * SMALL_BUFFER_BDP;
     // Unconfirmed burstiness: more than one K is still in the belief.
     let k_unconfirmed = planner.k.assumed.len() > 1;
     let cautious = small_buffer || k_unconfirmed;
     let since_probe = planner.last_probe.map_or(usize::MAX, |p| t - p);
 
-    let k_max: RealNumRep = match K_POLICY {
-        KPolicy::Fixed(k) => k,
-        KPolicy::Hypotheses(_) => planner.k.assumed.iter().copied().max().unwrap_or(0),
-    }
-    .into();
     let drained = belief.max_q <= DRAIN_MAX_Q + k_max;
     if drained {
         planner.last_drained = t;
@@ -475,7 +488,8 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             let budget = if cautious { 0.into() } else { CAUTIOUS_LOSS_BUDGET };
             (vec![CandidateAction::ProbeAboveLimit], budget)
         }
-        Mode::Cruise | Mode::Drain => (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET),
+        Mode::Cruise => (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET),
+        Mode::Drain => (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET),
     };
 
     StatePolicy {
@@ -485,5 +499,6 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         objective_order: names(OBJECTIVE_ORDER),
         candidate_actions,
         mode,
+        queue_target: DRAIN_MAX_Q + k_max,
     }
 }

@@ -727,6 +727,10 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 let rate = match candidate {
                     CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
                     CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
+                    CandidateAction::HoldQueue => std::cmp::max(
+                        0.into(),
+                        min_c - std::cmp::max(0.into(), max_q - self.policy.queue_target),
+                    ),
                     CandidateAction::ProbeAboveLimit => {
                         max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
                     }

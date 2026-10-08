@@ -164,12 +164,21 @@ owns its memory (`PlannerState`) and calls, once per committed RTT:
 3. `record_action`, after the move is chosen (probe bookkeeping).
 
 Modes: `Explore` (C loose; minimax picks among `MaxAllowedRate`,
-`DrainQueue`, `ProbeAboveLimit`), `Cruise` (C tight; hold `DrainQueue`,
-which is `min_c` once the queue is empty), `Probe` (C tight and a probe is
-due) and `Drain` (every `DRAIN_INTERVAL_RTTS`, held until the belief proves
-`max_q <= DRAIN_MAX_Q`, so the min-RTT estimate is refreshed).  All constants
-are experiment starting points; `--probe-interval` and `--drain-interval`
-override two of them.
+`DrainQueue`, `ProbeAboveLimit`, or only `DrainQueue` once the queue may
+exceed `EXPLORE_MAX_QUEUE_BDP`), `Cruise` (C tight; `HoldQueue`, i.e.
+`min_c` less any queue above `DRAIN_MAX_Q + K`, the smallest queue bursts
+let the belief prove), `Probe` (C tight and a probe is due) and `Drain`
+(every `DRAIN_INTERVAL_RTTS`, held until the belief proves
+`max_q <= DRAIN_MAX_Q + K` or for at most `MAX_DRAIN_RTTS`, so the min-RTT
+estimate is refreshed).  C counts as tight once
+`max_c <= C_TIGHT_RATIO * min_c + C_TIGHT_PER_K * K`: bursts blur C, so a
+fixed ratio is unreachable for large K.  All constants are experiment
+starting points; `--probe-interval`, `--drain-interval` and
+`--belief-history` override three of them.
+
+`--belief-history N` intersects only the newest N observations' windows.  In
+60-RTT sweeps the whole history (the default) was clearly better than N=10:
+a short history forgets B and C, re-probes and loses 4-7x more packets.
 
 ### Burstiness hypotheses
 
@@ -191,6 +200,26 @@ CCA's hypotheses do not change it.  K only bounds what the link may do;
 withhold bursts), `random` (seeded by `--seed`), `adversary` (replay the
 reply minimax expected, which is feasible for the CCA's belief rather than
 the true C/B) or `mixed` (switch among those every `--mixed-period` RTTs).
+
+### Belief soundness (bursty)
+
+Forward-simulated traces (`BurstyLinkSim`) are feasible for the true
+(C, B, K) by construction, so the tests in `network_model_nc` check that
+beliefs never exclude the truth (`test_forward_sim_true_k_*`).  They found:
+
+* The bursty crate's only sub-window C result (T=5, 1 loss) came from a
+  query without the burst constraints (its input in `qe/bursty_cbrdelay_T6/`
+  uses `A` rather than `P` and has no K), i.e. a plain bound.  `BurstyQe::c`
+  ignores it (`BURSTY_C_RESOLVED`) until it is re-solved.
+* The feasible C set of a window can be several islands, some a single point
+  (a backlogged link serves exactly C).  `tighten_c_with_b` therefore takes the
+  hull of the feasible `c_candidates` (grid plus observed and K-shifted rates)
+  and `compute_belief_bounds` samples B at those rates too.  This is still a
+  numerical search, not an exact projection.
+* The QE-window simulator (`get_network_move_sim_policy`) chooses each service
+  from the newest window alone, whose initial queue is free, so its traces can
+  be feasible per window yet impossible overall (it can starve the link
+  forever).  Use `BurstyLinkSim` for anything but `max`.
 
 ### Experiment scripts
 
