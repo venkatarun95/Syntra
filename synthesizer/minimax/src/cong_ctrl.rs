@@ -17,11 +17,13 @@ use minimax::State;
 // use network_model_z3::NetworkModelZ3;
 use ds::tree::Tree;
 use ds::*;
-use network_model_nc::{BurstyLinkSim, BurstyQe, LinkChoice, NetworkActionNC, NetworkModelNC, UnionBurstyQe};
+use network_model_nc::{
+    BurstyLinkSim, BurstyQe, LinkChoice, LossObservation, NetworkActionNC, NetworkModelNC, UnionBurstyQe,
+};
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
-    record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
+    explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
     PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
     K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
@@ -1056,6 +1058,42 @@ impl CongCtrlState<NetworkModelNC> {
         self.planner = planner;
     }
 
+    /// What the root of a search knows, for `--decisions`.
+    fn decision_features(&self) -> serde_json::Value {
+        let f = |x: RealNumRep| x.to_f64().unwrap();
+        let bb = self.belief_bounds;
+        let first = self
+            .get_relevant_history(Some(self.policy.belief_history_observations))
+            .into_iter()
+            .next()
+            .unwrap();
+        let last = self.history.last().unwrap();
+        serde_json::json!({
+            "mode": format!("{:?}", self.policy.mode),
+            "loss_tol": f(self.policy.loss_tolerance_abs),
+            "history_obs": self.policy.belief_history_observations,
+            "n_history": self.history.len(),
+            "belief": {
+                "min_c": f(bb.min_c), "max_c": f(bb.max_c), "min_b": f(bb.min_b), "max_b": f(bb.max_b),
+                "min_q": f(bb.min_q), "max_q": f(bb.max_q), "min_if": f(bb.min_if), "max_if": f(bb.max_if),
+            },
+            "candidates": self
+                .candidate_rates()
+                .into_iter()
+                .map(|(c, r)| serde_json::json!([format!("{:?}", c), f(r)]))
+                .collect::<Vec<_>>(),
+            "loss_since_start": f(last.get_ld() - first.get_ld()),
+            "ld": f(last.get_ld()),
+            "qdel": last.get_qdel(),
+            "a": f(last.a),
+            "s": f(last.s),
+            "last_rate": f(last.a - self.history[self.history.len() - 2].a),
+            "last_delivered": f(last.s - self.history[self.history.len() - 2].s),
+            "qe_ks": self.qe_ks.clone().unwrap_or_default(),
+            "metrics": self.compute_metrics(),
+        })
+    }
+
     /// Commit `m` (the CCA move just chosen at the root) to the planner;
     /// the application let `sent` of its rate be sent.
     fn record_cca_move(&mut self, m: &CCMove<NetworkActionNC>, sent: RealNumRep) {
@@ -1213,6 +1251,57 @@ struct Args {
     /// Only the newest N RTTs bound C from above for the planner.
     #[arg(long)]
     c_upper_rtts: Option<usize>,
+    /// Write one JSON line per searched RTT here: the root's belief,
+    /// candidates and metrics, and every root move's value as the search
+    /// compared it.  Used to distil the search into rules.
+    #[arg(long)]
+    decisions: Option<String>,
+    /// The link is outside this process (e.g. a packet simulator): each RTT
+    /// print `rate R` on stdout, then read the RTT's outcome from stdin as
+    /// `SENT S APP_LIMITED [ROUND:L ...]`: what was sent, the cumulative
+    /// service S, whether the application held the sender back (0/1), and
+    /// the cumulative loss L up to each sending round (0 is the first RTT,
+    /// -1 the empty initial history) that became observable.  Runs until
+    /// stdin closes; `--steps` is ignored.
+    #[arg(long)]
+    external: bool,
+    /// Use `explore_rule` instead of searching where it knows minimax's choice.
+    #[arg(long)]
+    explore_rule: bool,
+    /// Search every RTT, and count the RTTs where `explore_rule` claims to know minimax's
+    /// choice and differs from it (CSV column `rule`: `-` no claim, `ok`, `MISMATCH`).
+    #[arg(long)]
+    check_rule: bool,
+}
+
+/// `--external`: one RTT's outcome, as read from stdin.
+struct ExternalObs {
+    sent: RealNumRep,
+    s: RealNumRep,
+    app_limited: bool,
+    losses: Vec<(i64, RealNumRep)>,
+}
+
+/// Values arrive as decimals; the QE evaluators need small denominators, so
+/// round to the 1/16 grid the link simulator also uses.
+fn parse_real(x: &str) -> Result<RealNumRep, String> {
+    let v: f64 = x.parse().map_err(|e| format!("{x}: {e}"))?;
+    Ok(RealNumRep::new((v * 16.).round() as RealNumInt, 16))
+}
+
+fn parse_external(line: &str) -> Result<ExternalObs, String> {
+    let mut it = line.split_whitespace();
+    let mut next = || it.next().ok_or_else(|| format!("short line: {line}"));
+    let sent = parse_real(next()?)?;
+    let s = parse_real(next()?)?;
+    let app_limited = next()? == "1";
+    let losses = it
+        .map(|part| {
+            let (r, l) = part.split_once(':').ok_or(format!("{part}: expected ROUND:L"))?;
+            Ok((r.parse::<i64>().map_err(|e| format!("{part}: {e}"))?, parse_real(l)?))
+        })
+        .collect::<Result<_, String>>()?;
+    Ok(ExternalObs { sent, s, app_limited, losses })
 }
 
 /// `--sim-c-schedule`: (from RTT, link rate) pairs.
@@ -1490,7 +1579,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wtr.write_record([
             "time", "r", "a", "ld", "s", "qdel", "min_c", "max_c", "min_b", "max_b", "min_q",
             "max_q", "min_if", "max_if", "mode", "action", "loss_tol", "sim", "qe_ks", "alive_ks",
-            "sent", "app_limited", "candidates", "true_c", "belief_start", "restarts",
+            "sent", "app_limited", "candidates", "true_c", "belief_start", "restarts", "searched",
+            "rule",
         ])?;
         some_wtr = Some(wtr);
     }
@@ -1557,8 +1647,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut mixed_choice = SimChoice::Max;
     let mut app = AppSource::new(args.app, args.sim_c);
-    let tsteps = args.steps;
+    let mut decisions = match &args.decisions {
+        Some(path) => Some(std::io::BufWriter::new(File::create(path)?)),
+        None => None,
+    };
+    let tsteps = if args.external { u32::MAX } else { args.steps };
     let mut true_c = args.sim_c;
+    // `--external`: the history index of the first RTT, and the newest loss
+    // reported so far (the observation repeats it when nothing is new).
+    let n0 = ccs.history.len() as i64;
+    let mut last_loss: (i64, RealNumRep) = (n0 - 1, 0.into());
+    let mut stdin = std::io::stdin().lock();
     for t in 0..tsteps {
         let change = args.sim_c_schedule.as_ref().and_then(|Schedule(s)| s.iter().find(|(at, _)| *at == t));
         if let Some((_, c)) = change {
@@ -1577,15 +1676,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let root_moves = ccs.move_choices_cca_stack.last().unwrap().clone();
-        let searched = !args.sim_max_rate && root_moves.len() > 1;
+        let root_rates: Vec<RealNumRep> = root_moves
+            .iter()
+            .map(|m| match m {
+                CCMove::CCA(a) => a.rate,
+                _ => panic!("Expecting CCA move"),
+            })
+            .collect();
+        let rule = (args.explore_rule || args.check_rule)
+            .then(|| explore_rule(&root_rates, &ccs.belief_bounds, ccs.qe_ks.as_deref().unwrap_or(&[])))
+            .flatten();
+        let searched = !args.sim_max_rate && root_moves.len() > 1 && !(args.explore_rule && rule.is_some());
         let best_cc_move = if args.sim_max_rate {
             sim_strategy.as_mut().unwrap().get_rate(&ccs)
         } else if !searched {
-            // The planner left a single move; nothing to search.
-            root_moves.first().cloned()
+            // The planner left a single move, or `explore_rule` knows the search's choice.
+            match rule {
+                Some(rate) => Some(CCMove::CCA(CCAAction { rate })),
+                None => root_moves.first().cloned(),
+            }
         } else {
+            let root = decisions.is_some().then(|| ccs.decision_features());
             let (ret, _, _) = search.best_move(&mut ccs, Some(SEARCH_DEPTH), None);
+            if let (Some(w), Some(mut root)) = (decisions.as_mut(), root) {
+                let rate = |m: &CCMove<NetworkActionNC>| match m {
+                    CCMove::CCA(a) => a.rate.to_f64().unwrap(),
+                    _ => f64::NAN,
+                };
+                root["t"] = t.into();
+                root["chosen_rate"] = rate(ret.as_ref().unwrap()).into();
+                root["root_values"] = search
+                    .root_values
+                    .iter()
+                    .map(|(m, v)| serde_json::json!({"rate": rate(m), "value": v}))
+                    .collect();
+                use std::io::Write;
+                writeln!(w, "{}", root)?;
+                w.flush()?;
+            }
             ret
+        };
+        let rule_check = match (args.check_rule && searched, rule, best_cc_move.as_ref()) {
+            (true, Some(rate), Some(CCMove::CCA(a))) if a.rate == rate => "ok",
+            (true, Some(rate), Some(CCMove::CCA(a))) => {
+                warn!("t={}: explore_rule chose {} but the search chose {}", t, rate, a.rate);
+                "MISMATCH"
+            }
+            _ => "-",
         };
         // The CCA chose a rate; the application decides how much of it is
         // sent.  Only what is sent reaches the link and the QE history.
@@ -1593,8 +1730,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             CCMove::CCA(a) => a.rate,
             _ => panic!("Expecting CCA move"),
         };
-        let sent = app.send(t, intended, args.sim_c, &mut rng);
-        ccs.record_cca_move(best_cc_move.as_ref().unwrap(), sent);
+        let external = if args.external {
+            use std::io::{BufRead, Write};
+            let mut out = std::io::stdout().lock();
+            writeln!(out, "rate {}", intended.to_f64().unwrap())?;
+            out.flush()?;
+            let mut line = String::new();
+            if stdin.read_line(&mut line)? == 0 {
+                break;
+            }
+            Some(parse_external(&line)?)
+        } else {
+            None
+        };
+        let sent = match &external {
+            Some(obs) => obs.sent,
+            None => app.send(t, intended, args.sim_c, &mut rng),
+        };
+        // A sender that sends whole packets misses a fractional rate by
+        // less than a packet; only the application can make it app-limited.
+        let planner_sent = match &external {
+            Some(obs) if !obs.app_limited => intended,
+            _ => sent,
+        };
+        ccs.record_cca_move(best_cc_move.as_ref().unwrap(), planner_sent);
         let best_cc_move = Some(CCMove::CCA(CCAAction { rate: sent }));
 
         if args.tree {
@@ -1621,7 +1780,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             args.sim_policy
         };
-        let (network_move, sim_used) = if !args.sim {
+        let (network_move, sim_used) = if let Some(obs) = &external {
+            // History index of the observation being committed.
+            let now = ccs.history.len() as i64;
+            let mut lo: Vec<LossObservation> = obs
+                .losses
+                .iter()
+                .map(|&(round, l)| {
+                    let tau = n0 + round;
+                    assert!(tau < now, "loss reported for round {round}, which has not been served");
+                    last_loss = (tau, l);
+                    LossObservation { t: (now - 1 - tau) as usize, l }
+                })
+                .collect();
+            if lo.is_empty() {
+                lo.push(LossObservation { t: (now - 1 - last_loss.0) as usize, l: last_loss.1 });
+            }
+            let na = NetworkActionNC { s: obs.s, lo, app_send_fraction: network_model_nc::AppSendFraction::Full };
+            (Some(CCMove::Network(na)), SimChoice::Max)
+        } else if !args.sim {
             (ccs.any_move_guess(), sim_choice)
         } else {
             // The adversary's reply to the chosen move, as minimax evaluated it.
@@ -1716,6 +1893,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{:.2}", true_c.to_f64().unwrap()),
                 format!("{}", ccs.planner.belief_start),
                 format!("{}", ccs.planner.restarts),
+                format!("{}", searched),
+                rule_check.to_string(),
             ])?;
             wtr.flush()?;
         }

@@ -292,6 +292,40 @@ max/min/random/mixed links, backlogged/on-off/rate/random apps):
   with tight C show up as repeated `ProbeAboveLimit`, because an unsent
   probe does not reset the probe timer.
 
+### What the search decides, exactly
+
+`--decisions FILE` writes one JSON line per searched RTT: the root's belief,
+candidates, metrics and K set, the chosen rate, and every root move's value
+as the search compared it (`Search::root_values`; a pruned child's value is
+the bound the root saw).
+
+The search tries the root moves last to first (`best_move_guess` pops) and
+keeps the first unless a later one is strictly better, so a tie goes to the
+last distinct candidate rate: `ProbeAboveLimit` when the planner offers it,
+otherwise `DrainQueue`.  Note that `MaxAllowedRate` is *not* the choice when
+probing is rationed; the planner offering {MaxAllowedRate, DrainQueue} means
+DrainQueue.  Equal rates are deduplicated, so label the choice by its rate.
+
+In the logs every root move tied exactly whenever `max_c` was still
+`LARGEST_BW` or a single K was assumed: the delay box lets the worst-case
+link reveal nothing new in two RTTs, whatever the CCA sends.  Moves differed
+only while the committed history forced the next windows to narrow C under
+several K, by an amount that depends on the move through QE (in that region
+the choice was sometimes `DrainQueue` or `MaxAllowedRate`).  `explore_rule`
+encodes this: it returns the tie-break where ties are known and `None` (search)
+elsewhere.  `--explore-rule` uses it; `--check-rule` searches every RTT and
+marks the CSV column `rule` `ok` or `MISMATCH` where the rule claimed to know.
+
+### External links
+
+`--external` runs the same engine against a link outside the process: each
+RTT it prints `rate R` and reads `SENT S APP_LIMITED [ROUND:L ...]` (round 0
+is the first RTT, -1 the empty initial history).  Fed by a script replaying
+`BurstyLinkSim`'s `max` policy it reproduces `--sim` exactly.  cc_sim's
+`MinimaxQe` CCA (`src/minimax_qe.rs` in github.com/venkatarun95/cc_sim)
+drives it from packets; its header explains the mapping (service counts only
+packets sent before the round, and how unresolved losses are reported).
+
 ## Changing links and convergence
 
 `--sim-c-schedule T:C,...` changes the simulated link rate from RTT T on;

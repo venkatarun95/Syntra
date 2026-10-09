@@ -586,6 +586,29 @@ pub fn update_k(
     tracker.assumed.clone()
 }
 
+/// `--explore-rule`: minimax's choice among `root_moves` without searching, where it is known.
+/// `root_moves` are the distinct candidate rates in `StatePolicy::candidate_actions` order.
+///
+/// The search tries the root moves last to first and keeps the first one unless a later one
+/// is strictly better, so on a tie it returns the last.  In the `--decisions` logs of 30 varied
+/// links (see `CCA_DEVELOPMENT.md`) every root move tied exactly whenever `max_c` was still
+/// `LARGEST_BW` or a single K was assumed: the delay box lets the worst-case link reveal
+/// nothing new in two RTTs, whatever the CCA sends.  Moves only differed while the committed
+/// history forced the next windows to narrow C under several K, by an amount that depends on
+/// the move through QE; there this returns `None` and the engine searches.
+pub fn explore_rule(
+    root_moves: &[RealNumRep],
+    belief: &BeliefBounds,
+    assumed_ks: &[RealNumInt],
+) -> Option<RealNumRep> {
+    let ties = belief.max_c >= cc_common::LARGEST_BW.into() || assumed_ks.len() <= 1;
+    if root_moves.len() == 1 || ties {
+        root_moves.last().copied()
+    } else {
+        None
+    }
+}
+
 /// Called after the engine commits the chosen action at `timestep`: the
 /// CCA asked for `intended`, and the application let `sent` be sent.
 ///

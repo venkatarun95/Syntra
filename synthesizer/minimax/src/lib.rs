@@ -91,12 +91,19 @@ impl<S: State> TranspositionTable<S> {
 /// Search best moves for the maximizing player
 pub struct Search<S: State> {
     tt: TranspositionTable<S>,
+    /// Depth of the root in the current `best_move` iteration.
+    root_depth: u16,
+    /// Every root move tried by the last `best_move`, in search order, with
+    /// the value the root compared (a bound, where the child was pruned).
+    pub root_values: Vec<(S::M, S::V)>,
 }
 
 impl<S: State> Search<S> {
     pub fn new() -> Self {
         Self {
             tt: TranspositionTable::new(),
+            root_depth: 0,
+            root_values: Vec::new(),
         }
     }
 
@@ -169,6 +176,9 @@ impl<S: State> Search<S> {
             } else {
                 return None;
             };
+            if depth == self.root_depth {
+                self.root_values.push((next_move.clone(), new_value));
+            }
 
             if maximize {
                 if new_value > value {
@@ -248,6 +258,8 @@ impl<S: State> Search<S> {
             }
             //let d = depth;
             state.reset_moves();
+            self.root_depth = d;
+            self.root_values.clear();
             // The caller obtains the result from the root transposition-table
             // entry below, so every requested depth must store that entry.
             // Previously the first (and only) iteration used `false`, which
