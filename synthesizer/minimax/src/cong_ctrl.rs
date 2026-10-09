@@ -1265,11 +1265,19 @@ struct Args {
     /// stdin closes; `--steps` is ignored.
     #[arg(long)]
     external: bool,
-    /// Use `explore_rule` instead of searching where it knows minimax's choice.
+    /// `--external`: append every line read from stdin to this file (replay it with
+    /// `network_model_nc/examples/window_check.rs`).
+    #[arg(long)]
+    record: Option<String>,
+    /// Never search: take `explore_rule`'s choice (the search's tie-break).
     #[arg(long)]
     explore_rule: bool,
-    /// Search every RTT, and count the RTTs where `explore_rule` claims to know minimax's
-    /// choice and differs from it (CSV column `rule`: `-` no claim, `ok`, `MISMATCH`).
+    /// Take `explore_rule`'s choice only where it is known to be the search's, and search
+    /// elsewhere.
+    #[arg(long)]
+    explore_rule_exact: bool,
+    /// Search every RTT and compare `explore_rule` with it (CSV column `rule`: `ok` or
+    /// `MISMATCH`, suffixed `-known` where the rule claims to know the search's choice).
     #[arg(long)]
     check_rule: bool,
 }
@@ -1658,6 +1666,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n0 = ccs.history.len() as i64;
     let mut last_loss: (i64, RealNumRep) = (n0 - 1, 0.into());
     let mut stdin = std::io::stdin().lock();
+    let mut record = match &args.record {
+        Some(path) => Some(std::io::BufWriter::new(File::create(path)?)),
+        None => None,
+    };
     for t in 0..tsteps {
         let change = args.sim_c_schedule.as_ref().and_then(|Schedule(s)| s.iter().find(|(at, _)| *at == t));
         if let Some((_, c)) = change {
@@ -1683,10 +1695,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => panic!("Expecting CCA move"),
             })
             .collect();
-        let rule = (args.explore_rule || args.check_rule)
-            .then(|| explore_rule(&root_rates, &ccs.belief_bounds, ccs.qe_ks.as_deref().unwrap_or(&[])))
-            .flatten();
-        let searched = !args.sim_max_rate && root_moves.len() > 1 && !(args.explore_rule && rule.is_some());
+        let (rule_rate, rule_known) = explore_rule(&root_rates, &ccs.belief_bounds);
+        let use_rule = args.explore_rule || (args.explore_rule_exact && rule_known);
+        let rule = use_rule.then_some(rule_rate);
+        let searched = !args.sim_max_rate && root_moves.len() > 1 && !use_rule;
         let best_cc_move = if args.sim_max_rate {
             sim_strategy.as_mut().unwrap().get_rate(&ccs)
         } else if !searched {
@@ -1716,13 +1728,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             ret
         };
-        let rule_check = match (args.check_rule && searched, rule, best_cc_move.as_ref()) {
-            (true, Some(rate), Some(CCMove::CCA(a))) if a.rate == rate => "ok",
-            (true, Some(rate), Some(CCMove::CCA(a))) => {
-                warn!("t={}: explore_rule chose {} but the search chose {}", t, rate, a.rate);
-                "MISMATCH"
+        let rule_check = match (args.check_rule && searched, best_cc_move.as_ref()) {
+            (true, Some(CCMove::CCA(a))) => {
+                let verdict = if a.rate == rule_rate { "ok" } else { "MISMATCH" };
+                if a.rate != rule_rate {
+                    warn!("t={}: explore_rule chose {} but the search chose {}", t, rule_rate, a.rate);
+                }
+                format!("{}{}", verdict, if rule_known { "-known" } else { "" })
             }
-            _ => "-",
+            _ => "-".to_string(),
         };
         // The CCA chose a rate; the application decides how much of it is
         // sent.  Only what is sent reaches the link and the QE history.
@@ -1738,6 +1752,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut line = String::new();
             if stdin.read_line(&mut line)? == 0 {
                 break;
+            }
+            if let Some(w) = record.as_mut() {
+                write!(w, "{}", line)?;
+                w.flush()?;
             }
             Some(parse_external(&line)?)
         } else {
@@ -1894,7 +1912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{}", ccs.planner.belief_start),
                 format!("{}", ccs.planner.restarts),
                 format!("{}", searched),
-                rule_check.to_string(),
+                rule_check,
             ])?;
             wtr.flush()?;
         }

@@ -306,15 +306,20 @@ otherwise `DrainQueue`.  Note that `MaxAllowedRate` is *not* the choice when
 probing is rationed; the planner offering {MaxAllowedRate, DrainQueue} means
 DrainQueue.  Equal rates are deduplicated, so label the choice by its rate.
 
-In the logs every root move tied exactly whenever `max_c` was still
-`LARGEST_BW` or a single K was assumed: the delay box lets the worst-case
-link reveal nothing new in two RTTs, whatever the CCA sends.  Moves differed
-only while the committed history forced the next windows to narrow C under
-several K, by an amount that depends on the move through QE (in that region
-the choice was sometimes `DrainQueue` or `MaxAllowedRate`).  `explore_rule`
-encodes this: it returns the tie-break where ties are known and `None` (search)
-elsewhere.  `--explore-rule` uses it; `--check-rule` searches every RTT and
-marks the CSV column `rule` `ok` or `MISMATCH` where the rule claimed to know.
+Over 30 varied 60-RTT runs (675 searched RTTs) every root move tied exactly
+while `max_c` was still `LARGEST_BW` (the delay box lets the worst-case link
+reveal nothing new in two RTTs, whatever the CCA sends).  With `max_c`
+bounded the tie-break was still the choice in 214 of 216 RTTs; the other two
+were `DrainQueue`, which won on window-local objectives (`scb`, the width of
+C) that depend on the worst-case replies through QE, once with a single K
+assumed.  A decision tree on the root's belief, candidates and metrics does
+not predict those two (leave-one-run-out 0.944, below the 0.991 majority).
+
+`explore_rule` returns the tie-break and whether it is known to be the
+search's choice (`max_c` unbounded).  `--explore-rule` always uses it (no
+search: 99.7% agreement above); `--explore-rule-exact` searches where it is
+not known; `--check-rule` searches every RTT and marks the CSV column `rule`
+`ok` or `MISMATCH` (`-known` where the rule claimed to know).
 
 ### External links
 
@@ -325,6 +330,21 @@ is the first RTT, -1 the empty initial history).  Fed by a script replaying
 `MinimaxQe` CCA (`src/minimax_qe.rs` in github.com/venkatarun95/cc_sim)
 drives it from packets; its header explains the mapping (service counts only
 packets sent before the round, and how unresolved losses are reported).
+`--record FILE` saves the input lines; `examples/window_check.rs` in
+`network_model_nc` replays them and tests every window under each K.
+
+The model has no slack where a packet link deviates from it by a packet:
+an RTT that overflows serves exactly C (`det_loss` with `I = I[t-1] + C`),
+so a loss pins `B + C` exactly, and K only perturbs service when there is no
+overflow.  Two consequences for packet traffic:
+
+* The unit must be at least one packet (`K_WINDOW_DISAGREEMENT_TOL` and the
+  other slacks are one unit).  With half-packet units, losses on a static
+  cc_sim link ruled out every K within 16 RTTs.
+* Service must not be counted past the start of the next RTT's arrivals at
+  the link, i.e. at most up to one transmission time before the RTT ends:
+  one extra packet of service before an overflow shifts `B + C` by one
+  between losses, and the window becomes infeasible for every K.
 
 ## Changing links and convergence
 

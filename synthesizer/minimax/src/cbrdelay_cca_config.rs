@@ -586,27 +586,22 @@ pub fn update_k(
     tracker.assumed.clone()
 }
 
-/// `--explore-rule`: minimax's choice among `root_moves` without searching, where it is known.
-/// `root_moves` are the distinct candidate rates in `StatePolicy::candidate_actions` order.
+/// The search's choice among `root_moves` without searching, and whether it is known to be
+/// the search's choice.  `root_moves` are the distinct candidate rates in
+/// `StatePolicy::candidate_actions` order.
 ///
 /// The search tries the root moves last to first and keeps the first one unless a later one
-/// is strictly better, so on a tie it returns the last.  In the `--decisions` logs of 30 varied
-/// links (see `CCA_DEVELOPMENT.md`) every root move tied exactly whenever `max_c` was still
-/// `LARGEST_BW` or a single K was assumed: the delay box lets the worst-case link reveal
-/// nothing new in two RTTs, whatever the CCA sends.  Moves only differed while the committed
-/// history forced the next windows to narrow C under several K, by an amount that depends on
-/// the move through QE; there this returns `None` and the engine searches.
-pub fn explore_rule(
-    root_moves: &[RealNumRep],
-    belief: &BeliefBounds,
-    assumed_ks: &[RealNumInt],
-) -> Option<RealNumRep> {
-    let ties = belief.max_c >= cc_common::LARGEST_BW.into() || assumed_ks.len() <= 1;
-    if root_moves.len() == 1 || ties {
-        root_moves.last().copied()
-    } else {
-        None
-    }
+/// is strictly better, so on a tie it returns the last: `ProbeAboveLimit` when offered, else
+/// `DrainQueue`.  In the `--decisions` logs of 30 varied links (see `CCA_DEVELOPMENT.md`)
+/// every root move tied exactly while `max_c` was still `LARGEST_BW`: the delay box lets the
+/// worst-case link reveal nothing new in two RTTs, whatever the CCA sends.  Once `max_c` is
+/// bounded the search still chose the tie-break in 214 of 216 RTTs; the other two were
+/// `DrainQueue`, which won on window-local objectives (`scb`, the width of C) that depend on
+/// the worst-case replies through QE.  So the result is only known while `max_c` is
+/// unbounded (or there is one move).
+pub fn explore_rule(root_moves: &[RealNumRep], belief: &BeliefBounds) -> (RealNumRep, bool) {
+    let known = root_moves.len() == 1 || belief.max_c >= cc_common::LARGEST_BW.into();
+    (*root_moves.last().unwrap(), known)
 }
 
 /// Called after the engine commits the chosen action at `timestep`: the
