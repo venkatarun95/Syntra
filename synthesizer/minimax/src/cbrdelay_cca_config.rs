@@ -385,6 +385,11 @@ pub struct PlannerState {
     pub last_probe: Option<usize>,
     /// Timestep at which the belief last proved the queue empty.
     pub last_drained: usize,
+    /// The belief proves the queue is at most `DRAIN_MAX_Q + K` now: RTT
+    /// samples from this RTT measure the propagation delay (for a wrapper
+    /// that tracks the min RTT).  Guaranteed at least every
+    /// `DRAIN_INTERVAL_RTTS` unless a drain fails (`MAX_DRAIN_RTTS`).
+    pub min_rtt_sample: bool,
     /// Timestep at which the current (or last) drain began.
     pub drain_started: usize,
     /// The application sent less than the CCA's last rate.
@@ -761,7 +766,12 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     let queue_target = std::cmp::max(base_target, planner.queue_floor);
 
     let drained = belief.max_q <= queue_target;
-    if drained {
+    // A drain is due once no RTT has been a min-RTT sample (a queue at most
+    // `base_target`, not the floor) for `drain_interval_rtts`: the min RTT
+    // is probed explicitly even on a link with a floor.  A drain that ends
+    // at the floor also resets the timer.
+    planner.min_rtt_sample = belief.max_q <= base_target;
+    if planner.min_rtt_sample || (planner.mode == Mode::Drain && drained) {
         planner.last_drained = t;
     }
     if planner.mode != Mode::Drain {

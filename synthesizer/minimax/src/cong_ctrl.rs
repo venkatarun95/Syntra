@@ -1465,6 +1465,13 @@ struct Args {
     /// stdin closes; `--steps` is ignored.
     #[arg(long)]
     external: bool,
+    /// `--external`: print `rate R maxq Q min_rtt_sample 0|1` instead of
+    /// `rate R`.  `Q` bounds the bottleneck queue at the start of the RTT;
+    /// with `min_rtt_sample 1` it is at most `DRAIN_MAX_Q + K`, so this RTT's
+    /// samples measure the min RTT (one such RTT at least every
+    /// `DRAIN_INTERVAL_RTTS`, forced by a drain).
+    #[arg(long)]
+    report_queue: bool,
     /// `--external`: append every line read from stdin to this file (replay it with
     /// `network_model_nc/examples/window_check.rs`).
     #[arg(long)]
@@ -1797,7 +1804,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "time", "r", "a", "ld", "s", "qdel", "min_c", "max_c", "min_b", "max_b", "min_q",
             "max_q", "min_if", "max_if", "mode", "action", "loss_tol", "sim", "qe_ks", "alive_ks",
             "sent", "app_limited", "candidates", "true_c", "true_b", "belief_start", "restarts", "searched",
-            "rule",
+            "rule", "min_rtt_sample",
         ])?;
         some_wtr = Some(wtr);
     }
@@ -1970,7 +1977,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let external = if args.external {
             use std::io::{BufRead, Write};
             let mut out = std::io::stdout().lock();
-            writeln!(out, "rate {}", intended.to_f64().unwrap())?;
+            if args.report_queue {
+                writeln!(
+                    out,
+                    "rate {} maxq {} min_rtt_sample {}",
+                    intended.to_f64().unwrap(),
+                    ccs.get_latest_belief_bounds().max_q.to_f64().unwrap(),
+                    u8::from(ccs.planner.min_rtt_sample)
+                )?;
+            } else {
+                writeln!(out, "rate {}", intended.to_f64().unwrap())?;
+            }
             out.flush()?;
             let mut line = String::new();
             if stdin.read_line(&mut line)? == 0 {
@@ -2137,6 +2154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 format!("{}", ccs.planner.restarts),
                 format!("{}", searched),
                 rule_check,
+                format!("{}", ccs.planner.min_rtt_sample),
             ])?;
             wtr.flush()?;
         }

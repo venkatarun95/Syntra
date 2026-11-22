@@ -601,6 +601,20 @@ No belief excluded the true (C, B) after a restart, and the 16 static links
 had no restart.  Rises are only seen when the CCA sends above the old C:
 the next step is explicit rise checks.
 
+### Min-RTT samples (Nov 2026)
+
+The model's time step is the min RTT; a wrapper that measures it needs RTTs
+whose queue is provably near empty.  `PlannerState::min_rtt_sample` is set
+when the belief proves `max_q <= DRAIN_MAX_Q + K` (not the queue floor).
+A drain is due once no RTT has been one for `DRAIN_INTERVAL_RTTS` (40), so
+on a link with an unprovable floor the CCA still drains explicitly; a drain
+that ends at the floor also resets the timer.  The CSV has a
+`min_rtt_sample` column, and `--external --report-queue` prints
+`rate R maxq Q min_rtt_sample 0|1` (cc_sim's `MinimaxQe` parses only
+`rate R`, so this is opt-in).  On the 16-link sweep the longest gap between
+samples was 47 RTTs (40 plus a 3-RTT drain); throughput and loss were
+unchanged.
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in
