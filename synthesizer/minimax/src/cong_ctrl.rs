@@ -897,6 +897,12 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     ) -> Result<(BeliefBounds, usize), InconsistentQeWindows> {
         if history.len() < QE_WINDOW_OBSERVATIONS {
             let fresh = self.network_model.fresh_belief_bounds(history).expect("history shorter than a QE window");
+            if fresh.min_c > fresh.max_c && lenient {
+                // No static link explains even this short history (the chained
+                // C bounds crossed): keep the committed belief, as for a
+                // conflicting window.
+                return Ok((self.belief_bounds, 1));
+            }
             if fresh.min_c > fresh.max_c {
                 return Err(InconsistentQeWindows {
                     history_observations: history.len(),
