@@ -80,6 +80,11 @@ pub enum CandidateAction {
     /// the queue near the smallest provable size (about K under bursts)
     /// rather than paying ~K packets/RTT of throughput to aim at zero.
     HoldQueue,
+    /// What the link delivered per RTT over the (up to two) newest RTTs
+    /// since the belief started, or over the newest RTT if none.  Right
+    /// after a change, before any QE window exists: a backlogged link keeps
+    /// its queue, an idle one keeps the old rate.  Not a bound on anything.
+    MatchDelivery,
 }
 
 /// Lexicographic objective, from most important to least important.  Pass
@@ -214,9 +219,10 @@ pub struct BeliefStrategy {
     /// limit, but it trusts the small K before any evidence for it.
     pub k_optimistic: bool,
     /// Treat evidence against a static link as a change of the link: when a
-    /// confirmed K is ruled out by disagreeing windows, or the belief's
-    /// windows disagree by more than QE slack, restart the belief at the
-    /// newest window (instead of escalating K or keeping the older bound).
+    /// confirmed K is ruled out by disagreeing windows, or no link explains
+    /// the belief's history, restart the belief at the longest consistent
+    /// suffix of the history (`CongCtrlState::locate_change`).  On by
+    /// default (`--no-change-restart`).
     pub change_restart: bool,
     /// In Explore, do not force `DrainQueue` when the queue may exceed
     /// `EXPLORE_MAX_QUEUE_BDP`: let minimax choose, with `qdel` among its
@@ -241,7 +247,7 @@ impl Default for BeliefStrategy {
         Self {
             k_confirm_rtts: K_CONFIRM_RTTS,
             k_optimistic: false,
-            change_restart: false,
+            change_restart: true,
             explore_free: false,
             c_upper_rtts: None,
             explore_budget_bdp: EXPLORE_BUDGET_BDP,
@@ -331,6 +337,9 @@ pub enum Mode {
     Probe,
     /// Hold the drain rate until the belief proves the queue is empty.
     Drain,
+    /// The link changed less than a QE window ago: match its delivery
+    /// until the new link's windows exist.
+    Recover,
 }
 
 /// Burstiness hypotheses for `KPolicy::Hypotheses`.
@@ -686,7 +695,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     let mut default_history_len = state
         .belief_history
         .map_or(since_start, |n| n.min(since_start))
-        .clamp(QE_WINDOW_OBSERVATIONS, n_obs);
+        .clamp(1, n_obs);
     let belief = loop {
         match (state.belief_bounds_for_history)(default_history_len) {
             Ok(belief) => break belief,
@@ -781,6 +790,24 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         Mode::Cruise
     };
     planner.mode = mode;
+    // Fewer observations than a QE window since the link changed: the
+    // belief is the chained C bounds alone and the queue is only bounded by
+    // what is in flight (which includes up to an RTT of service lag), so
+    // holding the queue on it would idle the link.  Match the delivery
+    // until the new link's windows exist.
+    if since_start < QE_WINDOW_OBSERVATIONS {
+        planner.mode = Mode::Recover;
+        return StatePolicy {
+            belief_history_observations: default_history_len,
+            loss_tolerance_abs: CAUTIOUS_LOSS_BUDGET,
+            delay_tolerance_frac: 3.into(),
+            objective_order: names(OBJECTIVE_ORDER),
+            candidate_actions: vec![CandidateAction::MatchDelivery],
+            mode: Mode::Recover,
+            queue_target,
+            queue_cap: None,
+        };
+    }
     if !state.newest_window_feasible {
         // No static link explains the newest window: there are no feasible
         // network moves to search over.  Drain on the (restarted) belief
@@ -849,6 +876,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         // `HoldQueue` at the queue target: `DrainQueue` unless a floor is
         // known, in which case draining below it would only idle the link.
         Mode::Drain => (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET),
+        Mode::Recover => unreachable!("Recover returns early"),
     };
 
     StatePolicy {

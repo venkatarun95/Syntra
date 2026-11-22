@@ -557,6 +557,50 @@ Results (60 RTTs, sim K=1, `max` link unless noted; `summary.txt` of
 On a `random` link (which may under-serve) a rise in C cannot be told from
 a link withholding service, and no strategy detected it.
 
+### Change detection by the longest consistent prefix (Nov 2026)
+
+Change restarts are on by default (`--no-change-restart` turns them off).
+After the K update each RTT, `CongCtrlState::locate_change` checks the
+belief's history (strict fold: every window, the joint (C, B) bound and the
+chained C bounds) and, if no link explains it:
+
+1. If K values that no window has ruled out, other than the assumed ones,
+   explain the whole history, the link is burstier than assumed (K
+   confirmation is an assumption): the assumed K are ruled out and
+   confirmation starts over.  No restart.  Without this, a wrongly
+   confirmed K=1 on a K=4 random link restarted the belief 4 times.
+2. Otherwise the link changed.  If `history[start..e]` is consistent and
+   `history[start..e+1]` is not, the change came no later than observation
+   `e`, so the belief restarts at `e`; repeated while the rest is
+   inconsistent.  Consistency of prefixes is monotone, so `e` is found by
+   binary search.  The longest consistent *suffix* (tried first) is unsound:
+   after C 20 -> 50 it kept pre-change windows because one fictitious link
+   (C = 40) explained both sides, and the belief settled on C in [40, 40].
+
+Only T = 6 QE tables exist, so for the 6 RTTs after a restart there is no
+window.  `fold_history` then uses `NetworkModel::fresh_belief_bounds` (the
+chained C bounds, B unknown, queue at most what is in flight) and the planner
+is in `Mode::Recover`, sending `MatchDelivery` (the delivery per RTT since
+the restart): holding the queue on an in-flight bound, which includes up to
+an RTT of service lag, idled the link at 1-5 packets/RTT.  Recover is a
+heuristic; the beliefs stay sound.
+
+Simulated changes (`--sim-c-schedule`, and new `--sim-b-schedule`; CSV
+`true_b`), 60 RTTs, K=1 `max` unless noted, after the change:
+
+| change | off: util / loss | on: util / loss | detected | C within 25% after |
+| --- | --- | --- | --- | --- |
+| C 20 -> 50 at 25 | 0.41 / 0 | 0.80 / 64 | RTT 29 (probe) | 17 RTTs |
+| C 50 -> 20 at 25 | 1.00 / 130, C never right | 1.00 / 70 | RTT 27 | 13 RTTs |
+| C 20 -> 40 -> 20 | 0.51, then 1.00 | 0.60, then 1.00 / 108 | RTT 29, 42 | -, 12 RTTs |
+| B 40 -> 10 at 25 | B never right | 1.00 / 30 | RTT 26 | - |
+| B 10 -> 60 at 25 | not detected | not detected | - | - |
+| C 30 -> 60 at 30, K=4 random | 0.44 | 0.43 | RTT 52 | - |
+
+No belief excluded the true (C, B) after a restart, and the 16 static links
+had no restart.  Rises are only seen when the CCA sends above the old C:
+the next step is explicit rise checks.
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in

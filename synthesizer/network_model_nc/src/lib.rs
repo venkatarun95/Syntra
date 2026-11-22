@@ -724,6 +724,24 @@ impl NetworkModel for NetworkModelNC {
         Some((exact::round_down(lo), hi.map_or(LARGEST_BW.into(), exact::round_up)))
     }
 
+    fn fresh_belief_bounds(&self, history: &[Self::O]) -> Option<BeliefBounds> {
+        let (lo, hi) = self.chained_c_bounds(history)?;
+        // Everything not yet served or reported lost may still be queued.
+        let last = history.last()?;
+        let in_flight = std::cmp::max(last.a - last.s - last.get_ld(), 0.into());
+        Some(BeliefBounds {
+            min_c: std::cmp::max(lo, SMALLEST_BW.into()),
+            max_c: std::cmp::min(hi, LARGEST_BW.into()),
+            min_b: SMALLEST_BW.into(),
+            max_b: LARGEST_BW.into(),
+            min_q: 0.into(),
+            max_q: in_flight,
+            min_if: in_flight,
+            max_if: in_flight,
+            min_cb: 0.into(),
+        })
+    }
+
     fn compute_queue_delay(
         &self,
         relevant_history: &[Self::O],

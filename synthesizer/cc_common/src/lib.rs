@@ -232,6 +232,13 @@ pub trait NetworkModel: Debug + Sized {
         None
     }
 
+    /// Belief bounds from a history too short for a QE window, e.g. the
+    /// observations since the link changed.  `min_c > max_c` if no link
+    /// explains it.  `None` if the model does not support it.
+    fn fresh_belief_bounds(&self, _history: &[Self::O]) -> Option<BeliefBounds> {
+        None
+    }
+
     fn get_network_move_sim(
         &self,
         relevant_history: &[Self::O],
