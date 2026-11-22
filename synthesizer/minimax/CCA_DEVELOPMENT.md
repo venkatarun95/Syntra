@@ -442,6 +442,41 @@ values depend on the RTT's policy.
   fold does not carry the hidden queue between windows, so beliefs such as
   [10, 12.5] stop there however long the link stays backlogged.
 
+### Chained C bounds (Nov 2026)
+
+One QE window proves C only to within about 1/(T-1) of what it served
+(e.g. `[10, 12.5]` for C = 10): the link may serve up to one RTT behind its
+ideal curve, and every window's initial queue is free, so intersecting
+windows (even jointly in (C, B)) never gets better.  `network_model_nc/src/chain.rs`
+applies the model's equations to a whole run of consecutive explained
+windows instead.  Unrolling `I[t] = min(I[t-1] + C, P[t] - L[t])` from `t0`
+to `t1`, with `I[t-1] <= S[t] <= I[t]` and `A - K <= P <= A`:
+
+* `C >= (S[t1] - S[t0+1]) / (t1 - t0)`;
+* if `S[t1+1] < A[t1] - K - L[t1]`, then
+  `C <= max((S[t1+1] - S[t0]) / (t1-t0), max_{t0<tau<t1} (S[t1+1] - A[tau] + K + L[tau]) / (t1-tau))`.
+
+No backlog assumption is needed (a gap in the backlog makes a `tau` term
+large).  L enters only through upper bounds (L never decreases, so any
+later reported loss bounds it), which also copes with speculative histories
+whose loss reports skip times.  K is the largest K hypothesis still alive.
+`fold_belief_windows` chains each run of consecutive explained windows (a
+dropped window may be a link change) and passes the result to
+`joint_c_b_bounds`, which also tightens B through the pieces.
+
+`test_chained_c_bounds_sound` checks the bounds contain the true C, with no
+tolerance, on forward-simulated histories (C in {10, 20, 37}, five (K, B),
+four link patterns) and their suffixes.  The whole histories pin C to about
+0.5% (e.g. `[9.96, 10.006]`).
+
+On the 16-link sweep it fixed the case it was meant for (C=10 B=80:
+`[10, 12.5]` to `[10, 10.19]`) and changed no decision but one mixed link
+(second-half util 0.73 to 0.78).  What remains is not an inference gap: in
+Cruise the CCA sends exactly `min_c`, the queue empties, and a faster link
+gives identical observations (C=100 B=400 stays `[100, 114]`, C=15 B=60
+`[15, 16]`).  Only sending above `min_c`, i.e. the exploration trade-off,
+can narrow it, and there C = `min_c` already.
+
 ## Changing links and convergence
 
 `--sim-c-schedule T:C,...` changes the simulated link rate from RTT T on;

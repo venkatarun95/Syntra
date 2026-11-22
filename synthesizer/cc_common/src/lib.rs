@@ -215,11 +215,20 @@ pub trait NetworkModel: Debug + Sized {
     /// B must be in every window's B set.  Tighter than intersecting each
     /// window's bounds, which lets C and B vary between windows.  `None`
     /// if the model does not support it; `Some(None)` if no (C, B) explains
-    /// all the windows.  Each window's outstanding action is given.
+    /// all the windows.  Each window's outstanding action is given.  C is
+    /// also limited to `c_limit` (e.g. from `chained_c_bounds`).
     fn joint_c_b_bounds(
         &self,
         _windows: &[(&[Self::O], &Option<CCAAction>)],
+        _c_limit: Option<(RealNumRep, RealNumRep)>,
     ) -> Option<Option<BeliefBounds>> {
+        None
+    }
+
+    /// Bounds on C from a contiguous history explained by one link, chained
+    /// across its windows rather than window by window.  `None` if the
+    /// model does not support it.
+    fn chained_c_bounds(&self, _history: &[Self::O]) -> Option<(RealNumRep, RealNumRep)> {
         None
     }
 

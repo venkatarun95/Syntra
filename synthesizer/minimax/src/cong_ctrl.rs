@@ -827,6 +827,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let mut conflicts = 0;
         // The windows that contributed, for the joint (C, B) bound below.
         let mut used: Vec<(&[NM::O], &Option<CCAAction>)> = vec![];
+        let mut used_idx: Vec<usize> = vec![];
         for (idx, window) in history.windows(QE_WINDOW_OBSERVATIONS).enumerate() {
             let action = if idx + 1 == window_count { &self.move_cca } else { &None };
             let Some(next) = window_bounds(idx, window) else {
@@ -843,6 +844,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 continue;
             };
             used.push((window, action));
+            used_idx.push(idx);
             if bounds.is_none() {
                 bounds = Some(next);
                 continue;
@@ -887,7 +889,26 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         // window is ever dropped for being slow), and the network model
         // caches the committed prefix.
         if let Some(acc) = bounds.as_mut() {
-            match self.network_model.joint_c_b_bounds(&used) {
+            // C bounds chained across each run of consecutive explained
+            // windows: one link explains a run, and the run, unlike its
+            // windows, amortizes the link's service lag over many RTTs.
+            // A dropped window may be a link change, so runs do not span one.
+            let mut c_limit: Option<(RealNumRep, RealNumRep)> = None;
+            let mut start = 0;
+            for i in 0..used_idx.len() {
+                if i + 1 < used_idx.len() && used_idx[i + 1] == used_idx[i] + 1 {
+                    continue;
+                }
+                let run = &history[used_idx[start]..used_idx[i] + QE_WINDOW_OBSERVATIONS];
+                start = i + 1;
+                if let Some((lo, hi)) = self.network_model.chained_c_bounds(run) {
+                    c_limit = Some(match c_limit {
+                        None => (lo, hi),
+                        Some((l, h)) => (std::cmp::max(l, lo), std::cmp::min(h, hi)),
+                    });
+                }
+            }
+            match self.network_model.joint_c_b_bounds(&used, c_limit) {
                 Some(Some(joint)) => {
                     let crossed = intersect_c_b(acc, &joint);
                     debug_assert!(!crossed || conflicts > 0, "joint bound outside the per-window bounds");

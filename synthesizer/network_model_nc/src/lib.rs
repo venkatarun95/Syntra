@@ -14,6 +14,7 @@ use lazy_static::lazy_static;
 use network_model_nc_qe_output::*;
 use std::sync::Arc;
 
+pub mod chain;
 pub mod exact;
 pub mod generated;
 pub mod link_sim;
@@ -677,9 +678,16 @@ impl NetworkModel for NetworkModelNC {
     fn joint_c_b_bounds(
         &self,
         windows: &[(&[Self::O], &Option<CCAAction>)],
+        c_limit: Option<(RealNumRep, RealNumRep)>,
     ) -> Option<Option<BeliefBounds>> {
         let pieces = self.joint_pieces(windows)?;
-        let c = exact::c_set(&pieces);
+        let mut c = exact::c_set(&pieces);
+        if let Some((lo, hi)) = c_limit {
+            if lo > hi {
+                return Some(None);
+            }
+            c = c.intersection(&IntervalList::interval_bounded(Bound::Included(lo), Bound::Included(hi)));
+        }
         if c.is_empty() {
             return Some(None);
         }
@@ -696,6 +704,24 @@ impl NetworkModel for NetworkModelNC {
             max_if: zero,
             min_cb: exact::min_c_plus_b(&pieces, &c, SMALLEST_BW.into(), LARGEST_BW.into()).unwrap_or(zero),
         }))
+    }
+
+    fn chained_c_bounds(&self, history: &[Self::O]) -> Option<(RealNumRep, RealNumRep)> {
+        // As `get_observation_vectors`, but a speculative history can report
+        // a loss without the ones before it within this slice.
+        let a: Vec<RealNumRep> = history[..history.len() - 1].iter().map(|o| o.a).collect();
+        let s: Vec<RealNumRep> = history[1..].iter().map(|o| o.s).collect();
+        let mut losses = vec![];
+        for (i, obs) in history.iter().enumerate().skip(1) {
+            for lo in &obs.lo {
+                if lo.t <= i - 1 {
+                    losses.push((i - 1 - lo.t, lo.l));
+                }
+            }
+        }
+        let k = self.qe.k_values().into_iter().max().unwrap();
+        let (lo, hi) = chain::c_bounds(&a, &losses, &s, k);
+        Some((exact::round_down(lo), hi.map_or(LARGEST_BW.into(), exact::round_up)))
     }
 
     fn compute_queue_delay(
@@ -2199,6 +2225,55 @@ mod tests {
         ret
     }
 
+    /// The whole forward-simulated history (initial observations included).
+    fn forward_history(k: RealNumInt, b: RealNumInt, c: RealNumInt, choose: fn(usize) -> LinkChoice, rates: &[RealNumInt]) -> Vec<ObservationNC> {
+        let nm = NetworkModelNC::new().with_qe(bursty(k));
+        let mut history = nm.get_initial_history();
+        let mut sim = BurstyLinkSim::new(c.into(), b.into(), k.into(), history.len());
+        for (i, &rate) in rates.iter().enumerate() {
+            let move_cca = Some(CCAAction { rate: rate.into() });
+            let na = sim.step(history.last().unwrap().a, history.len(), choose(i));
+            let obs = nm.compute_observation(history.last().unwrap(), &na, &move_cca);
+            history.push(obs);
+        }
+        history
+    }
+
+    /// Chained C bounds must contain the true C on every forward-simulated
+    /// history and every suffix of it (a suffix starts with a non-empty
+    /// queue), with no tolerance.  Prints how tight they get.
+    #[test]
+    fn test_chained_c_bounds_sound() {
+        let mut rates: Vec<RealNumInt> = LONG_RATES.to_vec();
+        // A long backlogged stretch at about 1.2 C, then a drain.
+        rates.extend([24; 24]);
+        rates.extend([0, 0, 10, 10]);
+        for c in [10, 20, 37] {
+            let scaled: Vec<RealNumInt> = rates.iter().map(|&r| r * c / 20).collect();
+            for (k, b) in [(1, 5), (4, 9), (16, 33), (1, 100), (64, 200)] {
+                for (name, choose) in link_patterns() {
+                    let history = forward_history(k, b, c, choose, &scaled);
+                    let nm = NetworkModelNC::new().with_qe(bursty(k));
+                    let mut tightest = (RealNumRep::from(0), RealNumRep::from(LARGEST_BW));
+                    for start in (0..history.len() - 3).step_by(3) {
+                        for end in (start + 3..=history.len()).rev().step_by(2) {
+                            let (lo, hi) = nm.chained_c_bounds(&history[start..end]).unwrap();
+                            assert!(
+                                lo <= c.into() && RealNumRep::from(c) <= hi,
+                                "c={} k={} b={} {} [{}, {}): C in [{}, {}]",
+                                c, k, b, name, start, end, lo, hi
+                            );
+                            if start == 0 {
+                                tightest = (std::cmp::max(tightest.0, lo), std::cmp::min(tightest.1, hi));
+                            }
+                        }
+                    }
+                    println!("c={} k={} b={} {}: whole history C in [{}, {}]", c, k, b, name, tightest.0, tightest.1);
+                }
+            }
+        }
+    }
+
     const LONG_RATES: [RealNumInt; 32] = [
         5, 15, 10, 25, 30, 20, 35, 15, 25, 40, 10, 30, 45, 5, 20, 25,
         1, 1, 1, 1, 1, 1, 1, 1, 30, 30, 30, 30, 0, 0, 22, 22,
@@ -2237,7 +2312,7 @@ mod tests {
                     hi_b = std::cmp::min(hi_b, bb.max_b);
                     let refs: Vec<(&[ObservationNC], &Option<CCAAction>)> =
                         windows[..=i].iter().map(|w| (w.as_slice(), &None)).collect();
-                    let j = nm.joint_c_b_bounds(&refs).unwrap().unwrap_or_else(|| panic!("k={} b={} {} window {}: jointly infeasible", k, b, name, i));
+                    let j = nm.joint_c_b_bounds(&refs, None).unwrap().unwrap_or_else(|| panic!("k={} b={} {} window {}: jointly infeasible", k, b, name, i));
                     let msg = format!(
                         "k={} b={} {} window {}: joint c=[{}, {}] b=[{}, {}], boxes c=[{}, {}] b=[{}, {}]",
                         k, b, name, i, j.min_c, j.max_c, j.min_b, j.max_b, lo_c, hi_c, lo_b, hi_b
