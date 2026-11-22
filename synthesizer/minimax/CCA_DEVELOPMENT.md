@@ -808,6 +808,14 @@ unacked data 1.72 BDP, belief `max_q` 0.97 BDP (old search: 0.82, 2101,
 1.71, 0.96; only s14, s21 and s36 differ).  Table:
 `/tmp/cca_distill/final/simcmp.txt`.
 
+Held out (after the rule was fixed): 7 further links × 100 RTTs (C 100
+B 400; C 40 B 20 random; C 50 B 100 K=4 random; C 20 -> 50 -> 25; B
+10 -> 60; on-off app; C 60 -> 30 K=4 mixed), search and `--distilled` both
+with `--exact-root --tie-high`: 700/700 RTTs optimal and equal to the
+search's pick, 7/7 CSVs identical, 6 RTTs deferred (all exact ties that
+include the highest rate).  So over 805 searched RTTs the search strictly
+preferred a lower rate only once (n2 t68).
+
 ### Caveats
 
 * The deferral region is empirical: on unseen links a decision outside it
