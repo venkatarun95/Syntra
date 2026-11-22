@@ -24,7 +24,7 @@ use network_model_nc::{
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
     RISE_STEP,
-    explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
+    distilled_actions, explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
     PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
     EXPLORE_BUDGET_BDP, EXPLORE_MAX_QUEUE_BDP, K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
@@ -258,6 +258,12 @@ struct CongCtrlState<NM: NetworkModel> {
     recording_tree: bool,
 
     disable_pre_enumeration: bool,
+    /// `--tie-high`: order the root moves by rate so that the search, which
+    /// keeps the first move it tries unless a later one is strictly better,
+    /// breaks an exact tie towards the highest rate.
+    root_tie_high: bool,
+    /// `--spec-monotone`: see `compute_belief_bounds`.
+    spec_monotone: bool,
 
     // Config
     policy: StatePolicy,
@@ -395,7 +401,16 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
         // operation. As the speculation is starting afresh.
         assert!(self.move_choices_cca_stack.len() == 1);
         self.move_choices_cca_stack.pop();
-        self.move_choices_cca_stack.push(self.compute_cca_moves());
+        let mut moves = self.compute_cca_moves();
+        if self.root_tie_high {
+            // Tried last to first: the highest rate first.
+            let rate = |m: &CCMove<NM::NA>| match m {
+                CCMove::CCA(a) => a.rate,
+                _ => panic!("Expecting CCA move"),
+            };
+            moves.sort_by_key(rate);
+        }
+        self.move_choices_cca_stack.push(moves);
     }
 
     fn tt_state(&self) -> CCTTState<NM::O> {
@@ -720,8 +735,20 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 
     /// The rate of every candidate action the policy allows, in policy order.
     fn candidate_rates(&self) -> Vec<(CandidateAction, RealNumRep)> {
+        self.candidate_rates_ext().0
+    }
+
+    /// `candidate_rates`, and `MaxAllowedRate` before the queue cap (if any
+    /// candidate needs it).
+    fn candidate_rates_ext(&self) -> (Vec<(CandidateAction, RealNumRep)>, Option<RealNumRep>) {
+        self.candidate_rates_for(&self.policy.candidate_actions)
+    }
+
+    /// `candidate_rates_ext` for any list of actions, with this RTT's policy
+    /// parameters (loss budget, queue target and cap).
+    fn candidate_rates_for(&self, actions: &[CandidateAction]) -> (Vec<(CandidateAction, RealNumRep)>, Option<RealNumRep>) {
         let belief_bounds = self.get_latest_belief_bounds();
-        let needs_max_rate = self.policy.candidate_actions.iter().any(|candidate| {
+        let needs_max_rate = actions.iter().any(|candidate| {
             matches!(
                 candidate,
                 CandidateAction::MaxAllowedRate | CandidateAction::ProbeAboveLimit
@@ -748,8 +775,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         };
         let min_c = belief_bounds.min_c;
         let max_q = belief_bounds.max_q;
-        self.policy
-            .candidate_actions
+        let rates = actions
             .iter()
             .map(|candidate| {
                 let rate = match candidate {
@@ -782,7 +808,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 (*candidate, rate)
             })
             .filter(|(_, rate)| *rate >= 0.into())
-            .collect()
+            .collect();
+        (rates, max_allowed_rate)
     }
 
     fn compute_cca_moves(&self) -> Vec<CCMove<NM::NA>> {
@@ -983,7 +1010,13 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         if !self.history_stack.is_empty() {
             // A speculative state is never broader than the committed belief
             // it extends: the K set is fixed for the whole tree.
-            intersect_c_b(&mut bounds, &self.belief_bounds);
+            // `--spec-monotone`: nor than its parent's (the speculative state
+            // one observation earlier), which already includes the root.
+            let parent = match self.belief_bounds_stack.last() {
+                Some(parent) if self.spec_monotone => *parent,
+                _ => self.belief_bounds,
+            };
+            intersect_c_b(&mut bounds, &parent);
         }
         bounds
     }
@@ -1052,6 +1085,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             current: Weak::new(),
             recording_tree: false,
             disable_pre_enumeration: false,
+            root_tie_high: false,
+            spec_monotone: false,
             policy: StatePolicy::default(),
             planner: PlannerState::default(),
             qe_ks: None,
@@ -1242,39 +1277,76 @@ impl CongCtrlState<NetworkModelNC> {
         self.planner = planner;
     }
 
-    /// What the root of a search knows, for `--decisions`.
-    fn decision_features(&self) -> serde_json::Value {
-        let f = |x: RealNumRep| x.to_f64().unwrap();
+    /// `--distilled`: the highest rate among `distilled_actions`, computed
+    /// with the planner's formulas and parameters for this RTT, and whether
+    /// those actions are exactly the planner's candidate set.
+    fn distilled_rate(&self) -> (RealNumRep, bool) {
+        let actions = distilled_actions(&self.policy.features);
+        let ok = actions == self.policy.candidate_actions;
+        let (rates, _) = self.candidate_rates_for(&actions);
+        let rate = rates.iter().map(|(_, r)| *r).max().expect("no distilled action has a rate");
+        (rate, ok)
+    }
+
+    /// `--decisions`: everything the CCA knows before deciding this RTT,
+    /// with exact rationals as `n/d` strings: belief, planner memory, the
+    /// planner's derived quantities, mode and candidate set.
+    fn trace_features(&self) -> serde_json::Value {
+        let q = |x: RealNumRep| serde_json::Value::String(format!("{}", x));
         let bb = self.belief_bounds;
-        let first = self
-            .get_relevant_history(Some(self.policy.belief_history_observations))
-            .into_iter()
-            .next()
-            .unwrap();
+        let pf = self.policy.features;
+        let pl = &self.planner;
+        let (cands, max_allowed_raw) = self.candidate_rates_ext();
+        let n = self.history.len();
         let last = self.history.last().unwrap();
         serde_json::json!({
             "mode": format!("{:?}", self.policy.mode),
-            "loss_tol": f(self.policy.loss_tolerance_abs),
-            "history_obs": self.policy.belief_history_observations,
-            "n_history": self.history.len(),
-            "belief": {
-                "min_c": f(bb.min_c), "max_c": f(bb.max_c), "min_b": f(bb.min_b), "max_b": f(bb.max_b),
-                "min_q": f(bb.min_q), "max_q": f(bb.max_q), "min_if": f(bb.min_if), "max_if": f(bb.max_if),
+            "candidates": cands.iter().map(|(c, r)| serde_json::json!([format!("{:?}", c), q(*r)])).collect::<Vec<_>>(),
+            "max_allowed_raw": max_allowed_raw.map(q),
+            "policy": {
+                "loss_tol": q(self.policy.loss_tolerance_abs),
+                "queue_target": q(self.policy.queue_target),
+                "queue_cap": self.policy.queue_cap.map(q),
+                "history_obs": self.policy.belief_history_observations,
             },
-            "candidates": self
-                .candidate_rates()
-                .into_iter()
-                .map(|(c, r)| serde_json::json!([format!("{:?}", c), f(r)]))
-                .collect::<Vec<_>>(),
-            "loss_since_start": f(last.get_ld() - first.get_ld()),
-            "ld": f(last.get_ld()),
-            "qdel": last.get_qdel(),
-            "a": f(last.a),
-            "s": f(last.s),
-            "last_rate": f(last.a - self.history[self.history.len() - 2].a),
-            "last_delivered": f(last.s - self.history[self.history.len() - 2].s),
-            "qe_ks": self.qe_ks.clone().unwrap_or_default(),
-            "metrics": self.compute_metrics(),
+            "belief": {
+                "min_c": q(bb.min_c), "max_c": q(bb.max_c), "min_b": q(bb.min_b), "max_b": q(bb.max_b),
+                "min_q": q(bb.min_q), "max_q": q(bb.max_q), "min_if": q(bb.min_if), "max_if": q(bb.max_if),
+                "min_cb": q(bb.min_cb),
+            },
+            "pf": {
+                "prev_mode": format!("{:?}", pf.prev_mode),
+                "since_start": pf.since_start,
+                "newest_window_feasible": pf.newest_window_feasible,
+                "k_max": q(pf.k_max),
+                "c_tight": pf.c_tight, "small_buffer": pf.small_buffer,
+                "k_unconfirmed": pf.k_unconfirmed, "cautious": pf.cautious,
+                "since_probe": pf.since_probe,
+                "queue_target": q(pf.queue_target),
+                "drained": pf.drained, "drain_due": pf.drain_due, "drain_gave_up": pf.drain_gave_up,
+                "rise_continues": pf.rise_continues, "rise_due": pf.rise_due,
+                "rise_fits": pf.rise_fits, "rise_lossless": pf.rise_lossless,
+                "explore_cap": q(pf.explore_cap), "queue_high": pf.queue_high,
+                "probe_ok": pf.probe_ok, "probe_gap": pf.probe_gap,
+            },
+            "planner": {
+                "last_probe": pl.last_probe, "last_drained": pl.last_drained,
+                "drain_started": pl.drain_started, "app_limited": pl.app_limited,
+                "queue_floor": q(pl.queue_floor), "last_sent": q(pl.last_sent),
+                "belief_start": pl.belief_start, "restarts": pl.restarts,
+                "rise_last": pl.rise_last, "rise_interval": pl.rise_interval,
+                "rise": pl.rise.map(|r| serde_json::json!({"started": r.started, "rtts": r.rtts, "lossless": r.lossless})),
+                "k_assumed": pl.k.assumed.clone(),
+                "k_alive": pl.k.alive.iter().filter(|(_, a)| *a).map(|(k, _)| *k).collect::<Vec<_>>(),
+                "k_stable_rtts": pl.k.stable_rtts,
+                "min_rtt_sample": pl.min_rtt_sample,
+            },
+            "n_history": n,
+            "ld": q(last.get_ld()),
+            "a": q(last.a),
+            "s": q(last.s),
+            "last_rate": q(last.a - self.history[n - 2].a),
+            "last_delivered": q(last.s - self.history[n - 2].s),
         })
     }
 
@@ -1452,9 +1524,11 @@ struct Args {
     /// Only the newest N RTTs bound C from above for the planner.
     #[arg(long)]
     c_upper_rtts: Option<usize>,
-    /// Write one JSON line per searched RTT here: the root's belief,
-    /// candidates and metrics, and every root move's value as the search
-    /// compared it.  Used to distil the search into rules.
+    /// Write one JSON line per RTT here: the belief, planner memory and
+    /// the planner's derived features (`PlannerFeatures`), mode, candidate
+    /// rates (exact, as `n/d`), the chosen rate, and, where the search ran,
+    /// every root move's value and the set of optimal rates.  Used to
+    /// distil the search into rules (`scripts/distill/`).
     #[arg(long)]
     decisions: Option<String>,
     /// Search every root move with a full alpha-beta window, so the
@@ -1495,6 +1569,21 @@ struct Args {
     /// `MISMATCH`, suffixed `-known` where the rule claims to know the search's choice).
     #[arg(long)]
     check_rule: bool,
+    /// Never search: take `distilled_actions`' choice (the highest of its
+    /// actions' rates).  The CSV column `rule` says whether it matches the
+    /// planner's candidate set (`dist-ok`) or not (`dist-MISMATCH`).
+    #[arg(long)]
+    distilled: bool,
+    /// Break exact ties at the root towards the highest rate (by default the
+    /// search keeps the last candidate in planner order).  Every choice is
+    /// still minimax-optimal; `--distilled` makes the same choice.
+    #[arg(long)]
+    tie_high: bool,
+    /// Intersect each speculative belief with its parent's, not only with
+    /// the committed root's (a leaf could otherwise be broader than the node
+    /// above it, which once made the search prefer a lower rate on `c`).
+    #[arg(long)]
+    spec_monotone: bool,
 }
 
 /// `--external`: one RTT's outcome, as read from stdin.
@@ -1864,6 +1953,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut search: minimax::Search<CongCtrlState<NetworkModelNC>> = minimax::Search::new();
     // cong_ctrl_state.best_move_guess(tt);
     ccs.parallel_binary_search = args.parallel;
+    ccs.root_tie_high = args.tie_high;
+    ccs.spec_monotone = args.spec_monotone;
 
     if args.sim {
         ccs.network_model
@@ -1932,8 +2023,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         let (rule_rate, rule_known) = explore_rule(&root_rates, &ccs.belief_bounds);
         let use_rule = args.explore_rule || (args.explore_rule_exact && rule_known);
-        let rule = use_rule.then_some(rule_rate);
+        let mut rule = use_rule.then_some(rule_rate);
+        let mut dist_check = None;
+        if args.distilled {
+            assert!(!intervals.strategy.explore_free, "--distilled assumes the default planner");
+            let (rate, ok) = ccs.distilled_rate();
+            if !ok {
+                warn!("t={}: distilled actions {:?} differ from the planner's {:?}", t,
+                      distilled_actions(&ccs.policy.features), ccs.policy.candidate_actions);
+            }
+            dist_check = Some(if ok { "dist-ok" } else { "dist-MISMATCH" });
+            rule = Some(rate);
+        }
+        let use_rule = use_rule || args.distilled;
         let searched = !args.sim_max_rate && root_moves.len() > 1 && !use_rule;
+        let trace = decisions.is_some().then(|| ccs.trace_features());
+        let mut root_values_json = serde_json::Value::Null;
+        let mut optimal_rates: Vec<RealNumRep> = vec![];
         let best_cc_move = if args.sim_max_rate {
             sim_strategy.as_mut().unwrap().get_rate(&ccs)
         } else if !searched {
@@ -1943,30 +2049,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => root_moves.first().cloned(),
             }
         } else {
-            let root = decisions.is_some().then(|| ccs.decision_features());
+            let log_root = decisions.is_some();
             // A fresh table per decision: entries hold alpha-beta bounds as
             // if exact, and values depend on this RTT's policy and root.
             search = minimax::Search::new();
             search.exact_root = args.exact_root;
             let (ret, _, _) = search.best_move(&mut ccs, Some(args.depth.unwrap_or(SEARCH_DEPTH)), None);
-            if let (Some(w), Some(mut root)) = (decisions.as_mut(), root) {
+            if log_root {
                 let rate = |m: &CCMove<NetworkActionNC>| match m {
-                    CCMove::CCA(a) => a.rate.to_f64().unwrap(),
-                    _ => f64::NAN,
+                    CCMove::CCA(a) => a.rate,
+                    _ => panic!("Expecting CCA move"),
                 };
-                root["t"] = t.into();
-                root["chosen_rate"] = rate(ret.as_ref().unwrap()).into();
-                root["root_values"] = search
+                // The root minimizes; a move is optimal unless the best
+                // value is strictly smaller (equal values compare `None`).
+                let best = search
                     .root_values
                     .iter()
-                    .map(|(m, v)| serde_json::json!({"rate": rate(m), "value": v}))
+                    .find(|(m, _)| Some(m) == ret.as_ref())
+                    .map(|(_, v)| *v)
+                    .expect("chosen move has a root value");
+                optimal_rates = search
+                    .root_values
+                    .iter()
+                    .filter(|(_, v)| best.partial_cmp(v) != Some(Ordering::Less))
+                    .map(|(m, _)| rate(m))
                     .collect();
-                use std::io::Write;
-                writeln!(w, "{}", root)?;
-                w.flush()?;
+                root_values_json = search
+                    .root_values
+                    .iter()
+                    .map(|(m, v)| serde_json::json!({"rate": format!("{}", rate(m)), "value": v}))
+                    .collect();
             }
             ret
         };
+        if let (Some(w), Some(mut rec)) = (decisions.as_mut(), trace) {
+            let chosen = match best_cc_move.as_ref().unwrap() {
+                CCMove::CCA(a) => a.rate,
+                _ => panic!("Expecting CCA move"),
+            };
+            if !searched {
+                optimal_rates = vec![chosen];
+            }
+            rec["t"] = t.into();
+            rec["searched"] = searched.into();
+            rec["root_rates"] = root_rates.iter().map(|r| format!("{}", r)).collect();
+            rec["chosen_rate"] = format!("{}", chosen).into();
+            rec["optimal_rates"] = optimal_rates.iter().map(|r| format!("{}", r)).collect();
+            rec["root_values"] = root_values_json;
+            use std::io::Write;
+            writeln!(w, "{}", rec)?;
+            w.flush()?;
+        }
         let rule_check = match (args.check_rule && searched, best_cc_move.as_ref()) {
             (true, Some(CCMove::CCA(a))) => {
                 let verdict = if a.rate == rule_rate { "ok" } else { "MISMATCH" };
@@ -1975,7 +2108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 format!("{}{}", verdict, if rule_known { "-known" } else { "" })
             }
-            _ => "-".to_string(),
+            _ => dist_check.map_or("-".to_string(), str::to_string),
         };
         // The CCA chose a rate; the application decides how much of it is
         // sent.  Only what is sent reaches the link and the QE history.

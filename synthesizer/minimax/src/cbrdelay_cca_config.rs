@@ -475,6 +475,43 @@ pub struct StatePolicy {
     /// Every candidate rate is capped so that the worst-case queue (at
     /// `C = min_c`) stays within this.
     pub queue_cap: Option<RealNumRep>,
+    /// What `state_policy` derived from the belief and its memory on the
+    /// way to `mode` (logged by `--decisions`, read by `--distilled`).
+    pub features: PlannerFeatures,
+}
+
+/// The planner's intermediate quantities for one committed RTT: everything
+/// its mode and candidate set depend on.  Filled in by `state_policy`
+/// before it returns; quantities it never reached keep their defaults.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlannerFeatures {
+    /// The mode at the previous RTT (before this call).
+    pub prev_mode: Mode,
+    /// Observations since the belief (re)started.
+    pub since_start: usize,
+    pub newest_window_feasible: bool,
+    pub k_max: RealNumRep,
+    pub c_tight: bool,
+    pub small_buffer: bool,
+    pub k_unconfirmed: bool,
+    pub cautious: bool,
+    /// RTTs since the last probe (`None`: never probed).
+    pub since_probe: Option<usize>,
+    pub queue_target: RealNumRep,
+    pub drained: bool,
+    pub drain_due: bool,
+    pub drain_gave_up: bool,
+    pub rise_continues: bool,
+    pub rise_due: bool,
+    pub rise_fits: bool,
+    pub rise_lossless: bool,
+    pub explore_cap: RealNumRep,
+    pub queue_high: bool,
+    /// Explore only: a probe is allowed (the probe gap has passed).
+    pub probe_ok: bool,
+    pub probe_gap: usize,
+    /// C tight: `probe_interval_rtts` have passed since the last probe.
+    pub probe_due: bool,
 }
 
 impl Default for StatePolicy {
@@ -492,6 +529,7 @@ impl Default for StatePolicy {
             mode: Mode::Explore,
             queue_target: DRAIN_MAX_Q,
             queue_cap: None,
+            features: PlannerFeatures::default(),
         }
     }
 }
@@ -782,6 +820,18 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     let k_unconfirmed = planner.k.assumed.len() > 1;
     let cautious = small_buffer || k_unconfirmed;
     let since_probe = planner.last_probe.map_or(usize::MAX, |p| t - p);
+    let mut features = PlannerFeatures {
+        prev_mode: planner.mode,
+        since_start,
+        newest_window_feasible: state.newest_window_feasible,
+        k_max,
+        c_tight,
+        small_buffer,
+        k_unconfirmed,
+        cautious,
+        since_probe: planner.last_probe.map(|p| t - p),
+        ..Default::default()
+    };
 
     // Sending well below `min_c` drains any real queue (by at least the
     // margin), so what `max_q` keeps after such RTTs is not a queue the CCA
@@ -867,6 +917,15 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     let rise_lossless = !cautious && rise_fits;
     let rise_interval = if rise_lossless { planner.rise_interval } else { RISE_MAX_INTERVAL_RTTS };
     let rise_due = state.strategy.rise_check && c_tight && !planner.app_limited && t >= planner.rise_last + rise_interval;
+    features.queue_target = queue_target;
+    features.drained = drained;
+    features.drain_due = drain_due;
+    features.drain_gave_up = drain_gave_up;
+    features.rise_continues = rise_continues;
+    features.rise_due = rise_due;
+    features.rise_fits = rise_fits;
+    features.rise_lossless = rise_lossless;
+    features.probe_due = since_probe >= state.probe_interval_rtts;
 
     let mode = if rise_continues {
         Mode::RiseCheck
@@ -906,6 +965,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             mode: Mode::Recover,
             queue_target,
             queue_cap: None,
+            features,
         };
     }
     if !state.newest_window_feasible {
@@ -921,6 +981,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             mode,
             queue_target,
             queue_cap: None,
+            features,
         };
     }
 
@@ -933,6 +994,8 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     // drains (as in `queue_target`), so they do not count against the cap.
     let explore_cap = belief.min_c * state.strategy.explore_queue_bdp + std::cmp::max(planner.queue_floor, k_max);
     let queue_high = belief.max_q > explore_cap;
+    features.explore_cap = explore_cap;
+    features.queue_high = queue_high;
     let mut objective_order = names(OBJECTIVE_ORDER);
     let mut queue_target = queue_target;
     let mut queue_cap = None;
@@ -958,6 +1021,8 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             // again before then would spend its loss budget a second time.
             let probe_gap = if small_buffer { CAUTIOUS_EXPLORE_PROBE_GAP_RTTS } else { EXPLORE_PROBE_GAP_RTTS };
             let probe_ok = since_probe >= probe_gap;
+            features.probe_ok = probe_ok;
+            features.probe_gap = probe_gap;
             // `HoldQueue` (at the cap) rather than `DrainQueue`: idling for
             // a whole RTT teaches nothing about C and cannot drain a floor.
             queue_target = explore_cap;
@@ -989,5 +1054,50 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         mode,
         queue_target,
         queue_cap,
+        features,
     }
+}
+
+/// The distilled CCA (`--distilled`): this RTT's action from the planner's
+/// features alone, with no search.  Fitted to `--decisions --exact-root`
+/// traces (see "Distilled policy" in `CCA_DEVELOPMENT.md`); it must agree
+/// with `state_policy` + depth-4 minimax on every RTT of them.
+///
+/// Returns the actions whose rates the CCA compares; it sends the highest
+/// of their rates (the engine's candidate formulas, with this mode's loss
+/// budget, queue target and cap), labelled by the first action with it.
+/// Only `Explore` below its queue cap offers more than one.
+pub fn distilled_actions(f: &PlannerFeatures) -> Vec<CandidateAction> {
+    use CandidateAction::*;
+    if f.since_start < QE_WINDOW_OBSERVATIONS {
+        return vec![MatchDelivery]; // Recover
+    }
+    if !f.newest_window_feasible {
+        return vec![HoldQueue]; // the link changed under the newest window
+    }
+    if f.rise_continues {
+        return vec![AboveMaxC]; // RiseCheck
+    }
+    let draining = f.prev_mode == Mode::Drain && !f.drained && !f.drain_gave_up;
+    if draining || (f.drain_due && !f.drain_gave_up) {
+        return vec![HoldQueue]; // Drain
+    }
+    if !f.c_tight {
+        // Explore.
+        if f.queue_high {
+            return vec![HoldQueue];
+        }
+        let mut actions = vec![MaxAllowedRate, HoldQueue];
+        if f.probe_ok {
+            actions.push(ProbeAboveLimit);
+        }
+        return actions;
+    }
+    if f.rise_due {
+        return vec![AboveMaxC]; // RiseCheck
+    }
+    if f.probe_due {
+        return vec![ProbeAboveLimit]; // Probe
+    }
+    vec![HoldQueue] // Cruise
 }
