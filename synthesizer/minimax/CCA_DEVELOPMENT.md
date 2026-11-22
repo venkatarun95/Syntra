@@ -477,6 +477,28 @@ gives identical observations (C=100 B=400 stays `[100, 114]`, C=15 B=60
 `[15, 16]`).  Only sending above `min_c`, i.e. the exploration trade-off,
 can narrow it, and there C = `min_c` already.
 
+### Depth 6, and C tightness without a K allowance (Nov 2026)
+
+`C_TIGHT_PER_K` was 1/2: with K = 64 still alive, any belief narrower than
+32 packets/RTT counted as tight, so a depth-6 run on C=20 B=10 K=4 (`min`)
+left Explore at C in [14.68, 20] and cruised below 14.68 (0.55 util).  The
+chained bounds amortize bursts (K/(t1-tau)), so the allowance is now 0.  At
+depth 4 this changed nothing; at depth 6 that link went to 0.70 and C=20
+K=4 random to 0.90.
+
+16 links, 60 RTTs (15 counted):
+
+| search | util | util 0-20 | loss total | loss max | never within 25% | median step |
+| --- | --- | --- | --- | --- | --- | --- |
+| depth 4 | 0.86 | 0.74 | 490 | 150 | 0 | 3.9 s |
+| depth 6 | 0.86 | 0.72 | 232 | 56 | 1 | 22 s (max 373 s) |
+
+Depth 6 sees both sides of a probe, so it declines 2x probes whose loss it
+can now see: half the loss at the same utilization (not reachable by
+lowering the depth-4 budget: 0.5 BDP gave 0.77 util for 254 lost), at the
+cost of slower C convergence on small buffers (C=40 B=20 ends at
+[37.9, 55.6]).
+
 ## Changing links and convergence
 
 `--sim-c-schedule T:C,...` changes the simulated link rate from RTT T on;

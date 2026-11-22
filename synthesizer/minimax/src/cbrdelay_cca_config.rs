@@ -141,7 +141,7 @@ pub const QE_WINDOW_OBSERVATIONS: usize = 7;
 pub const C_TIGHT_RATIO: RealNumRep = RealNumRep::new_raw(5, 4);
 
 /// ... plus this many packets/RTT per unit of the largest assumed K.
-pub const C_TIGHT_PER_K: RealNumRep = RealNumRep::new_raw(1, 2);
+pub const C_TIGHT_PER_K: RealNumRep = RealNumRep::new_raw(0, 1);
 
 /// The buffer counts as small once `max_b < SMALL_BUFFER_BDP * min_c`.
 pub const SMALL_BUFFER_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
