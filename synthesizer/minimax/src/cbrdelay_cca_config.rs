@@ -113,12 +113,19 @@ pub enum CandidateAction {
 /// * `ttscbadd`: minimize RTTs until `min_c + min_b` increases by roughly one
 ///   loss-tolerance unit (allowing QE numerical slack).
 /// * `scb`: prefer `min_c + min_b` not decreasing from its initial value.
+/// * `sent`: maximize the data the CCA sends over the horizon.
 ///
 /// The `tt*` metrics use the end of the current speculative horizon as the
 /// target; if it is not reached, they receive the horizon length as a penalty.
 /// To create a genuinely new objective dimension, add the corresponding
 /// metric to `cc_common::Metrics` and its comparison in `CCValue`.
-pub const OBJECTIVE_ORDER: &[&str] = &["lt", "schadd", "ttscbadd", "scb", "c", "l"];
+///
+/// `sent` comes last: with `SEARCH_DEPTH` 4 every searched decision in a
+/// 16-link sweep was an exact tie on all the others, or preferred the higher
+/// rate (see "Ties" in `CCA_DEVELOPMENT.md`).  Making that preference an
+/// objective gives every decision one optimum instead of a tie broken by the
+/// search's move order.
+pub const OBJECTIVE_ORDER: &[&str] = &["lt", "schadd", "ttscbadd", "scb", "c", "l", "sent"];
 
 /// The number of observations accepted by one generated QE predicate.  Six
 /// transitions need seven observations.  Do not make a QE window shorter than
@@ -146,6 +153,11 @@ pub const SMALL_BUFFER_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 /// while C is loose.  Filling a large buffer adds delay (and makes QE
 /// enumerate many unobserved losses, which is slow).
 pub const EXPLORE_MAX_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(2, 1);
+
+/// An Explore probe's loss budget, in BDPs (`min_c`): the probe is this
+/// much above `MaxAllowedRate`.  Larger converges faster and loses more in
+/// the worst case.
+pub const EXPLORE_BUDGET_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 
 /// RTTs between probes once C is tight.
 pub const PROBE_INTERVAL_RTTS: usize = 10;
@@ -217,6 +229,11 @@ pub struct BeliefStrategy {
     /// While the link stays busy the recent windows keep `max_c` tight, so
     /// this only loosens it once the queue has emptied.
     pub c_upper_rtts: Option<usize>,
+    /// `EXPLORE_BUDGET_BDP` and `EXPLORE_MAX_QUEUE_BDP` (`--explore-budget`,
+    /// `--explore-queue`): the exploration trade-off between convergence
+    /// speed and worst-case loss and queue.
+    pub explore_budget_bdp: RealNumRep,
+    pub explore_queue_bdp: RealNumRep,
 }
 
 impl Default for BeliefStrategy {
@@ -227,13 +244,15 @@ impl Default for BeliefStrategy {
             change_restart: false,
             explore_free: false,
             c_upper_rtts: None,
+            explore_budget_bdp: EXPLORE_BUDGET_BDP,
+            explore_queue_bdp: EXPLORE_MAX_QUEUE_BDP,
         }
     }
 }
 
 /// `explore_free`: the objective once the queue may exceed
 /// `EXPLORE_MAX_QUEUE_BDP`, where the planner would otherwise force a drain.
-pub const EXPLORE_FREE_OBJECTIVE_ORDER: &[&str] = &["lt", "qdel", "schadd", "ttscbadd", "scb", "c", "l"];
+pub const EXPLORE_FREE_OBJECTIVE_ORDER: &[&str] = &["lt", "qdel", "schadd", "ttscbadd", "scb", "c", "l", "sent"];
 
 /// `change_restart`: windows a shadow belief (`KShadow`) must fit before the
 /// CCA concludes that the link changed.
@@ -778,14 +797,14 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         };
     }
 
-    let aggressive_budget = std::cmp::max(belief.min_c, 2.into());
+    let aggressive_budget = std::cmp::max(belief.min_c * state.strategy.explore_budget_bdp, 2.into());
     // While exploring, the worst-case queue is held within one BDP (or the
     // floor): every rate is capped by it, and above it the CCA holds the
     // queue there instead of idling.  The link stays backlogged, which is
     // what bounds C from above.
     // Bursts of up to K are part of the worst-case queue that no rate
     // drains (as in `queue_target`), so they do not count against the cap.
-    let explore_cap = belief.min_c * EXPLORE_MAX_QUEUE_BDP + std::cmp::max(planner.queue_floor, k_max);
+    let explore_cap = belief.min_c * state.strategy.explore_queue_bdp + std::cmp::max(planner.queue_floor, k_max);
     let queue_high = belief.max_q > explore_cap;
     let mut objective_order = names(OBJECTIVE_ORDER);
     let mut queue_target = queue_target;

@@ -109,6 +109,10 @@ pub struct Metrics {
     /// Negative delivered service, so smaller means more data was delivered.
     #[serde(with = "serde_real")]
     pub neg_delivered: RealNumRep,
+    /// Negative data the CCA sent over the horizon (smaller means more).
+    /// Unlike delivery, the adversary does not choose it.
+    #[serde(with = "serde_real")]
+    pub neg_sent: RealNumRep,
     /// Worst queueing delay above the one-RTT baseline; smaller is better.
     #[serde(with = "serde_real")]
     pub qdel: RealNumRep,

@@ -896,6 +896,7 @@ impl<NM: NetworkModel> AdaptiveBitrateState<NM> {
 
         let cca_metrics = cc_common::Metrics {
             neg_delivered: (first.get_s()) - (last.get_s()),
+            neg_sent: first.get_a() - last.get_a(),
             qdel: std::cmp::max(0.into(), (qmax as i32 - 1).into()),
             loss: std::cmp::max(
                 0.into(),

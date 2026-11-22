@@ -96,6 +96,9 @@ pub struct Search<S: State> {
     /// Every root move tried by the last `best_move`, in search order, with
     /// the value the root compared (a bound, where the child was pruned).
     pub root_values: Vec<(S::M, S::V)>,
+    /// Search every root move with a full window, so `root_values` are exact
+    /// (not alpha-beta bounds) and ties can be told apart.  Slower.
+    pub exact_root: bool,
 }
 
 impl<S: State> Search<S> {
@@ -104,6 +107,7 @@ impl<S: State> Search<S> {
             tt: TranspositionTable::new(),
             root_depth: 0,
             root_values: Vec::new(),
+            exact_root: false,
         }
     }
 
@@ -166,8 +170,13 @@ impl<S: State> Search<S> {
             // Recurse
             //state.make_move(&next_move);
             state.make_move_depth(&next_move, depth);
+            let (child_alpha, child_beta) = if self.exact_root && depth == self.root_depth {
+                (S::V::neg_inf(), S::V::inf())
+            } else {
+                (alpha, beta)
+            };
             let new_value =
-                self.deepen_tree(state, depth - 1, alpha, beta, stop_flag.clone(), enable_tt);
+                self.deepen_tree(state, depth - 1, child_alpha, child_beta, stop_flag.clone(), enable_tt);
             state.pop_move();
 
             // We ran out of time. Bail

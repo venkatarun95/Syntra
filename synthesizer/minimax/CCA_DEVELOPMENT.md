@@ -403,6 +403,45 @@ cannot detect such a link.  The K confirmation (`K_CONFIRM_RTTS`) is an
 assumption, not a deduction: on the mixed link it once confirmed K=1 (true
 K=4) and briefly believed C = 6.3 (true 75).
 
+### Ties, objectives and the exploration trade-off (Nov 2026)
+
+`--exact-root` searches every root move with a full window, so the
+`--decisions` values are exact (pruned children otherwise report bounds),
+and `--depth` overrides `SEARCH_DEPTH`.  The transposition table is now
+fresh for every decision: it stores alpha-beta bounds as if exact, and
+values depend on the RTT's policy.
+
+* At depth 4, 164 of 168 searched decisions (16 links) were exact ties on
+  every objective; the other 4 preferred the higher rate (on `c`).  Two
+  RTTs is shorter than both ways a probe pays off or costs: the link can
+  hide C behind up to one RTT of service lag, and a probe's losses are
+  reported about two RTTs later.  So `sent` (data sent over the horizon,
+  which the adversary does not choose) is now the last objective; it agrees
+  with every non-tie and leaves 6 genuine ties (moves whose follow-ups send
+  the same total).  A distilled rule is correct if it picks any optimum.
+* At depth 6 (about 20x slower) the search sees the trade-off: probing at
+  2x `min_c` pins C exactly in the worst case but loses about one BDP, just
+  over the budget, so with `lt` first it declines.  A lexicographic order can
+  only pick an extreme of that trade-off; the loss budget is the real knob.
+* The trade-off (16 links, 60 RTTs; `--explore-budget` in BDPs, queue cap
+  2 BDP):
+
+  | budget | C within 25% (median RTT) | never | util | util RTT 0-20 | loss (sum) |
+  |---|---|---|---|---|---|
+  | 0.25 | 20 | 4 | 0.68 | 0.51 | 55 |
+  | 0.5 | 20 | 1 | 0.77 | 0.59 | 254 |
+  | 1 (default) | 15 | 0 | 0.86 | 0.74 | 489 |
+  | 2 | 11 | 0 | 0.90 | 0.84 | 896 |
+
+  The queue cap (`--explore-queue` 1.5-4) barely matters (loss 469-550).
+  This cannot be avoided: a link at `C = min_c` is indistinguishable from a
+  faster one until the CCA sends more than `min_c` can serve, and on the
+  slow link with a small buffer that excess is lost.
+* An avoidable limit: one QE window (6 transitions, up to one RTT of lag)
+  proves at best `C <= served / (T - 1)`, i.e. within 25%, and the joint
+  fold does not carry the hidden queue between windows, so beliefs such as
+  [10, 12.5] stop there however long the link stays backlogged.
+
 ## Changing links and convergence
 
 `--sim-c-schedule T:C,...` changes the simulated link rate from RTT T on;

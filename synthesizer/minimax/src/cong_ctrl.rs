@@ -26,7 +26,7 @@ use cbrdelay_cca_config::{
     explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
     PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
-    K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
+    EXPLORE_BUDGET_BDP, EXPLORE_MAX_QUEUE_BDP, K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
 };
 
 // ------------------------------------------------------------------------------------------
@@ -142,10 +142,11 @@ impl CCValue {
             .time_to_shrink_minc_minb_add
             .partial_cmp(&m2.time_to_shrink_minc_minb_add);
         let scb = m2.shrink_minc_minb.partial_cmp(&m1.shrink_minc_minb);
+        let sent = m1.neg_sent.partial_cmp(&m2.neg_sent);
 
         let comparisons = [
             c, b, sc, sb, s, ld, l, qdel, schmul, schadd, sclmul, scladd, ttsc, lt, ttc, ttscl,
-            cb, ttcb, ttscbadd, scb,
+            cb, ttcb, ttscbadd, scb, sent,
         ];
         for idx in decode_objective_order(*objective_order) {
             let r = comparisons[idx];
@@ -157,9 +158,9 @@ impl CCValue {
     }
 }
 
-const OBJECTIVE_NAMES: [&str; 20] = [
+const OBJECTIVE_NAMES: [&str; 21] = [
     "c", "b", "sc", "sb", "s", "ld", "l", "qdel", "schmul", "schadd", "sclmul", "scladd", "ttsc", "lt",
-    "ttc", "ttscl", "cb", "ttcb", "ttscbadd", "scb",
+    "ttc", "ttscl", "cb", "ttcb", "ttscbadd", "scb", "sent",
 ];
 
 /// Compact, `Copy` representation required by the generic minimax value API.
@@ -624,6 +625,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 
         Metrics {
             neg_delivered: (first.get_s()) - (last.get_s()),
+            neg_sent: first.get_a() - last.get_a(),
             qdel: std::cmp::max(0.into(), (qmax as i32 - 1).into()),
             loss: std::cmp::max(
                 0.into(),
@@ -1288,6 +1290,13 @@ struct Args {
     /// Let minimax choose (with `qdel`) instead of forcing drains in Explore.
     #[arg(long)]
     explore_free: bool,
+    /// Override `EXPLORE_BUDGET_BDP`: an Explore probe's loss budget, in
+    /// BDPs (`min_c`), e.g. 0.5.
+    #[arg(long)]
+    explore_budget: Option<f64>,
+    /// Override `EXPLORE_MAX_QUEUE_BDP`, e.g. 3.
+    #[arg(long)]
+    explore_queue: Option<f64>,
     /// Only the newest N RTTs bound C from above for the planner.
     #[arg(long)]
     c_upper_rtts: Option<usize>,
@@ -1296,6 +1305,13 @@ struct Args {
     /// compared it.  Used to distil the search into rules.
     #[arg(long)]
     decisions: Option<String>,
+    /// Search every root move with a full alpha-beta window, so the
+    /// `--decisions` root values are exact and ties are real ties.
+    #[arg(long)]
+    exact_root: bool,
+    /// Override `SEARCH_DEPTH` (plies; must be even).
+    #[arg(long)]
+    depth: Option<u16>,
     /// The link is outside this process (e.g. a packet simulator): each RTT
     /// print `rate R` on stdout, then read the RTT's outcome from stdin as
     /// `SENT S APP_LIMITED [ROUND:L ...]`: what was sent, the cumulative
@@ -1457,6 +1473,11 @@ enum SimChoice {
     Alternate,
     Adversary,
     Mixed,
+}
+
+/// A CLI fraction as an exact rational on a 1/64 grid.
+fn frac(x: f64) -> RealNumRep {
+    RealNumRep::new((x * 64.0).round() as RealNumInt, 64)
 }
 
 /// xorshift64*: deterministic simulation randomness without a dependency.
@@ -1663,6 +1684,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             change_restart: args.change_restart,
             explore_free: args.explore_free,
             c_upper_rtts: args.c_upper_rtts,
+            explore_budget_bdp: args.explore_budget.map_or(EXPLORE_BUDGET_BDP, frac),
+            explore_queue_bdp: args.explore_queue.map_or(EXPLORE_MAX_QUEUE_BDP, frac),
         },
     };
 
@@ -1749,7 +1772,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             let root = decisions.is_some().then(|| ccs.decision_features());
-            let (ret, _, _) = search.best_move(&mut ccs, Some(SEARCH_DEPTH), None);
+            // A fresh table per decision: entries hold alpha-beta bounds as
+            // if exact, and values depend on this RTT's policy and root.
+            search = minimax::Search::new();
+            search.exact_root = args.exact_root;
+            let (ret, _, _) = search.best_move(&mut ccs, Some(args.depth.unwrap_or(SEARCH_DEPTH)), None);
             if let (Some(w), Some(mut root)) = (decisions.as_mut(), root) {
                 let rate = |m: &CCMove<NetworkActionNC>| match m {
                     CCMove::CCA(a) => a.rate.to_f64().unwrap(),
@@ -2061,6 +2088,7 @@ mod tests {
             loss: 0.into(),
             qdel: 0.into(),
             neg_delivered: 0.into(),
+            neg_sent: 0.into(),
             shrink_c: true,
             shrink_b: true,
             shrink_maxc_mul: true,
