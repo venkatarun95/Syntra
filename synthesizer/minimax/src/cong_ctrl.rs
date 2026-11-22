@@ -1277,15 +1277,33 @@ impl CongCtrlState<NetworkModelNC> {
         self.planner = planner;
     }
 
+    /// How many network replies the model offers to sending `rate` now
+    /// (the first ply of the search below that root move).
+    fn root_replies(&mut self, rate: RealNumRep) -> usize {
+        self.make_move(&CCMove::CCA(CCAAction { rate }));
+        let n = self.move_choices_network_stack.last().map_or(0, |m| m.len());
+        self.pop_move();
+        n
+    }
+
     /// `--distilled`: the highest rate among `distilled_actions`, computed
-    /// with the planner's formulas and parameters for this RTT, and whether
-    /// those actions are exactly the planner's candidate set.
-    fn distilled_rate(&self) -> (RealNumRep, bool) {
+    /// with the planner's formulas and parameters for this RTT, skipping a
+    /// rate to which the model has no network reply at all (unless every
+    /// rate is such), and whether those actions are exactly the planner's
+    /// candidate set.
+    fn distilled_rate(&mut self) -> (RealNumRep, bool) {
         let actions = distilled_actions(&self.policy.features);
         let ok = actions == self.policy.candidate_actions;
         let (rates, _) = self.candidate_rates_for(&actions);
-        let rate = rates.iter().map(|(_, r)| *r).max().expect("no distilled action has a rate");
-        (rate, ok)
+        let mut rates: Vec<RealNumRep> = rates.iter().map(|(_, r)| *r).unique().collect();
+        rates.sort();
+        if rates.len() > 1 {
+            let answered: Vec<RealNumRep> = rates.iter().copied().filter(|r| self.root_replies(*r) > 0).collect();
+            if !answered.is_empty() {
+                rates = answered;
+            }
+        }
+        (*rates.last().expect("no distilled action has a rate"), ok)
     }
 
     /// `--decisions`: everything the CCA knows before deciding this RTT,
@@ -2037,7 +2055,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let use_rule = use_rule || args.distilled;
         let searched = !args.sim_max_rate && root_moves.len() > 1 && !use_rule;
-        let trace = decisions.is_some().then(|| ccs.trace_features());
+        let trace = decisions.is_some().then(|| {
+            let mut rec = ccs.trace_features();
+            let replies: Vec<serde_json::Value> = if root_rates.len() > 1 {
+                root_rates.iter().map(|r| serde_json::json!([format!("{}", r), ccs.root_replies(*r)])).collect()
+            } else {
+                vec![]
+            };
+            rec["root_replies"] = replies.into();
+            rec
+        });
         let mut root_values_json = serde_json::Value::Null;
         let mut optimal_rates: Vec<RealNumRep> = vec![];
         let best_cc_move = if args.sim_max_rate {
