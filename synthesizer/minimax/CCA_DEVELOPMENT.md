@@ -960,6 +960,49 @@ observations and is always intersected with the previous committed belief
 change was checked when it was newer; the K tracker still accumulates every
 window).  With N = 64 the 7 held-out links give identical traces.
 
+## In cc_sim (Nov 2026)
+
+cc_sim (`~/Projects/cc_sim`, branch `minimax-qe`, `src/minimax_qe.rs`, CCA `"mmqe"`) runs this
+CCA itself over packet-level links: it drives `cbrdelay-cca --external --external-json
+--distilled --history-window 64` and only converts packets to the model's per-round
+observations and back.  Engine side:
+
+* `--external-json` prints each RTT's decision record after the rate (`rate R {...}`): belief,
+  planner memory and features, candidates, mode, `rule`, restarts.
+* Observation lines take exact fractions (`n/d`); a line ending in `replay` is a round replayed
+  to a fresh engine (after a change of units), and what was sent counts as the CCA's own action,
+  so the planner's memory follows what happened.
+* `window_check` (`network_model_nc/examples`) reads fractions too.
+
+What the packet-level link taught (each made the belief restart on a constant link, i.e. the
+observations did not fit the model):
+
+* **Boundary losses.**  cc_sim's propagation delay is before the bottleneck, so a packet sent at
+  the start of a round reaches the queue at the boundary of QE time.  If the previous round left
+  the queue full, the link drops it although the new round sends less than C.  The model checks
+  overflow only at the end of a round, where a round that sends less than C cannot overflow, so
+  it needs K >= 6 packets to explain one such loss (the next round's losses then need 56 packets
+  of service in a round of C = 50).  cc_sim now paces a round's packets at `(k+1)/(quota+1)` of
+  the round: the first one arrives a gap after the boundary, after the busy link has finished a
+  packet.
+* **Pacing gaps.**  A round boundary computed in floating point could fall a hair after the
+  timer meant to end the round, which skipped a round; the pacer then sent the next round's
+  quota as a burst (a BDP at once).  Boundaries are now whole microseconds.
+* **Units.**  The prior is 5 to 1000 units per round; cc_sim keeps C inside it by choosing the
+  unit (`2^u` packets, never below one packet: a packet is indivisible) and the round (`2^m`
+  RTTs, for links below about 10 packets per RTT).  The K hypotheses are physical (1, 4, 16, 64
+  packets) and are passed in units, rounded up.  Rescaling is only approximately scale-invariant:
+  the 1/1024 rounding grid and the one-unit constants (`DRAIN_MAX_Q`, `CAUTIOUS_LOSS_BUDGET`, the
+  one-packet probe) are in units, so after a rescale a decision can differ (on 1 Gbit/s, C was
+  just tight at [4000, 4984] packets and just loose at [3999, 5016] after the replay).
+
+From 1 kbit/s to 100 Gbit/s: below about 10 packets per RTT the rounds get long (1 kbit/s with
+1500-byte packets is a packet every 12 s, so the handshake RTT itself is 12 s and rounds are
+minutes), and cc_sim's clock (1 us) cannot pace more than a packet per microsecond, so
+100 Gbit/s needs packets of 12.5 kB or more.
+
+Report: `reports/2026-11-22-cc-sim/`.
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in

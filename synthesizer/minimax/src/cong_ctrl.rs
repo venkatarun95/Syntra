@@ -1653,6 +1653,11 @@ struct Args {
     /// `DRAIN_INTERVAL_RTTS`, forced by a drain).
     #[arg(long)]
     report_queue: bool,
+    /// `--external`: print `rate R J` instead, where J is this RTT's decision
+    /// record as one JSON object (as `--decisions` logs it: belief, planner
+    /// memory and features, mode, candidates, the chosen rate and `rule`).
+    #[arg(long)]
+    external_json: bool,
     /// `--external`: append every line read from stdin to this file (replay it with
     /// `network_model_nc/examples/window_check.rs`).
     #[arg(long)]
@@ -1716,11 +1721,21 @@ struct ExternalObs {
     s: RealNumRep,
     app_limited: bool,
     losses: Vec<(i64, RealNumRep)>,
+    /// The line ends with `replay`: an RTT replayed to a fresh CCA (e.g. in
+    /// new units).  What was sent is taken as the CCA's own action, so the
+    /// planner's memory follows what happened, not this CCA's choice.
+    replay: bool,
 }
 
-/// Values arrive as decimals; the QE evaluators need small denominators, so
-/// round to the 1/16 grid the link simulator also uses.
+/// Values arrive as exact fractions `N/D`, or as decimals, which the QE
+/// evaluators need on a small grid: rounded to the 1/16 grid the link
+/// simulator also uses.
 fn parse_real(x: &str) -> Result<RealNumRep, String> {
+    if let Some((n, d)) = x.split_once('/') {
+        let n: RealNumInt = n.parse().map_err(|e| format!("{x}: {e}"))?;
+        let d: RealNumInt = d.parse().map_err(|e| format!("{x}: {e}"))?;
+        return Ok(RealNumRep::new(n, d));
+    }
     let v: f64 = x.parse().map_err(|e| format!("{x}: {e}"))?;
     Ok(RealNumRep::new((v * 16.).round() as RealNumInt, 16))
 }
@@ -1731,13 +1746,19 @@ fn parse_external(line: &str) -> Result<ExternalObs, String> {
     let sent = parse_real(next()?)?;
     let s = parse_real(next()?)?;
     let app_limited = next()? == "1";
+    let mut replay = false;
     let losses = it
+        .filter(|part| {
+            let r = *part == "replay";
+            replay |= r;
+            !r
+        })
         .map(|part| {
             let (r, l) = part.split_once(':').ok_or(format!("{part}: expected ROUND:L"))?;
             Ok((r.parse::<i64>().map_err(|e| format!("{part}: {e}"))?, parse_real(l)?))
         })
         .collect::<Result<_, String>>()?;
-    Ok(ExternalObs { sent, s, app_limited, losses })
+    Ok(ExternalObs { sent, s, app_limited, losses, replay })
 }
 
 /// `--sim-c-schedule`: (from RTT, link rate) pairs.
@@ -2199,6 +2220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let use_rule = use_rule || (args.distilled && rule.is_some());
         let searched = !args.sim_max_rate && root_moves.len() > 1 && !use_rule;
         let trace = decisions.is_some().then(|| ccs.trace_features());
+        let trace_ext = (args.external && args.external_json).then(|| ccs.trace_features());
         let mut root_values_json = serde_json::Value::Null;
         let mut optimal_rates: Vec<RealNumRep> = vec![];
         let best_cc_move = if args.sim_max_rate {
@@ -2280,7 +2302,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let external = if args.external {
             use std::io::{BufRead, Write};
             let mut out = std::io::stdout().lock();
-            if args.report_queue {
+            if let Some(mut rec) = trace_ext {
+                rec["t"] = t.into();
+                rec["chosen_rate"] = format!("{}", intended).into();
+                rec["rule"] = rule_check.clone().into();
+                rec["restarts"] = ccs.planner.restarts.into();
+                rec["min_rtt_sample"] = ccs.planner.min_rtt_sample.into();
+                writeln!(out, "rate {} {}", intended.to_f64().unwrap(), rec)?;
+            } else if args.report_queue {
                 writeln!(
                     out,
                     "rate {} maxq {} min_rtt_sample {}",
@@ -2314,7 +2343,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(obs) if !obs.app_limited => intended,
             _ => sent,
         };
-        ccs.record_cca_move(best_cc_move.as_ref().unwrap(), planner_sent);
+        match &external {
+            Some(obs) if obs.replay => ccs.record_cca_move(&CCMove::CCA(CCAAction { rate: sent }), sent),
+            _ => ccs.record_cca_move(best_cc_move.as_ref().unwrap(), planner_sent),
+        }
         let best_cc_move = Some(CCMove::CCA(CCAAction { rate: sent }));
 
         if args.tree {

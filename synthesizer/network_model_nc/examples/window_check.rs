@@ -10,6 +10,9 @@ use num_traits::ToPrimitive;
 use std::sync::Arc;
 
 fn real(x: &str) -> RealNumRep {
+    if let Some((n, d)) = x.split_once('/') {
+        return RealNumRep::new(n.parse().unwrap(), d.parse().unwrap());
+    }
     let v: f64 = x.parse().unwrap();
     RealNumRep::new((v * 16.).round() as RealNumInt, 16)
 }
