@@ -728,13 +728,18 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         // when only `DrainQueue` is allowed.
         let max_allowed_rate = if needs_max_rate {
             let rh = self.get_relevant_history(Some(QE_WINDOW_OBSERVATIONS));
-            self.network_model.compute_max_allowed_rate(
-                &rh,
-                &self.move_cca,
-                0.into(),
-                self.policy.delay_tolerance_frac,
-                1,
-            )
+            self.network_model
+                .compute_max_allowed_rate(&rh, &self.move_cca, 0.into(), self.policy.delay_tolerance_frac, 1)
+                // The model minimizes `c + b - max_q` over sampled (C, B) of
+                // the newest window, which can miss the worst case (lowest C
+                // and B); the belief cannot.  For any feasible link,
+                // `c + b - q >= min_cb - max_q`, and `>= c >= min_c` since
+                // the queue never exceeds the buffer.
+                .map(|r| {
+                    let min_cb = std::cmp::max(belief_bounds.min_cb, belief_bounds.min_c + belief_bounds.min_b);
+                    let safe = std::cmp::max(min_cb - belief_bounds.max_q, belief_bounds.min_c);
+                    std::cmp::min(r, safe)
+                })
         } else {
             None
         };
@@ -754,6 +759,12 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                     CandidateAction::ProbeAboveLimit => {
                         max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
                     }
+                };
+                // Keep the worst-case queue within the cap: at C = min_c the
+                // queue grows by `rate - min_c`.
+                let rate = match self.policy.queue_cap {
+                    Some(cap) => std::cmp::min(rate, std::cmp::max(0.into(), min_c + cap - max_q)),
+                    None => rate,
                 };
                 (*candidate, rate)
             })
@@ -812,7 +823,10 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         // Until the first explainable window, the committed belief stands in.
         let mut bounds: Option<BeliefBounds> = None;
         let mut conflicts = 0;
+        // The windows that contributed, for the joint (C, B) bound below.
+        let mut used: Vec<(&[NM::O], &Option<CCAAction>)> = vec![];
         for (idx, window) in history.windows(QE_WINDOW_OBSERVATIONS).enumerate() {
+            let action = if idx + 1 == window_count { &self.move_cca } else { &None };
             let Some(next) = window_bounds(idx, window) else {
                 if !lenient {
                     return Err(InconsistentQeWindows {
@@ -826,6 +840,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 conflicts += 1;
                 continue;
             };
+            used.push((window, action));
             if bounds.is_none() {
                 bounds = Some(next);
                 continue;
@@ -863,6 +878,29 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 bounds.max_q = next.max_q;
                 bounds.min_if = next.min_if;
                 bounds.max_if = next.max_if;
+            }
+        }
+        // One (C, B) must explain every window, which the per-window
+        // intersection above does not require.  This is still exact (no
+        // window is ever dropped for being slow), and the network model
+        // caches the committed prefix.
+        if let Some(acc) = bounds.as_mut() {
+            match self.network_model.joint_c_b_bounds(&used) {
+                Some(Some(joint)) => {
+                    let crossed = intersect_c_b(acc, &joint);
+                    debug_assert!(!crossed || conflicts > 0, "joint bound outside the per-window bounds");
+                }
+                Some(None) if !lenient => {
+                    return Err(InconsistentQeWindows {
+                        history_observations: history.len(),
+                        window_index: window_count - 1,
+                        accumulated: *acc,
+                        next_window: *acc,
+                        infeasible: false,
+                    });
+                }
+                Some(None) => conflicts += 1,
+                None => {}
             }
         }
         Ok((bounds.unwrap_or(self.belief_bounds), conflicts))
@@ -1131,6 +1169,8 @@ fn intersect_c_b(acc: &mut BeliefBounds, next: &BeliefBounds) -> bool {
     } else {
         crossed = true;
     }
+    // Each is a lower bound on the same link's C + B.
+    acc.min_cb = std::cmp::max(acc.min_cb, next.min_cb);
     let min_b = std::cmp::max(acc.min_b, next.min_b);
     let max_b = std::cmp::min(acc.max_b, next.max_b);
     if min_b <= max_b {

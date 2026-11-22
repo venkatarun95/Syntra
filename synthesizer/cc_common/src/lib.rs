@@ -45,6 +45,11 @@ pub struct BeliefBounds {
     pub min_if: RealNumRep, // inflight
     #[serde(with = "serde_real")]
     pub max_if: RealNumRep,
+    /// A lower bound on `C + B` for one link that explains the history,
+    /// which can exceed `min_c + min_b` (e.g. a loss pins `C + B`).
+    /// Ignore it where it is below `min_c + min_b`.
+    #[serde(skip_serializing)]
+    pub min_cb: RealNumRep,
     // #[serde(skip_serializing)]
     // pub paths: Vec<(RealNumRep, RealNumRep)>
 }
@@ -70,6 +75,7 @@ impl Default for BeliefBounds {
             max_q: LARGEST_BW.into(),
             min_if: 0.into(),
             max_if: LARGEST_BW.into(),
+            min_cb: 0.into(),
         }
         // TODO: check if we want to use different values for buffer/queue/inflight.
     }
@@ -198,6 +204,19 @@ pub trait NetworkModel: Debug + Sized {
         move_cca: &Option<CCAAction>,
     ) -> Option<BeliefBounds> {
         Some(self.compute_belief_bounds(relevant_history, move_cca))
+    }
+
+    /// Bounds on the persistent parameters C and B (the other fields are
+    /// unset) under which *one* (C, B) explains every window: for each C,
+    /// B must be in every window's B set.  Tighter than intersecting each
+    /// window's bounds, which lets C and B vary between windows.  `None`
+    /// if the model does not support it; `Some(None)` if no (C, B) explains
+    /// all the windows.  Each window's outstanding action is given.
+    fn joint_c_b_bounds(
+        &self,
+        _windows: &[(&[Self::O], &Option<CCAAction>)],
+    ) -> Option<Option<BeliefBounds>> {
+        None
     }
 
     fn get_network_move_sim(

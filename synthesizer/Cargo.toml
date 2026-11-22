@@ -10,3 +10,8 @@ members = [
     "ds"
 , "abr_common", "network_model_c"]
 resolver = "2"
+
+# Exact arithmetic is `Ratio<i32>`: an overflow must stop the run, not wrap
+# silently and corrupt the history (and every belief after it).
+[profile.release]
+overflow-checks = true

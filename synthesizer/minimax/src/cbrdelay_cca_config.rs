@@ -139,14 +139,20 @@ pub const C_TIGHT_PER_K: RealNumRep = RealNumRep::new_raw(1, 2);
 /// The buffer counts as small once `max_b < SMALL_BUFFER_BDP * min_c`.
 pub const SMALL_BUFFER_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 
-/// While exploring, drain once the queue may exceed this many BDPs
-/// (`max_q > EXPLORE_MAX_QUEUE_BDP * min_c`).  Learning C needs only a brief
-/// queue; filling a large buffer adds delay (and makes QE enumerate many
-/// unobserved losses, which is slow).
-pub const EXPLORE_MAX_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
+/// While exploring, every rate keeps the worst-case queue within this many
+/// BDPs (`EXPLORE_MAX_QUEUE_BDP * min_c`), and above it the CCA holds the
+/// queue there.  At `C = min_c` the delay box alone can hold one BDP, so
+/// two leave one BDP to grow into: the rate can roughly double per RTT
+/// while C is loose.  Filling a large buffer adds delay (and makes QE
+/// enumerate many unobserved losses, which is slow).
+pub const EXPLORE_MAX_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(2, 1);
 
 /// RTTs between probes once C is tight.
 pub const PROBE_INTERVAL_RTTS: usize = 10;
+
+/// RTTs between probes while C is loose: a probe's losses are observable
+/// about two RTTs after it is sent.
+pub const EXPLORE_PROBE_GAP_RTTS: usize = 2;
 
 /// RTTs between probes while C is still loose but the CCA is cautious.
 pub const CAUTIOUS_EXPLORE_PROBE_GAP_RTTS: usize = 4;
@@ -159,6 +165,14 @@ pub const DRAIN_INTERVAL_RTTS: usize = 40;
 /// for the largest assumed K: with bursts of up to K the queue cannot be
 /// proven any smaller.
 pub const DRAIN_MAX_Q: RealNumRep = RealNumRep::new_raw(1, 1);
+
+/// RTTs in which the CCA sent at most `min_c` that `PlannerState::queue_floor`
+/// is the smallest `max_q` of.
+pub const QUEUE_FLOOR_RTTS: usize = 3;
+
+/// An RTT counts towards the queue floor if the CCA sent at least this
+/// fraction of `min_c` (and one packet) below `min_c`.
+pub const QUIET_MARGIN: RealNumRep = RealNumRep::new_raw(1, 8);
 
 /// Give up a drain that has not been proven complete after this many RTTs.
 pub const MAX_DRAIN_RTTS: usize = 3;
@@ -352,6 +366,16 @@ pub struct PlannerState {
     pub k: KTracker,
     /// Index of the first observation the belief uses (`change_restart`).
     pub belief_start: usize,
+    /// The part of `max_q` the sender has shown it cannot drain (bursts
+    /// held back, unreported losses, delay-box ambiguity): the smallest
+    /// `max_q` over the last `QUEUE_FLOOR_RTTS` RTTs in which the CCA sent
+    /// at most `min_c` less `QUIET_MARGIN`, which drain any real queue.  Re-tested at
+    /// every periodic drain.
+    pub queue_floor: RealNumRep,
+    /// `max_q` after each of those recent RTTs.
+    pub quiet_max_q: std::collections::VecDeque<RealNumRep>,
+    /// What was sent in the last RTT.
+    pub last_sent: RealNumRep,
     /// Times the belief was restarted because the link changed.
     pub restarts: usize,
 }
@@ -374,6 +398,9 @@ pub struct StatePolicy {
     pub mode: Mode,
     /// Queue `HoldQueue` aims for.
     pub queue_target: RealNumRep,
+    /// Every candidate rate is capped so that the worst-case queue (at
+    /// `C = min_c`) stays within this.
+    pub queue_cap: Option<RealNumRep>,
 }
 
 impl Default for StatePolicy {
@@ -390,6 +417,7 @@ impl Default for StatePolicy {
             ],
             mode: Mode::Explore,
             queue_target: DRAIN_MAX_Q,
+            queue_cap: None,
         }
     }
 }
@@ -398,10 +426,11 @@ fn names(objectives: &[&str]) -> Vec<String> {
     objectives.iter().map(|name| (*name).to_string()).collect()
 }
 
-/// `update_k`: windows computed independently may disagree by QE's
-/// discretization slack; only a larger gap between their C or B bounds
-/// rules a K out.
-pub const K_WINDOW_DISAGREEMENT_TOL: RealNumRep = RealNumRep::new_raw(1, 1);
+/// `update_k`: how far two windows' C or B bounds may miss each other
+/// before a K is ruled out.  Zero: each window's bounds are an exact
+/// projection rounded outward (`network_model_nc::exact`), so under the true
+/// K they always overlap.
+pub const K_WINDOW_DISAGREEMENT_TOL: RealNumRep = RealNumRep::new_raw(0, 1);
 
 /// Intersect a window's C/B bounds into `acc`, within
 /// `K_WINDOW_DISAGREEMENT_TOL` (QE slack); `None` if they disagree by more.
@@ -617,6 +646,7 @@ pub fn record_action(
     sent: RealNumRep,
 ) {
     planner.app_limited = sent + APP_LIMITED_SLACK < intended;
+    planner.last_sent = sent;
     let probed = planner.mode == Mode::Probe || action == Some(CandidateAction::ProbeAboveLimit);
     if probed && !planner.app_limited {
         planner.last_probe = Some(timestep);
@@ -662,6 +692,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         }
     }
     let t = state.timestep;
+    let prev_min_c = planner.last_min_c;
     planner.last_min_c = belief.min_c;
 
     let k_max: RealNumRep = match K_POLICY {
@@ -678,7 +709,30 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     let cautious = small_buffer || k_unconfirmed;
     let since_probe = planner.last_probe.map_or(usize::MAX, |p| t - p);
 
-    let drained = belief.max_q <= DRAIN_MAX_Q + k_max;
+    // Sending well below `min_c` drains any real queue (by at least the
+    // margin), so what `max_q` keeps after such RTTs is not a queue the CCA
+    // can drain.  Sending exactly `min_c` would not do: at `C = min_c` a
+    // standing queue would stay, and count as a floor.
+    let base_target = DRAIN_MAX_Q + k_max;
+    let margin = std::cmp::max(prev_min_c * QUIET_MARGIN, 1.into());
+    if planner.last_sent + margin <= prev_min_c {
+        planner.quiet_max_q.push_back(belief.max_q);
+        if planner.quiet_max_q.len() > QUEUE_FLOOR_RTTS {
+            planner.quiet_max_q.pop_front();
+        }
+    }
+    let floor = if planner.quiet_max_q.len() >= QUEUE_FLOOR_RTTS {
+        planner.quiet_max_q.iter().copied().min().unwrap()
+    } else {
+        0.into()
+    };
+    if floor > base_target && floor > planner.queue_floor {
+        info!("t={}: max_q does not drain below {}; holding it as the queue floor", t, floor);
+    }
+    planner.queue_floor = floor;
+    let queue_target = std::cmp::max(base_target, planner.queue_floor);
+
+    let drained = belief.max_q <= queue_target;
     if drained {
         planner.last_drained = t;
     }
@@ -686,6 +740,10 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         planner.drain_started = t;
     }
     let drain_due = t >= planner.last_drained + state.drain_interval_rtts;
+    if drain_due && planner.mode != Mode::Drain {
+        // Re-test the floor: the link may have released what it held.
+        planner.quiet_max_q.clear();
+    }
     let drain_gave_up = planner.mode == Mode::Drain && t >= planner.drain_started + MAX_DRAIN_RTTS;
     if drain_gave_up {
         warn!("t={}: drain not proven after {} RTTs (max_q={})", t, MAX_DRAIN_RTTS, belief.max_q);
@@ -713,15 +771,25 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             loss_tolerance_abs: CAUTIOUS_LOSS_BUDGET,
             delay_tolerance_frac: 3.into(),
             objective_order: names(OBJECTIVE_ORDER),
-            candidate_actions: vec![CandidateAction::DrainQueue],
+            candidate_actions: vec![CandidateAction::HoldQueue],
             mode,
-            queue_target: DRAIN_MAX_Q + k_max,
+            queue_target,
+            queue_cap: None,
         };
     }
 
     let aggressive_budget = std::cmp::max(belief.min_c, 2.into());
-    let queue_high = belief.max_q > belief.min_c * EXPLORE_MAX_QUEUE_BDP;
+    // While exploring, the worst-case queue is held within one BDP (or the
+    // floor): every rate is capped by it, and above it the CCA holds the
+    // queue there instead of idling.  The link stays backlogged, which is
+    // what bounds C from above.
+    // Bursts of up to K are part of the worst-case queue that no rate
+    // drains (as in `queue_target`), so they do not count against the cap.
+    let explore_cap = belief.min_c * EXPLORE_MAX_QUEUE_BDP + std::cmp::max(planner.queue_floor, k_max);
+    let queue_high = belief.max_q > explore_cap;
     let mut objective_order = names(OBJECTIVE_ORDER);
+    let mut queue_target = queue_target;
+    let mut queue_cap = None;
     let (candidate_actions, loss_tolerance_abs) = match mode {
         Mode::Explore if queue_high && state.strategy.explore_free => {
             objective_order = names(EXPLORE_FREE_OBJECTIVE_ORDER);
@@ -732,12 +800,22 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             ];
             (actions, CAUTIOUS_LOSS_BUDGET)
         }
-        Mode::Explore if queue_high => (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET),
+        Mode::Explore if queue_high => {
+            queue_target = explore_cap;
+            (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET)
+        }
         Mode::Explore => {
+            queue_cap = Some(explore_cap);
             // Capturing bandwidth fast matters most while C is loose; only
             // a buffer proven small makes the CCA ration its probes.
-            let probe_ok = !small_buffer || since_probe >= CAUTIOUS_EXPLORE_PROBE_GAP_RTTS;
-            let mut actions = vec![CandidateAction::MaxAllowedRate, CandidateAction::DrainQueue];
+            // A probe's losses are reported about two RTTs later; probing
+            // again before then would spend its loss budget a second time.
+            let probe_gap = if small_buffer { CAUTIOUS_EXPLORE_PROBE_GAP_RTTS } else { EXPLORE_PROBE_GAP_RTTS };
+            let probe_ok = since_probe >= probe_gap;
+            // `HoldQueue` (at the cap) rather than `DrainQueue`: idling for
+            // a whole RTT teaches nothing about C and cannot drain a floor.
+            queue_target = explore_cap;
+            let mut actions = vec![CandidateAction::MaxAllowedRate, CandidateAction::HoldQueue];
             if probe_ok {
                 actions.push(CandidateAction::ProbeAboveLimit);
             }
@@ -749,7 +827,9 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             (vec![CandidateAction::ProbeAboveLimit], budget)
         }
         Mode::Cruise => (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET),
-        Mode::Drain => (vec![CandidateAction::DrainQueue], CAUTIOUS_LOSS_BUDGET),
+        // `HoldQueue` at the queue target: `DrainQueue` unless a floor is
+        // known, in which case draining below it would only idle the link.
+        Mode::Drain => (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET),
     };
 
     StatePolicy {
@@ -759,6 +839,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         objective_order,
         candidate_actions,
         mode,
-        queue_target: DRAIN_MAX_Q + k_max,
+        queue_target,
+        queue_cap,
     }
 }

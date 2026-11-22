@@ -126,26 +126,51 @@ selects which generated QE evaluator the unchanged `NetworkModelNC` uses:
 Its lookups return `None` for an unsolved (T, losses) key instead of
 panicking, which is what makes partial QE results usable.
 
-### Unfinished QE queries for C
+### Exact beliefs: B with C symbolic
 
-The bursty C query did not finish at T=6, and at T=5 only one loss count
-finished.  When the C lookup for a window is missing, `NetworkModelNC::compute_c`
-intersects every constraint on C that *was* solved:
+Each window's belief is the *exact* projection of its feasible (C, B) set,
+not a grid search.  The generated B functions are linear in C (and B) for
+concrete observations, so `scripts/gen_b_lin.py` copies them into
+`network_model_nc/src/generated/b_lin_*.rs` with C of type `ds::lin::Lin`
+(`k + c*C`, `i128` rationals).  A comparison of two `Lin` values is answered
+on the current *cell* of C (an open interval or a point); if its sign
+changes inside the cell, the root is recorded and the cell is split
+(`network_model_nc::exact::pieces`).  When no split remains, every cell's
+result is exact: a list of pieces, each a cell of C with B's interval list
+linear in C.  From the pieces:
 
-1. C from shorter sub-windows, largest T first (T=5, then T=4, ...), over every
-   sub-window whose loss count has a result.
-2. `c_from_b`: the clauses of this window's (solved) B query that constrain C
-   without mentioning B.  The transpiler emits these as `COMPUTE_C_FROM_B`.
-3. Numerical elimination of B: C is feasible for the window iff its B interval
-   is non-empty, so `tighten_c_with_b` bisects for that range on a 1/16 grid.
-   Like `my_min`/`my_max`, it assumes the feasible C set is one interval.
+* the feasible C set (`exact::c_set`) and B range (`exact::b_range`),
+* `min_cb`, the smallest C + B of one feasible link (a loss pins C + B, so
+  this beats `min_c + min_b`),
+* the joint (C, B) set of several windows (`exact::intersect`): one link must
+  explain every window.  `fold_belief_windows` intersects all windows of the
+  history this way (`NetworkModel::joint_c_b_bounds`), on top of the
+  per-window boxes; committed prefixes are cached, so this costs nothing
+  measurable.  It does *not* enforce continuity of the hidden queue between
+  overlapping windows; only a longer QE would.
 
-Step 3 is what the unfinished QE query would have done symbolically; for
-concrete observations it is a 1-D search.  The test
-`test_c_tightened_with_b_matches_exact` hides the plain model's T=6 C and
-checks that this recovers the exact T=6 C to within the grid, even with no
-sub-window results at all.  Steps 2-3 also keep every C passed to the T=6
-B/Q/S/L functions feasible; those functions `assert!` that C is feasible.
+The B formulas' clauses that do not mention B (on C or on the observations
+alone) become "no B here" (`None`), not panics.  With the plain T=6 C query
+hidden, the projection reproduces the QE's C exactly on every simulated
+window (`test_c_tightened_with_b_matches_exact`); under the true K, per-window
+and joint beliefs contain the true C, B and C + B with zero tolerance
+(`test_forward_sim_*`), so `K_WINDOW_DISAGREEMENT_TOL` is 0.
+
+Bounds are rounded *outward* to dyadic rationals (denominator a power of two
+up to 1024): `RealNumRep` is `Ratio<i32>`, and mixing denominators (e.g. 3
+and 1024) in cumulative arrivals overflowed.  Release builds now have
+`overflow-checks = true`, so an overflow stops the run instead of silently
+corrupting the history.  Points at which the concrete QE functions are
+evaluated (`exact::representatives`) may be exact non-dyadic values with
+modest denominators.
+
+`MaxAllowedRate` from sampled (C, B) paths can miss the worst case (it once
+returned `LARGEST_BW`), so the engine clamps it to the belief's sound bound
+`max(min_c, min_cb - max_q)`.
+
+When a window's C query is missing (the bursty T=6 C query did not finish),
+`compute_c` intersects C from shorter sub-windows (where solved) with the
+exact projection.
 
 Regenerate the bursty crate from all bursty results with
 `sh qe/scripts/transpile_bursty.sh` (see the `qe` README).
@@ -245,10 +270,12 @@ beliefs never exclude the truth (`test_forward_sim_true_k_*`).  They found:
   uses `A` rather than `P` and has no K), i.e. a plain bound.  `BurstyQe::c`
   ignores it (`BURSTY_C_RESOLVED`) until it is re-solved.
 * The feasible C set of a window can be several islands, some a single point
-  (a backlogged link serves exactly C).  `tighten_c_with_b` therefore takes the
-  hull of the feasible `c_candidates` (grid plus observed and K-shifted rates)
-  and `compute_belief_bounds` samples B at those rates too.  This is still a
-  numerical search, not an exact projection.
+  (a backlogged link serves exactly C).  The grid search that used to find it
+  could miss islands and rounded inward, so it is replaced by the exact
+  projection above.
+* Under a union of K, a (C, B) can fit no K: Q, S and L are then the empty
+  set (`infeasible_is_empty`, `UnionBurstyQe::union`), that adversary path is
+  dropped, and a network node with no feasible move is scored as a leaf.
 * The QE-window simulator (`get_network_move_sim_policy`) chooses each service
   from the newest window alone, whose initial queue is free, so its traces can
   be feasible per window yet impossible overall (it can starve the link
@@ -345,6 +372,36 @@ overflow.  Two consequences for packet traffic:
   the link, i.e. at most up to one transmission time before the RTT ends:
   one extra packet of service before an overflow shifts `B + C` by one
   between losses, and the window becomes infeasible for every K.
+
+### Planner changes after the exact beliefs (Nov 2026)
+
+A 17-scenario sweep (C 10-100, B 5-400, K 1-16, max/min/random/mixed links,
+on-off and rate-limited apps) found the planner, not minimax, at fault:
+
+* *Deadlock*: on a K=4 min-service link the CCA sent 0 for 46 RTTs.  `max_q`
+  includes what no rate can drain (bursts held back, unreported losses,
+  delay-box lag), and `DrainQueue` waited for it forever.  Now
+  `PlannerState::queue_floor` is the smallest `max_q` over the last
+  `QUEUE_FLOOR_RTTS` RTTs that sent at least `QUIET_MARGIN` below `min_c`
+  (any real queue drains in those), queue targets are at least the floor,
+  and Drain/Explore use `HoldQueue` at the target rather than idling.
+* *Idle exploration*: every probe was followed by 1-3 RTTs at rate 0.  Now
+  every Explore rate is capped (`StatePolicy::queue_cap`) so the worst-case
+  queue stays within `EXPLORE_MAX_QUEUE_BDP` (2: one BDP of delay box plus
+  one of growth) plus `max(floor, K)`, and above the cap the CCA holds the
+  queue there.  The link stays backlogged, which is what bounds C from above.
+* *Compounding probes*: three aggressive probes in a row each spent a full
+  loss budget before the first one's losses were reported.  Explore probes
+  are now `EXPLORE_PROBE_GAP_RTTS` = 2 apart.
+
+Before/after (60 RTTs, second-half utilization, packets lost): K=4 min link
+0.00/0.73, 4/5; C=30 random 0.68/0.87; C=10 B=80 converges with 3 instead of
+16 idle RTTs; C=75 mixed crashed at RTT 25 and now reaches 0.91 with 6 lost;
+max links stay at 1.00.  The C=50 B=25 K=16 run is outside the model
+(K < pert * B requires B > 32), and its belief excludes the truth: the model
+cannot detect such a link.  The K confirmation (`K_CONFIRM_RTTS`) is an
+assumption, not a deduction: on the mixed link it once confirmed K=1 (true
+K=4) and briefly believed C = 6.3 (true 75).
 
 ## Changing links and convergence
 

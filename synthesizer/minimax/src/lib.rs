@@ -209,6 +209,17 @@ impl<S: State> Search<S> {
             }
         }
 
+        if best_move.is_none() && !(depth == self.root_depth) {
+            // No move at all: in the network model, no network response is
+            // feasible here, because an earlier (discretized) response led to
+            // a history no link explains.  The branch is an artifact, so
+            // score it as a leaf rather than as the best or worst case.
+            let v = state.value();
+            if enable_tt {
+                self.tt.insert(tt_state, (None, v), depth);
+            }
+            return Some(v);
+        }
         state.chosen_move(&best_move, &value);
         if enable_tt || depth == SPECULATION_SIZE as u16 {
             self.tt.insert(

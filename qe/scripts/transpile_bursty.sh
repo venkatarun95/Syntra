@@ -33,3 +33,8 @@ cd "$QE_DIR"
     --extra-input "5=$SCRATCH/T5" \
     --extra-input "4=$SCRATCH/T4" \
     --output-path "$OUT"
+
+# The CCA evaluates the B functions with C symbolic (exact projection onto
+# C); regenerate that copy from the new crate.
+SYN=$QE_DIR/../synthesizer
+python3 "$SYN/scripts/gen_b_lin.py" "$OUT" "$SYN/network_model_nc/src/generated/b_lin_bursty.rs"

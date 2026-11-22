@@ -12,7 +12,10 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::Once;
 
 use ds::interval::IntervalList;
+use ds::lin::Lin;
 use ds::*;
+
+use crate::generated::{b_lin_bursty, b_lin_plain};
 
 type Bounds = Option<IntervalList<RealNumRep>>;
 
@@ -51,6 +54,23 @@ pub trait QeTables: Debug + Send + Sync {
         l0: RealNumRep,
         c: RealNumRep,
     ) -> Bounds;
+
+    /// `b` with C symbolic (see `ds::lin` and `crate::exact`).  The outer
+    /// `None`: no result for this key; the inner `None`: this C is
+    /// infeasible.
+    #[allow(clippy::too_many_arguments)]
+    fn b_lin(
+        &self,
+        _t: i32,
+        _n: i32,
+        _a: &[RealNumRep],
+        _l: &[RealNumRep],
+        _s: &[RealNumRep],
+        _l0: RealNumRep,
+        _c: Lin,
+    ) -> Option<Option<IntervalList<Lin>>> {
+        None
+    }
 
     /// Bounds on the queue at the end of the trace.
     #[allow(clippy::too_many_arguments)]
@@ -101,6 +121,19 @@ pub trait QeTables: Debug + Send + Sync {
 pub struct PlainQe;
 
 impl QeTables for PlainQe {
+    fn b_lin(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: Lin,
+    ) -> Option<Option<IntervalList<Lin>>> {
+        b_lin_plain::COMPUTE_B_LIN.get(&(t, n)).map(|f| f(a, l, s, l0, c))
+    }
+
     fn c(&self, t: i32, n: i32, a: &[RealNumRep], l: &[RealNumRep], s: &[RealNumRep], l0: RealNumRep)
         -> Bounds {
         network_model_nc_qe_output::COMPUTE_C
@@ -184,6 +217,21 @@ pub struct BurstyQe {
 }
 
 impl QeTables for BurstyQe {
+    fn b_lin(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: Lin,
+    ) -> Option<Option<IntervalList<Lin>>> {
+        b_lin_bursty::COMPUTE_B_LIN
+            .get(&(t, n))
+            .map(|f| f(a, l, s, l0, c, self.k, self.pert))
+    }
+
     fn k_values(&self) -> Vec<RealNumRep> {
         vec![self.k]
     }
@@ -322,12 +370,29 @@ impl UnionBurstyQe {
     /// result, i.e. that its (C, B) inputs are feasible for its K.  A (C, B)
     /// from the union belief can be feasible for one K and not another; such
     /// a K contributes nothing, so its assertion failure is skipped.
+    ///
+    ///
+    /// `None` if no K has a table for this key; if some K has one but none
+    /// fits, the result is the empty set.
     fn union(&self, b: Option<RealNumRep>, f: impl Fn(&BurstyQe) -> Bounds) -> Bounds {
-        self.ks
-            .iter()
-            .filter(|&&k| b.map_or(true, |b| k < self.pert * b))
-            .filter_map(|&k| quietly_catch(|| f(&BurstyQe { k, pert: self.pert })).flatten())
-            .reduce(|acc, x| acc.union(&x))
+        let mut ret = None;
+        let mut any_table = false;
+        for &k in &self.ks {
+            let bq = BurstyQe { k, pert: self.pert };
+            match quietly_catch(|| f(&bq)) {
+                Some(Some(x)) => {
+                    any_table = true;
+                    // Results assume `K < pert * B`; a K that violates it
+                    // contributes nothing.
+                    if b.map_or(true, |b| k < self.pert * b) {
+                        ret = Some(ret.map_or(x.clone(), |acc: IntervalList<RealNumRep>| acc.union(&x)));
+                    }
+                }
+                Some(None) => {}
+                None => any_table = true,
+            }
+        }
+        any_table.then(|| ret.unwrap_or_else(|| IntervalList::new(vec![])))
     }
 }
 
@@ -347,13 +412,34 @@ pub(crate) fn quietly_catch<T>(f: impl FnOnce() -> T) -> Option<T> {
             }
         }));
     });
-    QUIET_PANICS.with(|q| q.set(true));
+    // Restore rather than clear: calls nest.
+    let outer = QUIET_PANICS.with(|q| q.replace(true));
     let ret = panic::catch_unwind(AssertUnwindSafe(f));
-    QUIET_PANICS.with(|q| q.set(false));
+    QUIET_PANICS.with(|q| q.set(outer));
     ret.ok()
 }
 
 impl QeTables for UnionBurstyQe {
+    /// The union over K.  No `quietly_catch` here: with C symbolic, a K for
+    /// which C is infeasible returns `None` rather than panicking.
+    fn b_lin(
+        &self,
+        t: i32,
+        n: i32,
+        a: &[RealNumRep],
+        l: &[RealNumRep],
+        s: &[RealNumRep],
+        l0: RealNumRep,
+        c: Lin,
+    ) -> Option<Option<IntervalList<Lin>>> {
+        let per_k: Vec<_> = self
+            .ks
+            .iter()
+            .map(|&k| BurstyQe { k, pert: self.pert }.b_lin(t, n, a, l, s, l0, c))
+            .collect::<Option<_>>()?;
+        Some(per_k.into_iter().flatten().reduce(|acc, x| acc.union(&x)))
+    }
+
     fn k_values(&self) -> Vec<RealNumRep> {
         self.ks.clone()
     }

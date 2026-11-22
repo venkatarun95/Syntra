@@ -1,6 +1,7 @@
 use num_rational::Ratio;
 
 pub mod interval;
+pub mod lin;
 pub mod tree;
 // pub mod my_f64;
 
