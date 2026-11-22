@@ -246,6 +246,10 @@ struct CongCtrlState<NM: NetworkModel> {
     // All the stacks are in lock step
     history_stack: Vec<NM::O>, // board state after network move
     belief_bounds_stack: Vec<BeliefBounds>, // beliefs at the end of the sequence of observations
+    /// In lock step with `belief_bounds_stack`: the speculative reply left a
+    /// C or B interval disjoint from the parent's, so no static link
+    /// explains the speculative history (see `game_over`).
+    disjoint_stack: Vec<bool>,
     move_choices_cca_stack: Vec<Vec<CCMove<NM::NA>>>, // move choices at each step of the speculation for the CCA.
     move_choices_network_stack: Vec<Vec<CCMove<NM::NA>>>, // move choices at each step of the speculation for the network.
 
@@ -262,8 +266,13 @@ struct CongCtrlState<NM: NetworkModel> {
     /// keeps the first move it tries unless a later one is strictly better,
     /// breaks an exact tie towards the highest rate.
     root_tie_high: bool,
-    /// `--spec-monotone`: see `compute_belief_bounds`.
+    /// Intersect speculative beliefs with their parent's; see
+    /// `compute_belief_bounds` (`--no-spec-monotone` turns it off).
     spec_monotone: bool,
+    /// Prune speculative replies whose belief is disjoint from the parent's
+    /// (`game_over`); `--no-prune-disjoint` keeps them, scored on their own
+    /// interval.
+    prune_disjoint: bool,
 
     // Config
     policy: StatePolicy,
@@ -306,6 +315,15 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
     }
 
     fn game_over(&self) -> Option<Self::V> {
+        // A speculative network reply that no static link could produce
+        // (its C or B interval is disjoint from what the node above it
+        // proved) is not a move the network has: score it as the network's
+        // worst value, so the adversary never picks it.  If every reply is
+        // such, the network node has no move and is scored as a leaf, as for
+        // any node without feasible replies.
+        if self.prune_disjoint && self.disjoint_stack.last() == Some(&true) {
+            return Some(CCValue::NegInf);
+        }
         None
     }
 
@@ -362,7 +380,9 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
 
                 self.move_cca = None;
                 self.history_stack.push(observation);
-                self.belief_bounds_stack.push(self.compute_belief_bounds());
+                let (bounds, disjoint) = self.compute_belief_bounds_checked();
+                self.belief_bounds_stack.push(bounds);
+                self.disjoint_stack.push(disjoint);
                 self.move_choices_cca_stack.push(self.compute_cca_moves());
             }
         }
@@ -384,6 +404,7 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
             self.move_cca = Some(CCAAction { rate });
             debug!("Pop move: {:?}", ret);
             self.belief_bounds_stack.pop();
+            self.disjoint_stack.pop();
             self.move_choices_cca_stack.pop();
         }
         self.tree_pop_move();
@@ -523,6 +544,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
 
         self.history.push(self.history_stack.pop().unwrap());
         self.belief_bounds_stack.pop();
+        self.disjoint_stack.pop();
         self.move_choices_network_stack.pop();
         self.move_choices_cca_stack.pop();
         self.move_choices_cca_stack.pop();
@@ -999,6 +1021,14 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     }
 
     fn compute_belief_bounds(&self) -> BeliefBounds {
+        self.compute_belief_bounds_checked().0
+    }
+
+    /// `compute_belief_bounds`, and whether a speculative state's C or B
+    /// interval is disjoint from its parent's (or the root's), which no
+    /// static link explains.  The bounds then keep the state's own interval
+    /// in that dimension.
+    fn compute_belief_bounds_checked(&self) -> (BeliefBounds, bool) {
         let history_len = self.policy.belief_history_observations + self.history_stack.len();
         // Conflicting windows keep the older accumulated bound rather than
         // replacing the whole history by the newest window, which would
@@ -1010,15 +1040,19 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         if !self.history_stack.is_empty() {
             // A speculative state is never broader than the committed belief
             // it extends: the K set is fixed for the whole tree.
-            // `--spec-monotone`: nor than its parent's (the speculative state
-            // one observation earlier), which already includes the root.
+            // Nor than its parent's (the speculative state one observation
+            // earlier, which already includes the root): the link is static
+            // within the tree, so what the parent proved still holds.  Only
+            // the root's would let a leaf forget what the node above it
+            // proved (`--no-spec-monotone`).
             let parent = match self.belief_bounds_stack.last() {
                 Some(parent) if self.spec_monotone => *parent,
                 _ => self.belief_bounds,
             };
-            intersect_c_b(&mut bounds, &parent);
+            let disjoint = intersect_c_b(&mut bounds, &parent);
+            return (bounds, disjoint);
         }
-        bounds
+        (bounds, false)
     }
 
     /// The previous committed belief, if it may still constrain the new one:
@@ -1087,6 +1121,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             disable_pre_enumeration: false,
             root_tie_high: false,
             spec_monotone: false,
+            prune_disjoint: false,
+            disjoint_stack: Vec::new(),
             policy: StatePolicy::default(),
             planner: PlannerState::default(),
             qe_ks: None,
@@ -1277,33 +1313,28 @@ impl CongCtrlState<NetworkModelNC> {
         self.planner = planner;
     }
 
-    /// How many network replies the model offers to sending `rate` now
-    /// (the first ply of the search below that root move).
-    fn root_replies(&mut self, rate: RealNumRep) -> usize {
-        self.make_move(&CCMove::CCA(CCAAction { rate }));
-        let n = self.move_choices_network_stack.last().map_or(0, |m| m.len());
-        self.pop_move();
-        n
-    }
-
-    /// `--distilled`: the highest rate among `distilled_actions`, computed
-    /// with the planner's formulas and parameters for this RTT, skipping a
-    /// rate to which the model has no network reply at all (unless every
-    /// rate is such), and whether those actions are exactly the planner's
-    /// candidate set.
-    fn distilled_rate(&mut self) -> (RealNumRep, bool) {
+    /// `--distilled`: the rate `distilled_actions` picks (the highest of its
+    /// actions' rates, with the planner's formulas and parameters for this
+    /// RTT), or `None` where the distilled policy defers to the search: more
+    /// than one distinct rate, `max_c` bounded, and the highest rate is the
+    /// queue cap's (`min_c + cap - max_q`).  There probing now or next RTT
+    /// sends about the same over the horizon and the choice is made by the
+    /// worst-case width of C at the horizon (`c`), which no root feature
+    /// predicted (see "Distilled policy" in `CCA_DEVELOPMENT.md`).
+    /// Also whether those actions are exactly the planner's candidate set.
+    fn distilled_rate(&self) -> (Option<RealNumRep>, bool) {
         let actions = distilled_actions(&self.policy.features);
         let ok = actions == self.policy.candidate_actions;
         let (rates, _) = self.candidate_rates_for(&actions);
-        let mut rates: Vec<RealNumRep> = rates.iter().map(|(_, r)| *r).unique().collect();
-        rates.sort();
-        if rates.len() > 1 {
-            let answered: Vec<RealNumRep> = rates.iter().copied().filter(|r| self.root_replies(*r) > 0).collect();
-            if !answered.is_empty() {
-                rates = answered;
-            }
-        }
-        (*rates.last().expect("no distilled action has a rate"), ok)
+        let distinct: Vec<RealNumRep> = rates.iter().map(|(_, r)| *r).unique().collect();
+        let top = *distinct.iter().max().expect("no distilled action has a rate");
+        let bb = self.get_latest_belief_bounds();
+        let cap_bound = self
+            .policy
+            .queue_cap
+            .is_some_and(|cap| top == std::cmp::max(0.into(), bb.min_c + cap - bb.max_q));
+        let defer = distinct.len() > 1 && cap_bound && bb.max_c < LARGEST_BW.into();
+        (if defer { None } else { Some(top) }, ok)
     }
 
     /// `--decisions`: everything the CCA knows before deciding this RTT,
@@ -1587,9 +1618,11 @@ struct Args {
     /// `MISMATCH`, suffixed `-known` where the rule claims to know the search's choice).
     #[arg(long)]
     check_rule: bool,
-    /// Never search: take `distilled_actions`' choice (the highest of its
-    /// actions' rates).  The CSV column `rule` says whether it matches the
-    /// planner's candidate set (`dist-ok`) or not (`dist-MISMATCH`).
+    /// Take `distilled_actions`' choice (the highest of its actions' rates)
+    /// instead of searching, except in the small region where it defers to
+    /// the search (`distilled_rate`).  The CSV column `rule` is `dist-ok`,
+    /// `dist-search` (deferred) or `dist-MISMATCH` (its actions differ from
+    /// the planner's candidate set).
     #[arg(long)]
     distilled: bool,
     /// Break exact ties at the root towards the highest rate (by default the
@@ -1597,11 +1630,16 @@ struct Args {
     /// still minimax-optimal; `--distilled` makes the same choice.
     #[arg(long)]
     tie_high: bool,
-    /// Intersect each speculative belief with its parent's, not only with
-    /// the committed root's (a leaf could otherwise be broader than the node
-    /// above it, which once made the search prefer a lower rate on `c`).
+    /// Intersect each speculative belief only with the committed root's,
+    /// not with its parent's (the old behaviour): a leaf can then be broader
+    /// than the node above it, which made the search prefer a lower rate on
+    /// `c` (see "Distilled policy" in `CCA_DEVELOPMENT.md`).
     #[arg(long)]
-    spec_monotone: bool,
+    no_spec_monotone: bool,
+    /// Keep speculative network replies whose C or B interval is disjoint
+    /// from the parent node's (the old behaviour) instead of pruning them.
+    #[arg(long)]
+    no_prune_disjoint: bool,
 }
 
 /// `--external`: one RTT's outcome, as read from stdin.
@@ -1972,7 +2010,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cong_ctrl_state.best_move_guess(tt);
     ccs.parallel_binary_search = args.parallel;
     ccs.root_tie_high = args.tie_high;
-    ccs.spec_monotone = args.spec_monotone;
+    ccs.spec_monotone = !args.no_spec_monotone;
+    ccs.prune_disjoint = !args.no_prune_disjoint;
 
     if args.sim {
         ccs.network_model
@@ -2050,21 +2089,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 warn!("t={}: distilled actions {:?} differ from the planner's {:?}", t,
                       distilled_actions(&ccs.policy.features), ccs.policy.candidate_actions);
             }
-            dist_check = Some(if ok { "dist-ok" } else { "dist-MISMATCH" });
-            rule = Some(rate);
+            // `None`: the distilled policy defers to the search here.
+            dist_check = Some(match (ok, rate) {
+                (false, _) => "dist-MISMATCH",
+                (true, Some(_)) => "dist-ok",
+                (true, None) => "dist-search",
+            });
+            rule = rate;
         }
-        let use_rule = use_rule || args.distilled;
+        let use_rule = use_rule || (args.distilled && rule.is_some());
         let searched = !args.sim_max_rate && root_moves.len() > 1 && !use_rule;
-        let trace = decisions.is_some().then(|| {
-            let mut rec = ccs.trace_features();
-            let replies: Vec<serde_json::Value> = if root_rates.len() > 1 {
-                root_rates.iter().map(|r| serde_json::json!([format!("{}", r), ccs.root_replies(*r)])).collect()
-            } else {
-                vec![]
-            };
-            rec["root_replies"] = replies.into();
-            rec
-        });
+        let trace = decisions.is_some().then(|| ccs.trace_features());
         let mut root_values_json = serde_json::Value::Null;
         let mut optimal_rates: Vec<RealNumRep> = vec![];
         let best_cc_move = if args.sim_max_rate {

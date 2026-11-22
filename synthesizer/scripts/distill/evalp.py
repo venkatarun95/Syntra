@@ -1,9 +1,10 @@
 import sys
 from load import *
+
 from policy import distilled_actions, distilled_rate
 from collections import Counter, defaultdict
 rows = load(sys.argv[1:])
-names_ok = rate_opt = rate_exact = 0
+names_ok = rate_opt = rate_exact = deferred = 0
 bad = []
 per_run = defaultdict(lambda: [0,0,0])
 for r in rows:
@@ -12,6 +13,9 @@ for r in rows:
         sp = r["pf"]["since_probe"]
         r["pf"]["probe_due"] = sp is None or sp >= 10
     acts, rate = distilled_rate(r)
+    if rate is None and r["searched"]:
+        deferred += 1
+        rate = r["chosen"]  # the distilled CCA runs the same search here
     planner = [a for a, _ in r["cands"]]
     n_ok = acts == planner
     o_ok = rate in r["opt"]
@@ -23,6 +27,7 @@ for r in rows:
 n = len(rows)
 print(f"RTTs {n}  runs {len(per_run)}  searched {sum(r['searched'] for r in rows)}")
 print(f"candidate set == planner's: {names_ok}/{n}")
+print(f"deferred to the search (cap-bound region): {deferred}")
 print(f"rate is minimax-optimal (any optimum): {rate_opt}/{n}")
 print(f"rate == search's own choice (tie-break): {rate_exact}/{n}")
 for b in bad[:40]: print("BAD", b)

@@ -26,11 +26,22 @@ def distilled_actions(pf):
         return ["ProbeAboveLimit"]
     return ["HoldQueue"]
 
+LARGEST_BW = 1000
+
 def distilled_rate(r):
-    """Highest rate of the distilled actions, using the logged candidate rates."""
+    """(actions, rate) of the distilled policy over a logged record; rate is
+    None where it defers to the search: >1 distinct rate, max_c bounded, and
+    the highest rate equals the queue cap's (min_c + cap - max_q)."""
     acts = distilled_actions(r["pf"])
     d = {}
     for a, x in r["cands"]:
         d.setdefault(a, x)
-    rates = [d[a] for a in acts if a in d]
-    return acts, (max(rates) if rates else None)
+    rates = sorted(set(d[a] for a in acts if a in d))
+    if not rates:
+        return acts, None
+    top = rates[-1]
+    B = r["B"]; cap = r["policy"]["queue_cap"]
+    cap_bound = cap is not None and top == max(F(0), B["min_c"] + F(cap) - B["max_q"])
+    if len(rates) > 1 and cap_bound and B["max_c"] < LARGEST_BW:
+        return acts, None
+    return acts, top

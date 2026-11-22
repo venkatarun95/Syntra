@@ -663,6 +663,160 @@ data averaged 1.58 BDP instead of 1.51 (it includes the one-BDP delay
 box).  Loss went from 88 to 243 packets: the lossy checks on buffers under
 a BDP cost about `r - B` each (C=100 B=50: 52 packets in one check).
 
+## Distilled policy (Nov 2026)
+
+`--distilled` runs the CCA without any search: beliefs, K tracking, change
+detection and the planner's memory are computed exactly as before, and the
+action comes from `distilled_actions` in `cbrdelay_cca_config.rs`: a list of
+actions, of which the CCA sends the **highest rate** (the engine's candidate
+formulas, with the mode's loss budget, queue target and cap).  The CSV
+column `rule` is `dist-ok` when that list is exactly the planner's
+candidate set, `dist-search` where it defers to the search (below).
+
+### The rules
+
+`BDP` is `min_c`; `K` the largest assumed burstiness; `target` =
+`max(1 + K, queue_floor)`.  First match wins:
+
+| # | condition (belief / planner memory) | mode | action (rate) |
+| --- | --- | --- | --- |
+| 1 | fewer than 7 observations since the belief (re)started | Recover | `MatchDelivery` (delivery per RTT over the last 1-2 RTTs) |
+| 2 | no static link explains the newest QE window | (any) | `HoldQueue` (`min_c - max(0, max_q - target)`) |
+| 3 | a rise check is running: started < `ceil(r/(r - max_c)) + 1` RTTs ago, and (lossless) `max_q + r - min_c <= min_b` or (lossy) no new loss | RiseCheck | `AboveMaxC` (`r = max_c + max(max_c/4, 1)`) |
+| 4 | draining and `max_q > target` for < 3 RTTs, or no min-RTT sample (`max_q <= 1 + K`) for 40 RTTs | Drain | `HoldQueue` |
+| 5a | `max_c > 1.25 min_c` and `max_q > 2 BDP + max(queue_floor, K)` | Explore | `HoldQueue` at that cap |
+| 5b | `max_c > 1.25 min_c` otherwise | Explore | **highest of** `MaxAllowedRate`, `HoldQueue` (= `min_c` here) and, if >= 2 RTTs (4 if `max_b < min_c`) since the last probe, `ProbeAboveLimit` (`MaxAllowedRate` + max(1 BDP, 2), or + 1 if `max_b < min_c`); every rate capped at `min_c + 2 BDP + max(queue_floor, K) - max_q` |
+| 6 | C tight, a rise check due (not app-limited; 10, 20, 40 RTTs after the last for lossless checks, 40 otherwise) | RiseCheck | `AboveMaxC` |
+| 7 | C tight, >= 10 RTTs since the last probe | Probe | `ProbeAboveLimit` (budget 0 if cautious, else 1) |
+| 8 | otherwise | Cruise | `HoldQueue` |
+
+`MaxAllowedRate` is the model's no-loss rate, clamped to
+`max(max(min_cb, min_c + min_b) - max_q, min_c)`.
+
+Rows 1-4 and 6-8 are the planner (`state_policy`) restated: there the
+planner leaves one candidate and nothing is searched.  Row 5b is the only
+place the depth-4 search chooses, and the distilled rule for it is a single
+sentence: **send the most the candidates allow** -- except in one region,
+where `--distilled` still runs the search:
+
+* **Deferral region**: more than one distinct candidate rate, `max_c`
+  bounded (`< LARGEST_BW`), and the highest rate is the queue cap's
+  (`min_c + 2 BDP + max(queue_floor, K) - max_q`, i.e. the probe would fill
+  the Explore queue cap).  26 of 725 searched RTTs (3.6%) in the final labels; the search picked the
+  highest rate in 25 of them (see below).
+
+### Data and agreement
+
+Traces: `--decisions FILE --exact-root` now logs every RTT (searched or
+not) with the belief (exact rationals), the planner's memory and derived
+quantities (`PlannerFeatures`: C tight, small buffer, cautious, drain/rise/
+probe timers and flags, queue cap, ...), the candidate set with exact rates,
+the chosen rate and, where the search ran, every root move's exact value and
+the set of optimal rates (a move is optimal unless the best value is
+strictly smaller; equal values compare as `None`).  Scripts:
+`scripts/distill/` (`run.sh` runs a scenario file, `evalp.py` scores the
+policy, `objs.py` says which objective separated the root moves,
+`tree.py` fits a generic decision tree, `cmpcsv.py`/`simcmp.py` compare
+CSVs, `pv.py` prints principal variations of a `--tree` dump).
+
+Training: `scripts/distill/train.sc`, 37 links × 70 RTTs (C 10-100, B
+0.25-8 BDP, sim K 1/4/16, max/min/random/mixed, backlogged, on-off, rate
+and random apps, 8 with C or B changes), depth 4, bursty QE.  New:
+`new.sc`, 8 other links.
+
+
+### Search fixes found by the distillation
+
+Three searched decisions went against "highest rate" in the first labels.
+Tree dumps (`--tree`, `scripts/distill/pv.py`) traced each one:
+
+* **Speculative beliefs could be broader than their parent's** (s21 t48,
+  s36 t49).  A speculative state's belief was intersected with the committed
+  root only, so a leaf could forget what the node above it had proved: on
+  s21 the probe's worst leaf had `min_c` 33.24 under a parent with 34.41,
+  on s36 `max_c` went back from 17.5 to the root's 18.75.  `c` then
+  preferred the lower rate.  Now every speculative belief is also
+  intersected with its parent's (default; `--no-spec-monotone` restores the
+  old behaviour).  The link is static within the tree, so this is sound.
+* **Replies inconsistent with the speculative history were scored** (the
+  same s36 dump: leaves at C = 12.5 under a parent with C in [13.33, 17.5]).
+  When a reply leaves C or B disjoint from the parent's interval,
+  `intersect_c_b` kept the leaf's own interval, i.e. the search scored a link
+  that cannot exist.  Now such a reply is pruned: `game_over` scores it as
+  the network's worst value (`NegInf`), so the adversary never picks it; if
+  every reply is such, the network node has no move and is scored as a leaf,
+  as before (`--no-prune-disjoint` keeps them).  There is no legitimate
+  disjoint case in speculation: the planner, K set and belief start are
+  frozen for the tree, and change detection (`locate_change`) runs only on
+  committed history, which keeps its own handling.
+* **n2 t68 is the search being right.**  Every root rate has the same 8
+  first replies and no leaf on the deciding line is broader than its
+  parent.  The worst reply serves exactly `min_c`.  The probe now (89.8)
+  fills the Explore queue cap, so the next move is held near `min_c`;
+  holding now (64.2) leaves room to probe next RTT.  Both orders send the
+  same over the horizon (2631.5), so `sent` ties and `c` decides: the worst
+  C width at the horizon is 20.8 for probe-then-hold and 14.7 for
+  hold-then-probe.  Whether the later probe teaches more depends on the
+  worst-case service lag at the horizon end, which no root feature
+  predicted (one case in 725 searched RTTs; not enough to fit a rule).
+
+Effect on the labels: over the common prefixes of the 45 runs (691 searched
+RTTs where the old and new search saw the same state), the optimal set
+changed at 2: s21 t48 (parent intersection; now the probe) and s22 t46
+(pruning; {30, 60} became {60}, same choice).  s36 t49 changed too (seen
+with parent intersection alone; under `--tie-high` that run diverges
+earlier, at a tie at t34).  On s36 (C 40 -> 15) the fixed search probes
+more after the fall: same utilization, 42 packets lost instead of 4.
+
+### Agreement
+
+Final labels: `--exact-root --tie-high`, both search fixes, 45 runs (37
+training + 8 new) × 70 RTTs, `/tmp/cca_distill/search_v3`
+(`scripts/distill/evalp.py`):
+
+| | RTTs | searched | candidate set = planner's | rule's rate optimal | = search's own pick |
+| --- | --- | --- | --- | --- | --- |
+| all 45 runs | 3150 | 725 | 3150 | 3150 (26 deferred) | 3150 |
+
+* Outside the deferral region the highest rate was optimal at all 699
+  searched RTTs.  Inside it (26 RTTs) the search picked the highest rate 25
+  times and `HoldQueue` once (n2 t68).  The n2 t68 pattern (hold first so
+  the next move can probe) appears nowhere else, in the old or the new
+  labels.
+* What separated the root moves: `sent` in ~93% of searched RTTs, exact
+  ties on every objective in ~5%, `c` in the rest.  With the search's
+  default tie-break (last candidate in planner order) 9 ties went to a lower
+  rate (s14, s36, n2, n4): equal total sent because the second move's
+  queue-limited rate gives back what the first added.  `--tie-high` breaks
+  ties towards the highest rate (all moves are optimal), which is what the
+  distilled rule does; with the default tie-break the traces would differ
+  at those ties.
+* The rule has no fitted thresholds, so leave-one-run-out is the same.  A
+  generic scikit-learn tree on ~30 features fits the old labels 100% but
+  scores 0.985 leave-one-run-out (it memorises the exceptions).
+
+### Simulation
+
+`--distilled --exact-root --tie-high` (`/tmp/cca_distill/distilled_v3`) vs
+the fixed search with `--exact-root --tie-high`
+(`/tmp/cca_distill/search_v3`): **45/45 CSVs identical** on every column
+but the step time, i.e. the distilled CCA reproduced every trace exactly
+(3124 RTTs by the rule, 26 by the deferred search).  Mean step 0.14 s
+instead of 1.42 s.  Per-run utilization, loss and queue are therefore
+equal; over the 45 runs (RTTs 10-70): utilization 0.82, 2139 packets lost,
+unacked data 1.72 BDP, belief `max_q` 0.97 BDP (old search: 0.82, 2101,
+1.71, 0.96; only s14, s21 and s36 differ).  Table:
+`/tmp/cca_distill/final/simcmp.txt`.
+
+### Caveats
+
+* The deferral region is empirical: on unseen links a decision outside it
+  could still go against the highest rate, and `--distilled` cannot notice
+  (it does not search there).  Re-check new scenario sets with the search
+  (`run.sh ... --exact-root --tie-high`, then `evalp.py`).
+* All labels are depth 4, bursty QE, default planner (`--explore-free` is
+  not supported by `--distilled`).
+
 ## QE/transpilation boundary
 
 The runner evaluates the generated Rust QE implementation in
