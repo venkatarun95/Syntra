@@ -1095,7 +1095,16 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         planner.rise_last = t;
         planner.rise = None;
     }
-    let rise_lossless = !cautious && rise_fits;
+    // `r / (r - max_c)` RTTs prove `C >= max_c` only to within the service
+    // lag; one more makes the lower bound exceed `max_c`.
+    let rise_step = rise_rate - belief.max_c;
+    let rise_rtts = (rise_rate / rise_step).ceil().to_integer() as usize + 1;
+    // A lossless check must fit for all its RTTs, not just the next one:
+    // stopped when the queue no longer fits, it would never prove anything
+    // on a buffer of about a BDP.  Otherwise the check is lossy (it ends at
+    // its first loss, which only comes if C did not rise).
+    let rise_fits_all = belief.max_q + (rise_rate - belief.min_c) * (rise_rtts as RealNumInt) <= belief.min_b;
+    let rise_lossless = !cautious && rise_fits_all;
     let rise_interval = if rise_lossless { planner.rise_interval } else { tun().rise_max_interval_rtts };
     let rise_due = state.strategy.rise_check && c_tight && !planner.app_limited && t >= planner.rise_last + rise_interval;
     features.queue_target = queue_target;
@@ -1117,10 +1126,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     } else if !c_tight {
         Mode::Explore
     } else if rise_due {
-        // `r / (r - max_c)` RTTs prove `C >= max_c` only to within the
-        // service lag; one more makes the lower bound exceed `max_c`.
-        let step = rise_rate - belief.max_c;
-        let rtts = (rise_rate / step).ceil().to_integer() as usize + 1;
+        let rtts = rise_rtts;
         info!("t={}: rise check at {} for {} RTTs ({})", t, rise_rate, rtts, if rise_lossless { "lossless" } else { "lossy" });
         planner.rise = Some(RiseCheck { started: t, rtts, lossless: rise_lossless, loss_at_start: loss_now });
         Mode::RiseCheck
