@@ -598,8 +598,8 @@ Simulated changes (`--sim-c-schedule`, and new `--sim-b-schedule`; CSV
 | C 30 -> 60 at 30, K=4 random | 0.44 | 0.43 | RTT 52 | - |
 
 No belief excluded the true (C, B) after a restart, and the 16 static links
-had no restart.  Rises are only seen when the CCA sends above the old C:
-the next step is explicit rise checks.
+had no restart.  Rises are only seen when the CCA sends above the old C,
+hence the rise checks below.
 
 ### Min-RTT samples (Nov 2026)
 
@@ -614,6 +614,54 @@ that ends at the floor also resets the timer.  The CSV has a
 `rate R`, so this is opt-in).  On the 16-link sweep the longest gap between
 samples was 47 RTTs (40 plus a 3-RTT drain); throughput and loss were
 unchanged.
+
+### Rise checks (Nov 2026)
+
+A rise in C is invisible at rates up to `max_c`, and a rise in B at rates
+the old buffer absorbed, so neither ever contradicts the belief on its own.
+`Mode::RiseCheck` sends `AboveMaxC` (`max_c * (1 + RISE_STEP)`, at least one
+packet more) for `ceil(r / (r - max_c)) + 1` RTTs (6 with `RISE_STEP` = 1/4).
+If C rose to at least `r`, the chained lower bound passes `max_c`; with a
+small buffer, if B rose, the absence of loss is unexplainable.  Either way
+`locate_change` restarts the belief; otherwise the planner drains what the
+check queued.
+
+The cost is inherent to the delay box, not to the step: the link may serve
+up to an RTT late, so proving `C > max_c` from rate `r` takes about
+`r / (r - max_c)` RTTs, which queue about `(r - max_c) * r / (r - max_c) = r`
+packets if C did not rise.  So every check costs about one BDP of queue, or
+loss when the buffer cannot hold it.  A larger step only shortens the check.
+
+Schedule (user-approved trade-off):
+
+* Lossless checks (not cautious, and the worst-case queue after another
+  RTT, at `C = min_c`, fits in `min_b`) start `RISE_INTERVAL_RTTS` (10)
+  after a restart or after C becomes tight, and back off 10, 20, 40
+  (`RISE_MAX_INTERVAL_RTTS`).  A lossless check ends early once the next
+  RTT might overflow `min_b`.
+* Lossy checks (cautious: small buffer or unconfirmed K) wait 40 RTTs, and
+  end at the first reported loss, which says the old buffer still
+  overflows.  This is the only B-rise check: with a large buffer a B rise
+  does not matter.
+* A drain cannot interrupt a check; a check waits for a drain.
+  `--no-rise-check` turns checks off.
+
+Change scenarios (80 RTTs; compare the 60-RTT table above):
+
+| change | after the change, with rise checks |
+| --- | --- |
+| C 20 -> 50 at 25 | 0.93 utilization (was 0.80), 64 lost |
+| C 20 -> 40 -> 20 | 0.81 after the rise (was 0.60), C tight 15 RTTs after it |
+| B 10 -> 60 at 25 | detected by the first lossy check (restart at 57; was never) |
+| C 30 -> 60 at 30, K=4 random | detected at 47 (was 59), 0.79 utilization (was 0.43) |
+| C 50 -> 20, B 40 -> 10 | unchanged (falls are detected anyway) |
+
+No belief excluded the true (C, B) after a restart.  On the 16 static links
+(80 RTTs, counting RTTs 20-80) there was no restart.  Utilization went
+from 0.893 to 0.901 (checks also tighten C on `random` links).  Unacked
+data averaged 1.58 BDP instead of 1.51 (it includes the one-BDP delay
+box).  Loss went from 88 to 243 packets: the lossy checks on buffers under
+a BDP cost about `r - B` each (C=100 B=50: 52 packets in one check).
 
 ## QE/transpilation boundary
 

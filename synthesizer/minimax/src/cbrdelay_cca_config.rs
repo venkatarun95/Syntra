@@ -5,7 +5,7 @@
 //! the minimax implementation remains in `cong_ctrl.rs`.  Agents changing
 //! this experiment should first read `../CCA_DEVELOPMENT.md`.
 
-use cc_common::BeliefBounds;
+use cc_common::{BeliefBounds, Observation};
 use ds::{RealNumInt, RealNumRep};
 use log::{info, warn};
 use network_model_nc::{AppSendFraction, ObservationNC};
@@ -85,6 +85,9 @@ pub enum CandidateAction {
     /// after a change, before any QE window exists: a backlogged link keeps
     /// its queue, an idle one keeps the old rate.  Not a bound on anything.
     MatchDelivery,
+    /// `max_c` plus `RISE_STEP` of it (at least one packet): held for a
+    /// rise check, so that a link that now serves more proves it.
+    AboveMaxC,
 }
 
 /// Lexicographic objective, from most important to least important.  Pass
@@ -203,6 +206,19 @@ pub const APP_LIMITED_SLACK: RealNumRep = RealNumRep::new_raw(1, 16);
 /// keeps the link busy, while an idle app leaves it empty.)
 pub const INFORMATIVE_LOAD: RealNumRep = RealNumRep::new_raw(1, 2);
 
+/// A rise check sends `max_c * (1 + RISE_STEP)`.  Proving `C > max_c` from
+/// a rate `r` takes about `r / (r - max_c)` RTTs (the link may serve up to
+/// an RTT late), and if C did not rise those RTTs queue about `r`: roughly
+/// a BDP whatever the step.  A larger step only shortens the check.
+pub const RISE_STEP: RealNumRep = RealNumRep::new_raw(1, 4);
+
+/// RTTs from a change (or from C becoming tight) to the first rise check;
+/// each check that finds nothing doubles the gap, up to
+/// `RISE_MAX_INTERVAL_RTTS`.  A check that would lose packets (the proven
+/// buffer cannot hold its queue) always waits the maximum.
+pub const RISE_INTERVAL_RTTS: usize = 10;
+pub const RISE_MAX_INTERVAL_RTTS: usize = 40;
+
 /// Loss budget (packets per probe) when cautious.
 pub const CAUTIOUS_LOSS_BUDGET: RealNumRep = RealNumRep::new_raw(1, 1);
 
@@ -240,6 +256,9 @@ pub struct BeliefStrategy {
     /// speed and worst-case loss and queue.
     pub explore_budget_bdp: RealNumRep,
     pub explore_queue_bdp: RealNumRep,
+    /// Periodically send above `max_c` to detect a rise in C (or, when the
+    /// buffer is small, in B) (`--no-rise-check`).
+    pub rise_check: bool,
 }
 
 impl Default for BeliefStrategy {
@@ -252,6 +271,7 @@ impl Default for BeliefStrategy {
             c_upper_rtts: None,
             explore_budget_bdp: EXPLORE_BUDGET_BDP,
             explore_queue_bdp: EXPLORE_MAX_QUEUE_BDP,
+            rise_check: true,
         }
     }
 }
@@ -337,6 +357,10 @@ pub enum Mode {
     Probe,
     /// Hold the drain rate until the belief proves the queue is empty.
     Drain,
+    /// C is tight: send above `max_c` for a few RTTs.  If C (or, with a
+    /// small buffer, B) rose, the history contradicts the belief and
+    /// `locate_change` restarts it; otherwise the queue built is drained.
+    RiseCheck,
     /// The link changed less than a QE window ago: match its delivery
     /// until the new link's windows exist.
     Recover,
@@ -411,6 +435,23 @@ pub struct PlannerState {
     pub last_sent: RealNumRep,
     /// Times the belief was restarted because the link changed.
     pub restarts: usize,
+    /// The current rise check: its first timestep, its length in RTTs,
+    /// whether it must stay lossless, and the loss reported when it began.
+    pub rise: Option<RiseCheck>,
+    /// When the last rise check ended (or C last was loose, or the belief
+    /// restarted), and the gap to the next one.
+    pub rise_last: usize,
+    pub rise_interval: usize,
+    /// `belief_start` the rise schedule was last reset for.
+    pub rise_belief_start: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RiseCheck {
+    pub started: usize,
+    pub rtts: usize,
+    pub lossless: bool,
+    pub loss_at_start: RealNumRep,
 }
 
 /// Settings selected once at the beginning of a state.  They remain immutable
@@ -788,12 +829,61 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         planner.last_drained = t;
     }
 
-    let mode = if planner.mode == Mode::Drain && !drained && !drain_gave_up {
+    // Rise checks.  A rise in C is invisible at rates up to `max_c`, and a
+    // rise in B at rates the buffer absorbed anyway, so neither ever
+    // contradicts the belief by itself: the CCA has to send above `max_c`.
+    // The schedule restarts with the belief, and while C is loose (Explore
+    // probes above `max_c` anyway).
+    if planner.belief_start != planner.rise_belief_start || !c_tight || planner.rise_interval == 0 {
+        planner.rise_belief_start = planner.belief_start;
+        planner.rise_interval = RISE_INTERVAL_RTTS;
+        planner.rise_last = t;
+        planner.rise = None;
+    }
+    let rise_rate = belief.max_c + std::cmp::max(belief.max_c * RISE_STEP, 1.into());
+    // Lossless only if the worst-case queue (`C = min_c`) after another RTT
+    // at the rise rate fits in the smallest buffer.
+    let rise_fits = belief.max_q + rise_rate - belief.min_c <= belief.min_b;
+    let loss_now = state.history.last().map_or(0.into(), |o| o.get_ld());
+    let rise_continues = match planner.rise {
+        Some(rise) if planner.mode == Mode::RiseCheck => {
+            t < rise.started + rise.rtts
+                && if rise.lossless {
+                    rise_fits
+                } else {
+                    // Lossy: a loss means the old buffer still overflows.
+                    loss_now <= rise.loss_at_start
+                }
+        }
+        _ => false,
+    };
+    if planner.mode == Mode::RiseCheck && !rise_continues {
+        // Nothing contradicted the belief (or a restart would have reset
+        // the schedule): wait longer for the next one.
+        planner.rise_interval = std::cmp::min(planner.rise_interval * 2, RISE_MAX_INTERVAL_RTTS);
+        planner.rise_last = t;
+        planner.rise = None;
+    }
+    let rise_lossless = !cautious && rise_fits;
+    let rise_interval = if rise_lossless { planner.rise_interval } else { RISE_MAX_INTERVAL_RTTS };
+    let rise_due = state.strategy.rise_check && c_tight && !planner.app_limited && t >= planner.rise_last + rise_interval;
+
+    let mode = if rise_continues {
+        Mode::RiseCheck
+    } else if planner.mode == Mode::Drain && !drained && !drain_gave_up {
         Mode::Drain
     } else if drain_due && !drain_gave_up {
         Mode::Drain
     } else if !c_tight {
         Mode::Explore
+    } else if rise_due {
+        // `r / (r - max_c)` RTTs prove `C >= max_c` only to within the
+        // service lag; one more makes the lower bound exceed `max_c`.
+        let step = rise_rate - belief.max_c;
+        let rtts = (rise_rate / step).ceil().to_integer() as usize + 1;
+        info!("t={}: rise check at {} for {} RTTs ({})", t, rise_rate, rtts, if rise_lossless { "lossless" } else { "lossy" });
+        planner.rise = Some(RiseCheck { started: t, rtts, lossless: rise_lossless, loss_at_start: loss_now });
+        Mode::RiseCheck
     } else if since_probe >= state.probe_interval_rtts {
         Mode::Probe
     } else {
@@ -883,6 +973,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             (vec![CandidateAction::ProbeAboveLimit], budget)
         }
         Mode::Cruise => (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET),
+        Mode::RiseCheck => (vec![CandidateAction::AboveMaxC], CAUTIOUS_LOSS_BUDGET),
         // `HoldQueue` at the queue target: `DrainQueue` unless a floor is
         // known, in which case draining below it would only idle the link.
         Mode::Drain => (vec![CandidateAction::HoldQueue], CAUTIOUS_LOSS_BUDGET),

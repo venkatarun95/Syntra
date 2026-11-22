@@ -23,6 +23,7 @@ use network_model_nc::{
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
+    RISE_STEP,
     explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
     PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
@@ -761,6 +762,10 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                     CandidateAction::ProbeAboveLimit => {
                         max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
                     }
+                    CandidateAction::AboveMaxC => {
+                        let max_c = belief_bounds.max_c;
+                        max_c + std::cmp::max(max_c * RISE_STEP, 1.into())
+                    }
                     CandidateAction::MatchDelivery => {
                         let h = &self.history;
                         let n = h.len();
@@ -1431,6 +1436,9 @@ struct Args {
     /// (restarting is the default).
     #[arg(long)]
     no_change_restart: bool,
+    /// Do not send above `max_c` periodically to detect a rise in C or B.
+    #[arg(long)]
+    no_rise_check: bool,
     /// Let minimax choose (with `qdel`) instead of forcing drains in Explore.
     #[arg(long)]
     explore_free: bool,
@@ -1692,7 +1700,7 @@ fn get_sim_tag(args: &Args) -> String {
     if let Some(k) = args.k_confirm {
         ret.push_str(&format!("_kc{k}"));
     }
-    for (on, name) in [(args.k_optimistic, "kopt"), (args.no_change_restart, "nochg"), (args.explore_free, "xfree")] {
+    for (on, name) in [(args.k_optimistic, "kopt"), (args.no_change_restart, "nochg"), (args.no_rise_check, "norise"), (args.explore_free, "xfree")] {
         if on {
             ret.push_str(&format!("_{name}"));
         }
@@ -1841,6 +1849,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             c_upper_rtts: args.c_upper_rtts,
             explore_budget_bdp: args.explore_budget.map_or(EXPLORE_BUDGET_BDP, frac),
             explore_queue_bdp: args.explore_queue.map_or(EXPLORE_MAX_QUEUE_BDP, frac),
+            rise_check: !args.no_rise_check,
         },
     };
 
