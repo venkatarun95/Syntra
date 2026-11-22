@@ -296,7 +296,7 @@ impl<O: cc_common::Observation> ObservationABR<O> {
             .into_iter()
             .fold(zero, |acc, frame| {
                 acc + if frame.length >= frame.message_length {
-                    frame.encoded_frames.len() as i32
+                    frame.encoded_frames.len() as RealNumInt
                 } else {
                     0
                 }

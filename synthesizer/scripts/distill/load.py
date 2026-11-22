@@ -2,7 +2,7 @@
 import json, glob, os
 from fractions import Fraction as F
 
-ORDER = ["MaxAllowedRate", "HoldQueue", "ProbeAboveLimit", "DrainQueue", "MatchDelivery", "AboveMaxC"]
+ORDER = ["MaxAllowedRate", "HoldQueue", "ProbeAboveLimit", "DrainQueue", "MatchDelivery", "AboveMaxC", "ProbeOnePacket", "ProbeDelivery"]
 
 def q(x):
     return None if x is None else F(x)

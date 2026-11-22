@@ -5,7 +5,8 @@ QE_WINDOW_OBSERVATIONS = 7
 
 def distilled_actions(pf):
     if pf["since_start"] < QE_WINDOW_OBSERVATIONS:
-        return ["MatchDelivery"]
+        # Recover
+        return ["ProbeDelivery" if pf["probe_ok"] else "MatchDelivery"]
     if not pf["newest_window_feasible"]:
         return ["HoldQueue"]
     if pf["rise_continues"]:
@@ -17,6 +18,8 @@ def distilled_actions(pf):
         if pf["queue_high"]:
             return ["HoldQueue"]
         a = ["MaxAllowedRate", "HoldQueue"]
+        if pf.get("probe_small_too"):
+            a.append("ProbeOnePacket")
         if pf["probe_ok"]:
             a.append("ProbeAboveLimit")
         return a

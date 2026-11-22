@@ -897,7 +897,7 @@ impl<NM: NetworkModel> AdaptiveBitrateState<NM> {
         let cca_metrics = cc_common::Metrics {
             neg_delivered: (first.get_s()) - (last.get_s()),
             neg_sent: first.get_a() - last.get_a(),
-            qdel: std::cmp::max(0.into(), (qmax as i32 - 1).into()),
+            qdel: std::cmp::max(0.into(), (qmax as RealNumInt - 1).into()),
             loss: std::cmp::max(
                 0.into(),
                 last.get_ld() - first.get_ld() - self.loss_tolerance_abs,
@@ -970,7 +970,7 @@ impl<NM: NetworkModel> AdaptiveBitrateState<NM> {
                             frame_rate += 1;
                             //print!("GG!\n");
                             // TODO: Currently fragile, need to be changed later
-                            total_qualities += f.message_length / f.encoded_frames.len() as i32;
+                            total_qualities += f.message_length / f.encoded_frames.len() as RealNumInt;
                         }
                         break;
                     }
@@ -1397,7 +1397,7 @@ impl<NM: NetworkModel> AdaptiveBitrateState<NM> {
                 if before_padding > max_allowed_rate_no_loss {
                     break;
                 }
-                let denom = RealNumRep::new_raw(len as i32 - 1, 1);
+                let denom = RealNumRep::new_raw(len as RealNumInt - 1, 1);
                 let padding_per_frame = if denom == 0.into() {
                     max_allowed_rate_no_loss - before_padding
                 } else {

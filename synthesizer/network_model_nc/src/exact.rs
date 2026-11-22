@@ -82,7 +82,7 @@ fn is_open(cell: Cell) -> bool {
 pub fn round_down(x: Wide) -> RealNumRep {
     narrow(x).unwrap_or_else(|| {
         let q = (x * Wide::from_integer(GRID as i128)).floor().to_integer();
-        RealNumRep::new(q.to_i32().expect("bound out of range"), GRID)
+        RealNumRep::new(q.to_i64().expect("bound out of range"), GRID)
     })
 }
 
@@ -90,24 +90,24 @@ pub fn round_down(x: Wide) -> RealNumRep {
 pub fn round_up(x: Wide) -> RealNumRep {
     narrow(x).unwrap_or_else(|| {
         let q = (x * Wide::from_integer(GRID as i128)).ceil().to_integer();
-        RealNumRep::new(q.to_i32().expect("bound out of range"), GRID)
+        RealNumRep::new(q.to_i64().expect("bound out of range"), GRID)
     })
 }
 
 /// `x` itself if its denominator is a power of two up to `GRID`.  Bounds
-/// flow into cumulative arrivals as rates, and `RealNumRep` is `Ratio<i32>`:
-/// mixing denominators such as 3 and 1024 makes sums overflow (silently, in
-/// release builds).  Dyadic denominators up to `GRID` stay bounded.
+/// flow into cumulative arrivals as rates, and `RealNumRep` is `Ratio<i64>`:
+/// mixing denominators such as 3 and 1024 makes sums grow until they overflow (a
+/// panic: release builds check overflow).  Dyadic denominators up to `GRID` stay bounded.
 fn narrow(x: Wide) -> Option<RealNumRep> {
     let d = *x.denom();
     if d > GRID as i128 || d & (d - 1) != 0 {
         return None;
     }
-    Some(RealNumRep::new(x.numer().to_i32()?, d as i32))
+    Some(RealNumRep::new(x.numer().to_i64()?, d as RealNumInt))
 }
 
 /// See `narrow`.
-const GRID: i32 = 1024;
+const GRID: RealNumInt = 1024;
 
 /// The closed hull of each run of adjacent pieces, rounded outward: a
 /// superset of the feasible C set.
@@ -199,12 +199,12 @@ pub fn representatives(pieces: &[Piece]) -> Vec<RealNumRep> {
 }
 
 /// `x` exactly, if its denominator is modest: the concrete QE functions
-/// evaluated at it compute in `Ratio<i32>`.
+/// evaluated at it compute in `RealNumRep`.
 fn exact_value(x: Wide) -> Option<RealNumRep> {
     if *x.denom() > MAX_EVAL_DEN {
         return None;
     }
-    Some(RealNumRep::new(x.numer().to_i32()?, x.denom().to_i32()?))
+    Some(RealNumRep::new(x.numer().to_i64()?, x.denom().to_i64()?))
 }
 
 /// See `exact_value`.

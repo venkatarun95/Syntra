@@ -8,7 +8,7 @@ use lazy_static::lazy_static;
 use std::collections::HashMap;
 use std::ops::Bound;
 
-fn lc(n: i32, d: i32) -> Lin {
+fn lc(n: RealNumInt, d: RealNumInt) -> Lin {
     Lin::from(RealNumRep::new(n, d))
 }
 

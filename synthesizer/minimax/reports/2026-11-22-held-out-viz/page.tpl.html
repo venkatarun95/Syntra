@@ -1,0 +1,375 @@
+<title>Minimax CCA in Simulation</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: one reading column; a scenario switcher above a stacked instrument panel (rate, queue, loss, mode) sharing one time axis. */
+:root {
+  --bg: #f6f7f8;
+  --surface: #fcfcfb;
+  --ink: #101418;
+  --ink-2: #4c535b;
+  --muted: #858b92;
+  --grid: #e1e3e5;
+  --axis: #c3c6ca;
+  --ring: rgba(16,20,24,0.10);
+  --accent: #2a78d6;
+  --band: rgba(42,120,214,0.16);
+  --qband: rgba(235,104,52,0.18);
+  --q: #eb6834;
+  --loss: #e34948;
+  --truth: #101418;
+  --m-explore: #2a78d6;
+  --m-probe: #eb6834;
+  --m-cruise: #1baf7a;
+  --m-rise: #eda100;
+  --m-drain: #e87ba4;
+  --m-recover: #008300;
+  --tip-bg: #101418;
+  --tip-fg: #f0efec;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-data: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1113; --surface: #17191b; --ink: #eef0f2; --ink-2: #b9bfc6; --muted: #868c93;
+    --grid: #26292c; --axis: #3a3e42; --ring: rgba(255,255,255,0.10);
+    --accent: #3987e5; --band: rgba(57,135,229,0.22); --qband: rgba(217,89,38,0.24); --q: #d95926;
+    --loss: #e66767; --truth: #eef0f2;
+    --m-explore: #3987e5; --m-probe: #d95926; --m-cruise: #199e70; --m-rise: #c98500; --m-drain: #d55181; --m-recover: #008300;
+    --tip-bg: #eef0f2; --tip-fg: #101418;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1113; --surface: #17191b; --ink: #eef0f2; --ink-2: #b9bfc6; --muted: #868c93;
+  --grid: #26292c; --axis: #3a3e42; --ring: rgba(255,255,255,0.10);
+  --accent: #3987e5; --band: rgba(57,135,229,0.22); --qband: rgba(217,89,38,0.24); --q: #d95926;
+  --loss: #e66767; --truth: #eef0f2;
+  --m-explore: #3987e5; --m-probe: #d95926; --m-cruise: #199e70; --m-rise: #c98500; --m-drain: #d55181; --m-recover: #008300;
+  --tip-bg: #eef0f2; --tip-fg: #101418;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.55;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 32px 64px;
+}
+.wrap { max-width: 1040px; margin: 0 auto; display: flex; flex-direction: column; gap: 40px; }
+h1, h2, h3 { font-family: var(--font-display); font-weight: 600; text-wrap: balance; margin: 0; letter-spacing: 0.005em; }
+h1 { font-size: 2.1rem; line-height: 1.1; }
+h2 { font-size: 1.45rem; }
+h3 { font-size: 1.1rem; }
+p { margin: 0; max-width: 68ch; }
+.eyebrow { font-family: var(--font-display); font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); font-weight: 500; }
+header { display: flex; flex-direction: column; gap: 12px; }
+header p { color: var(--ink-2); }
+code, .mono { font-family: var(--font-data); font-size: 0.88em; }
+section { display: flex; flex-direction: column; gap: 16px; }
+
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; }
+.tab {
+  font: 500 0.88rem var(--font-body); color: var(--ink-2); background: transparent; border: 1px solid var(--ring);
+  border-radius: 999px; padding: 6px 13px; cursor: pointer;
+}
+.tab:hover { color: var(--ink); border-color: var(--axis); }
+.tab[aria-selected="true"] { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.tab:focus-visible, .toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.panel { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 20px; display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.panel-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 24px; align-items: start; }
+.panel-head .setup { color: var(--ink-2); font-size: 0.92rem; }
+.panel-head .story { font-size: 0.95rem; }
+.stats { display: grid; grid-template-columns: repeat(4, minmax(72px, auto)); gap: 4px 20px; }
+.stat { display: flex; flex-direction: column; }
+.stat .v { font-family: var(--font-data); font-size: 1.15rem; font-weight: 500; }
+.stat .k { font-size: 0.74rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; font-family: var(--font-display); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.82rem; color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 16px; height: 10px; border-radius: 2px; display: inline-block; }
+.sw.line { height: 2px; border-radius: 0; }
+.sw.dash { height: 0; border-top: 2px dashed var(--truth); background: none; }
+
+.chart { position: relative; width: 100%; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart-title { font-family: var(--font-display); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 2px; }
+.tick { font-family: var(--font-data); font-size: 10.5px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.tip {
+  position: absolute; pointer-events: none; background: var(--tip-bg); color: var(--tip-fg); font-family: var(--font-data);
+  font-size: 11.5px; line-height: 1.5; padding: 8px 10px; border-radius: 6px; white-space: nowrap; z-index: 5; top: 0;
+}
+.tip b { font-weight: 500; }
+.charts { display: flex; flex-direction: column; gap: 14px; position: relative; }
+
+.explain { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+.steps { display: flex; flex-direction: column; gap: 14px; padding: 0; margin: 0; list-style: none; counter-reset: s; }
+.steps li { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; counter-increment: s; }
+.steps li::before { content: counter(s); font-family: var(--font-data); font-size: 0.85rem; color: var(--muted); border: 1px solid var(--ring); border-radius: 50%; width: 28px; height: 28px; display: grid; place-items: center; }
+.steps li div { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.modes { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+.modes th, .modes td { text-align: left; padding: 8px 10px 8px 0; border-bottom: 1px solid var(--grid); vertical-align: top; }
+.modes th { font-family: var(--font-display); font-weight: 500; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--muted); }
+.table-scroll { overflow-x: auto; }
+.note { font-size: 0.88rem; color: var(--ink-2); }
+.pending { border: 1px dashed var(--axis); border-radius: 10px; padding: 16px; color: var(--ink-2); font-size: 0.92rem; }
+
+@media (max-width: 640px) {
+  .panel { padding: 14px; }
+  .panel-head { grid-template-columns: minmax(0, 1fr); }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  h1 { font-size: 1.7rem; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Syntra · CBR-delay model · depth-4 minimax</div>
+    <h1>Minimax CCA in simulation</h1>
+    <p>Seven simulated links, 100 RTTs each, driven by the synthesized congestion controller: an exact belief over the link's capacity C and buffer B, a planner that picks a mode each RTT, and a minimax search among the moves the mode allows. One time step is one minimum RTT; rates are packets per RTT.</p>
+  </header>
+
+  <section aria-labelledby="sc-h">
+    <h2 id="sc-h">Scenarios</h2>
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div class="panel" id="panel"></div>
+  </section>
+
+  <section aria-labelledby="alg-h">
+    <h2 id="alg-h">What the controller does</h2>
+    <div class="explain" id="explain"></div>
+  </section>
+
+  <section aria-labelledby="dist-h" id="distilled">
+    <h2 id="dist-h">Distilled policy</h2>
+    <div id="dist-body"></div>
+  </section>
+</div>
+
+<script>
+const DATA = /*DATA*/null;
+const EXTRA = /*EXTRA*/null;
+const MODES = [
+  ['Explore', '--m-explore', 'C is loose: minimax chooses among probing, holding and the max safe rate'],
+  ['Probe', '--m-probe', 'C is tight; a one-RTT probe at the edge of what the buffer absorbs'],
+  ['Cruise', '--m-cruise', 'C is tight; hold the queue near its provable floor'],
+  ['RiseCheck', '--m-rise', 'Send 5/4 of max C for a few RTTs to see whether C or B grew'],
+  ['Drain', '--m-drain', 'Empty the queue to take a min-RTT sample'],
+  ['Recover', '--m-recover', 'Just after a detected change: match the delivery rate'],
+];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const NS = 'http://www.w3.org/2000/svg';
+const el = (tag, attrs = {}, parent) => {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+};
+const fmt = (x, d = 1) => (Math.abs(x) >= 999.5 ? '∞' : (+x).toFixed(d));
+const niceMax = v => {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+};
+const ticks = (max, n = 4) => {
+  const step = niceMax(max / n);
+  const out = [];
+  for (let v = 0; v <= max + 1e-9; v += step) out.push(+v.toFixed(6));
+  return out;
+};
+
+let current = 0;
+try { const h = location.hash.slice(1); const i = DATA.findIndex(d => d.key === h); if (i >= 0) current = i; } catch (e) {}
+
+function renderTabs() {
+  const tabs = document.getElementById('tabs');
+  tabs.innerHTML = '';
+  DATA.forEach((d, i) => {
+    const b = document.createElement('button');
+    b.className = 'tab'; b.id = 'tab-' + d.key; b.type = 'button';
+    b.setAttribute('role', 'tab'); b.setAttribute('aria-selected', i === current);
+    b.textContent = d.title;
+    b.onclick = () => { current = i; try { history.replaceState(null, '', '#' + d.key); } catch (e) {} renderTabs(); renderPanel(); };
+    tabs.appendChild(b);
+  });
+}
+
+function changePoints(s) {
+  const out = [];
+  for (let i = 1; i < s.t.length; i++) if (s.true_c[i] !== s.true_c[i - 1] || s.true_b[i] !== s.true_b[i - 1]) out.push(i);
+  return out;
+}
+
+function renderPanel() {
+  const d = DATA[current], s = d.series, st = d.stats;
+  const p = document.getElementById('panel');
+  p.innerHTML = `
+    <div class="panel-head">
+      <div style="display:flex;flex-direction:column;gap:6px;min-width:0">
+        <h3>${d.title}</h3>
+        <p class="setup">${d.setup}</p>
+        <p class="story">${d.story}</p>
+      </div>
+      <div class="stats">
+        <div class="stat"><span class="v">${(st.util * 100).toFixed(0)}%</span><span class="k">Utilization</span></div>
+        <div class="stat"><span class="v">${st.loss.toFixed(0)}</span><span class="k">Pkts lost</span></div>
+        <div class="stat"><span class="v">${(st.loss / Math.max(st.sent, 1) * 100).toFixed(1)}%</span><span class="k">Loss rate</span></div>
+        <div class="stat"><span class="v">${st.restarts}</span><span class="k">Restarts</span></div>
+      </div>
+    </div>
+    <div class="charts" id="charts"></div>
+    <p class="note">Hover or tap a chart to read one RTT. Solid vertical lines mark belief restarts (the controller concluded the link changed); dashed vertical lines mark the true changes. The belief band is clipped where max C or max queue is still unbounded.</p>`;
+  drawCharts(document.getElementById('charts'), s);
+}
+
+function drawCharts(host, s) {
+  const n = s.t.length;
+  const W = Math.max(300, host.clientWidth);
+  const M = { l: 44, r: 12 };
+  const iw = W - M.l - M.r;
+  const x = i => M.l + (i / (n - 1)) * iw;
+  const cps = changePoints(s);
+  const restarts = s.t.filter((_, i) => s.restart[i]);
+  const tip = document.createElement('div'); tip.className = 'tip'; tip.hidden = true;
+  const panels = [];
+
+  function frame(title, legendHtml, H, yMax, yLabelFmt) {
+    const wrap = document.createElement('div'); wrap.className = 'chart';
+    wrap.innerHTML = `<div class="chart-title">${title}</div>${legendHtml ? `<div class="legend" style="margin-bottom:6px">${legendHtml}</div>` : ''}`;
+    host.appendChild(wrap);
+    const T = 6, B = 20;
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': title });
+    wrap.appendChild(svg);
+    const y = v => T + (1 - Math.min(v, yMax) / yMax) * (H - T - B);
+    for (const tv of ticks(yMax)) {
+      el('line', { x1: M.l, x2: W - M.r, y1: y(tv), y2: y(tv), stroke: css('--grid'), 'stroke-width': 1 }, svg);
+      const t = el('text', { x: M.l - 6, y: y(tv) + 3.5, 'text-anchor': 'end', class: 'tick' }, svg); t.textContent = yLabelFmt ? yLabelFmt(tv) : tv;
+    }
+    el('line', { x1: M.l, x2: W - M.r, y1: y(0), y2: y(0), stroke: css('--axis'), 'stroke-width': 1 }, svg);
+    for (let tv = 0; tv < n; tv += 10) {
+      const t = el('text', { x: x(tv), y: H - 5, 'text-anchor': 'middle', class: 'tick' }, svg); t.textContent = tv;
+    }
+    for (const c of cps) el('line', { x1: x(c), x2: x(c), y1: T, y2: H - B, stroke: css('--truth'), 'stroke-width': 1, 'stroke-dasharray': '3 3', opacity: 0.55 }, svg);
+    for (const r of restarts) el('line', { x1: x(r), x2: x(r), y1: T, y2: H - B, stroke: css('--truth'), 'stroke-width': 1.5, opacity: 0.8 }, svg);
+    panels.push({ svg, H, T, B, wrap });
+    return { svg, y };
+  }
+  const path = (ys, y) => ys.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+  const stepPath = (ys, y) => ys.map((v, i) => `${i ? `L${x(i).toFixed(1)},${y(ys[i - 1]).toFixed(1)}L` : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join('');
+  const band = (lo, hi, y) => {
+    let dd = '';
+    for (let i = 0; i < n; i++) dd += `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(hi[i]).toFixed(1)}`;
+    for (let i = n - 1; i >= 0; i--) dd += `L${x(i).toFixed(1)},${y(lo[i]).toFixed(1)}`;
+    return dd + 'Z';
+  };
+
+  // Rate
+  const rMax = niceMax(Math.max(...s.true_c, ...s.rate, ...s.min_c) * 1.35);
+  {
+    const lg = `<span><i class="sw line" style="background:var(--accent)"></i>Rate sent</span><span><i class="sw" style="background:var(--band)"></i>Belief: C between min and max</span><span><i class="sw dash"></i>True C</span>`;
+    const { svg, y } = frame('Rate · packets per RTT', lg, 200, rMax);
+    el('path', { d: band(s.min_c, s.max_c, y), fill: css('--band'), stroke: 'none' }, svg);
+    el('path', { d: stepPath(s.true_c, y), fill: 'none', stroke: css('--truth'), 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }, svg);
+    el('path', { d: path(s.sent, y), fill: 'none', stroke: css('--accent'), 'stroke-width': 2, 'stroke-linejoin': 'round' }, svg);
+  }
+  // Queue
+  const qMax = niceMax(Math.max(...s.max_q, ...s.true_b) * 1.15);
+  {
+    const lg = `<span><i class="sw" style="background:var(--qband)"></i>Belief: queue between min and max</span><span><i class="sw line" style="background:var(--q)"></i>Worst-case queue (max)</span><span><i class="sw dash"></i>True buffer B</span>`;
+    const { svg, y } = frame('Queue · packets', lg, 150, qMax);
+    el('path', { d: band(s.min_q, s.max_q, y), fill: css('--qband'), stroke: 'none' }, svg);
+    el('path', { d: path(s.max_q, y), fill: 'none', stroke: css('--q'), 'stroke-width': 2, 'stroke-linejoin': 'round' }, svg);
+    el('path', { d: stepPath(s.true_b, y), fill: 'none', stroke: css('--truth'), 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }, svg);
+  }
+  // Loss
+  const lMax = niceMax(Math.max(2, ...s.loss) * 1.1);
+  {
+    const { svg, y } = frame('Packets lost per RTT', '', 90, lMax);
+    const bw = Math.max(1.5, iw / n - 2);
+    s.loss.forEach((v, i) => {
+      if (v <= 0) return;
+      const h = Math.max(1, y(0) - y(v));
+      el('rect', { x: x(i) - bw / 2, y: y(0) - h, width: bw, height: h, rx: Math.min(2, bw / 2), fill: css('--loss') }, svg);
+    });
+  }
+  // Mode strip
+  {
+    const H = 46;
+    const wrap = document.createElement('div'); wrap.className = 'chart';
+    const present = MODES.filter(m => s.mode.includes(m[0]));
+    wrap.innerHTML = `<div class="chart-title">Planner mode</div><div class="legend" style="margin-bottom:6px">${present.map(m => `<span><i class="sw" style="background:var(${m[1]})"></i>${m[0]}</span>`).join('')}<span><i class="sw" style="background:none;border:1.5px solid var(--muted);height:8px;width:8px;border-radius:50%"></i>Min-RTT sample</span></div>`;
+    host.appendChild(wrap);
+    const svg = el('svg', { viewBox: `0 0 ${W} ${H}`, height: H, role: 'img', 'aria-label': 'Planner mode per RTT' });
+    wrap.appendChild(svg);
+    const cw = iw / (n - 1);
+    s.mode.forEach((m, i) => {
+      const spec = MODES.find(q => q[0] === m);
+      el('rect', { x: x(i) - cw / 2 + 0.5, y: 4, width: Math.max(1, cw - 1), height: 16, fill: spec ? css(spec[1]) : css('--muted') }, svg);
+      if (s.min_rtt[i]) el('circle', { cx: x(i), cy: 27, r: 2, fill: 'none', stroke: css('--muted'), 'stroke-width': 1.2 }, svg);
+    });
+    for (let tv = 0; tv < n; tv += 10) { const t = el('text', { x: x(tv), y: H - 3, 'text-anchor': 'middle', class: 'tick' }, svg); t.textContent = tv; }
+    panels.push({ svg, H, T: 4, B: 26, wrap });
+  }
+
+  host.appendChild(tip);
+  const cursors = panels.map(pn => el('line', { y1: pn.T, y2: pn.H - pn.B, stroke: css('--ink-2'), 'stroke-width': 1, opacity: 0, 'pointer-events': 'none' }, pn.svg));
+  function show(i) {
+    cursors.forEach(c => { c.setAttribute('x1', x(i)); c.setAttribute('x2', x(i)); c.setAttribute('opacity', 0.6); });
+    const lines = [
+      `<b>RTT ${i}</b> · ${s.mode[i]} → ${s.action[i]}${s.app_limited[i] ? ' (app-limited)' : ''}`,
+      `sent ${fmt(s.sent[i])} · C ∈ [${fmt(s.min_c[i])}, ${fmt(s.max_c[i])}] · true ${fmt(s.true_c[i], 0)}`,
+      `queue ≤ ${fmt(s.max_q[i])} · B ∈ [${fmt(s.min_b[i], 0)}, ${fmt(s.max_b[i], 0)}] · true ${fmt(s.true_b[i], 0)}`,
+      `lost ${fmt(s.loss[i], 0)}${s.restart[i] ? ' · belief restarted' : ''}`,
+    ];
+    tip.innerHTML = lines.join('<br>');
+    tip.hidden = false;
+    const hw = host.clientWidth, tw = tip.offsetWidth;
+    let left = x(i) * hw / W + 12;
+    if (left + tw > hw) left = x(i) * hw / W - tw - 12;
+    tip.style.left = Math.max(0, left) + 'px';
+  }
+  function hide() { tip.hidden = true; cursors.forEach(c => c.setAttribute('opacity', 0)); }
+  panels.forEach(pn => {
+    const hit = el('rect', { x: M.l, y: 0, width: iw, height: pn.H, fill: 'transparent' }, pn.svg);
+    const move = ev => {
+      const r = pn.svg.getBoundingClientRect();
+      const px = (ev.clientX - r.left) * W / r.width;
+      const i = Math.round(Math.min(n - 1, Math.max(0, (px - M.l) / iw * (n - 1))));
+      show(i);
+    };
+    hit.addEventListener('pointermove', move);
+    hit.addEventListener('pointerdown', move);
+    hit.addEventListener('pointerleave', hide);
+  });
+}
+
+function renderExplain() {
+  const host = document.getElementById('explain');
+  const E = (EXTRA && EXTRA.explain) || null;
+  host.innerHTML = (E || '') + `
+    <div class="table-scroll"><table class="modes"><thead><tr><th>Mode</th><th>When</th><th>Sends</th></tr></thead><tbody>
+      <tr><td><i class="sw" style="background:var(--m-explore)"></i> Explore</td><td>max C &gt; 1.25 × min C</td><td>Minimax picks among the max safe rate, holding the queue at 2 BDP, and a probe one BDP (or one packet, if the buffer is small) above the safe rate.</td></tr>
+      <tr><td><i class="sw" style="background:var(--m-cruise)"></i> Cruise</td><td>C tight, nothing due</td><td>min C minus whatever the queue may exceed its provable floor by (about K + 1 packets).</td></tr>
+      <tr><td><i class="sw" style="background:var(--m-probe)"></i> Probe</td><td>C tight, 10 RTTs since the last probe</td><td>One RTT at the largest rate no believed link would drop (plus one packet unless cautious).</td></tr>
+      <tr><td><i class="sw" style="background:var(--m-rise)"></i> RiseCheck</td><td>C tight; 10, 20, then 40 RTTs apart (40 if it must lose)</td><td>5/4 of max C for about 6 RTTs. Costs about one BDP of queue, or loss on a buffer under one BDP.</td></tr>
+      <tr><td><i class="sw" style="background:var(--m-drain)"></i> Drain</td><td>40 RTTs without a min-RTT sample</td><td>Below min C until the belief proves the queue holds at most K + 1 packets (at most 3 RTTs).</td></tr>
+      <tr><td><i class="sw" style="background:var(--m-recover)"></i> Recover</td><td>Under 7 RTTs since a restart</td><td>What the link delivered over the last one or two RTTs.</td></tr>
+    </tbody></table></div>`;
+}
+
+function renderDistilled() {
+  const host = document.getElementById('dist-body');
+  if (EXTRA && EXTRA.distilled) { host.innerHTML = EXTRA.distilled; return; }
+  host.innerHTML = `<div class="pending">A separate agent is distilling the controller into a decision procedure that matches every RTT of the training traces (any minimax-optimal move counts as a match). Its rules and a side-by-side simulation will appear here once it finishes.</div>`;
+}
+
+renderTabs(); renderPanel(); renderExplain(); renderDistilled();
+let rt; addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(renderPanel, 150); });
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderPanel);
+new MutationObserver(renderPanel).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+</script>

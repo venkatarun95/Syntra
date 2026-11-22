@@ -818,12 +818,147 @@ preferred a lower rate only once (n2 t68).
 
 ### Caveats
 
-* The deferral region is empirical: on unseen links a decision outside it
-  could still go against the highest rate, and `--distilled` cannot notice
-  (it does not search there).  Re-check new scenario sets with the search
-  (`run.sh ... --exact-root --tie-high`, then `evalp.py`).
+* The rule is empirical: on unseen links a decision could go against the
+  highest rate, and `--distilled` cannot notice.  Re-check new scenario sets
+  with the search (`run.sh ... --exact-root --tie-high`, then `evalp.py`).
 * All labels are depth 4, bursty QE, default planner (`--explore-free` is
-  not supported by `--distilled`).
+  not supported by `--distilled`), default `--param`s.
+* Since the changes below, `--distilled` no longer searches in the
+  cap-bound region: it sends the highest rate there too, and the CSV marks
+  the RTT `dist-capbound`.  The one labelled exception (n2 t68: the search
+  holds at 64.2 instead of probing to 89.8, on the worst-case width of C at
+  the horizon) is ignored on purpose; `--distilled-search` restores the
+  deferral.
+
+## Depth 6, probe timing, Cruise queue, runtime parameters (Nov 2026)
+
+Notes and reports: `reports/2026-11-22-depth6-probes/`.
+
+### Depth 6
+
+Same 7 links × 100 RTTs as the held-out set, `--depth 6 --exact-root
+--tie-high` (search fixes on):
+
+* **Cost.** A searched RTT takes 13-26 s (median per link), up to 72 s,
+  about 10× depth 4 per extra move/reply pair.  Depth 8 would be minutes per
+  searched RTT; not run.
+* **Behaviour.** Utilization is the same (within 0.02) and loss is lower
+  (brise 35 -> 15, cupdown 162 -> 107, cdrop_bursty 141 -> 96, onoff 25 -> 5,
+  smallbuf 80 -> 8), but for a reason that is an artifact of the horizon:
+  `lt` counts all loss since the belief started against one probe's budget.
+  A probe at the root shows its whole worst case inside six plies (on
+  bigbuf t8: the probe's 100 packets plus 11 that the service lag overflows
+  afterwards = 111 > 100), while a probe one RTT later shows less, so the
+  search postpones probes: Explore probes every 3 RTTs instead of 2.  On
+  smallbuf it never probes again after t13: C stays at [38, 56] for 87 RTTs
+  and the CCA never leaves Explore.  That is lower loss by not learning.
+* With `--lt-slack 2` (`lt` allows two budgets) depth 6 is back to depth 4:
+  the highest rate is optimal at 49 of 51 searched RTTs (was 67 of 106),
+  the loss is depth 4's.  The two exceptions take the one-packet probe on
+  the first probe.
+* The bursty large-buffer link does not improve with depth (0.71 vs 0.72):
+  its loss of utilization is in Cruise, which has one candidate.
+
+So depth 6 shows no real gain; the CCA stays the depth-4 distilled rule.
+
+### Why the bursty large-buffer link is below full utilization
+
+On C 50, B 100, K 4 with random service, Cruise's `HoldQueue` sends
+`min_c - (max_q - target)`.  The link may serve up to an RTT late, so the
+worst-case queue `max_q` swings between 4 and 28 packets while `min_q` is 0,
+and Cruise drains a queue that may not exist: it sends 25-48 at C 50.  Depth
+does not change it (one candidate).  The trade-off is worst-case delay for
+utilization, now `CRUISE_QUEUE_BDP` (`--cruise-queue`, `--param
+cruise_queue_bdp=`): Cruise holds the worst-case queue up to that many BDPs.
+
+| Cruise queue | util (from RTT 10) | mean / max worst-case queue (pkts) | final C belief |
+| --- | --- | --- | --- |
+| 0 | 0.78 | 20 / 57 | [47.9, 53.2] |
+| 0.25 BDP | 0.81 | 22 / 59 | [48.5, 52.9] |
+| 0.5 BDP (default) | 0.87 | 29 / 88 | [48.8, 50.3] |
+| 1 BDP | 0.92 | 38 / 97 | [49.9, 50.1] |
+
+A busier link also pins C.  On a link that serves on time this is a real
+standing queue of up to 0.5 BDP.  The rest of the gap is Explore: with K
+unconfirmed it takes ~30 RTTs.
+
+### Probe timing and Recover
+
+* **Probes are timed from the last probe or the last growth of the C
+  interval, whichever is later** (`PlannerState::c_widened`): `min_c` falls
+  or `max_c` rises at a restart, a larger K, or an expired `max_c`.
+* **Why Recover lasts 7 observations.**  QE tables exist only for windows
+  of 7 observations (T = 6), and a window that reaches back past a change
+  mixes two links, so for 6 RTTs after a restart there is no window: the
+  belief is the chained C bounds alone and the queue is bounded only by
+  what is in flight (including an RTT of service lag).  Shorter windows
+  would need new QE runs.
+* **Recover now probes** (`ProbeDelivery`, every `EXPLORE_PROBE_GAP_RTTS`
+  from the restart): it sends the delivery plus as much again as keeps the
+  in-flight queue bound within `RECOVER_QUEUE_DELIVERIES` (2) deliveries.
+  After a rise the bound is about one RTT of sending and this doubles the
+  rate; after a fall the link is backlogged, the bound is 4-6 deliveries and
+  it sends the delivery.  cupdown (C 20 -> 50 -> 25): Explore starts at
+  `min_c` 50 instead of 25 after the rise; utilization 0.84 -> 0.87.
+  `--no-recover-probe` turns it off.
+* **One-packet probes** (`ProbeOnePacket`, `MaxAllowedRate + 1`) are
+  offered next to the 1-BDP Explore probe whenever the budget exceeds one
+  packet (`--no-probe-one-packet`).  At depth 4 the search never strictly
+  prefers it (tied 6 times, loses 35 times: loss within the budget is free
+  and the larger probe sends and learns more).  At depth 6 with `lt` slack it
+  wins the two cases above.
+
+Labels with these changes (`/tmp/cca_new/d4_all`, 45 runs × 70 RTTs, 714
+searched): candidate set = planner's 3150/3150, distilled rate optimal
+3150/3150; "highest" is not optimal only at n2 t68, as before.  On the 7
+held-out links `--distilled` reproduces the search's CSV on every behaviour
+column.
+
+Default changes vs the previous section (7 links × 100 RTTs, depth 4):
+
+| link | util before -> after | loss before -> after |
+| --- | --- | --- |
+| bigbuf | 0.95 -> 0.95 | 0 -> 0 |
+| smallbuf | 0.81 -> 0.88 | 80 -> 80 |
+| bursty | 0.72 -> 0.81 | 0 -> 0 |
+| cupdown | 0.84 -> 0.87 | 162 -> 172 |
+| brise | 0.98 -> 0.99 | 35 -> 35 |
+| onoff | 0.49 -> 0.50 | 25 -> 25 |
+| cdrop_bursty | 0.74 -> 0.75 | 141 -> 137 |
+
+### Runtime parameters
+
+Every planner constant is a field of `Tunables` (`tun()`), defaulting to
+the constant; `--param NAME=VALUE` (repeatable) overrides it, e.g.
+`--param c_tight_ratio=1.5 --param k_hypotheses=1/4/16`.  The strategy
+switches are also `--param`s (`probe_interval_rtts`, `drain_interval_rtts`,
+`k_confirm_rtts`, `explore_budget_bdp`, `explore_max_queue_bdp`,
+`cruise_queue_bdp`, `rise_check`, `probe_one_packet`, `recover_probe`).  The
+distilled rule was checked against the search with the defaults only.
+
+### 64-bit rationals and long runs
+
+`RealNumRep` is now `Ratio<i64>` (was `i32`).  Every run so far was at most
+100 RTTs; at C 500 the `i32` engine overflowed (a panic, since release
+builds check overflow) at RTT 396, with cumulative arrivals near 174k.  The
+7 held-out traces are identical under `i64` (it can only differ where
+`i32` overflowed).  The exact layer still rounds new bounds outward to
+dyadic denominators up to 1024, which keeps denominators small; cumulative
+counts still grow, so very long runs should rebase (A and S shifted by the
+same amount leave every constraint unchanged).
+
+Per-RTT cost grows with the history: every RTT, change detection
+(`locate_change`) checks that the whole history since the belief started
+is consistent, which includes the chained C bounds over every pair of RTTs,
+and the belief folds every window.  A step takes 0.1 s at RTT 100 and 1.4 s
+at RTT 900 (C 500, random service).  `--belief-history N` alone does not
+help (change detection still reads everything) and forgets: the retained
+belief is only kept while the window holds an app-limited RTT.
+`--history-window N` bounds the cost: the belief folds the newest N
+observations and is always intersected with the previous committed belief
+(until a restart), and change detection checks only the newest N (an older
+change was checked when it was newer; the K tracker still accumulates every
+window).  With N = 64 the 7 held-out links give identical traces.
 
 ## QE/transpilation boundary
 

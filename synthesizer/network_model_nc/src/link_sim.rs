@@ -86,7 +86,7 @@ impl BurstyLinkSim {
 
         let lo_s = std::cmp::max(self.last_s, i_prev);
         // Round down to a 1/16 grid to keep rational denominators bounded.
-        let s = std::cmp::max(lo_s, lo_s + ((i - lo_s) * clamp01(choice.service) * 16i32).floor() / 16i32);
+        let s = std::cmp::max(lo_s, lo_s + ((i - lo_s) * clamp01(choice.service) * 16).floor() / 16);
         let s = std::cmp::min(s, i);
         self.last_s = s;
 

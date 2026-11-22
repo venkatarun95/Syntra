@@ -23,11 +23,12 @@ use network_model_nc::{
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
-    RISE_STEP,
+    frac,
+    tun, set_tunables, Tunables, CRUISE_QUEUE_BDP,
     distilled_actions, explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
     PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
-    EXPLORE_BUDGET_BDP, EXPLORE_MAX_QUEUE_BDP, K_POLICY, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
+    EXPLORE_BUDGET_BDP, EXPLORE_MAX_QUEUE_BDP, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
 };
 
 // ------------------------------------------------------------------------------------------
@@ -273,6 +274,14 @@ struct CongCtrlState<NM: NetworkModel> {
     /// (`game_over`); `--no-prune-disjoint` keeps them, scored on their own
     /// interval.
     prune_disjoint: bool,
+    /// `lt` (the `loss_tol` metric) allows this many times the loss budget
+    /// over the history and horizon (`--lt-slack`).
+    lt_slack: RealNumRep,
+    /// `--history-window`: beliefs and change detection look at only the
+    /// newest this many observations, and the previous committed belief is
+    /// always retained (until a restart), so what older windows proved is
+    /// kept while the per-RTT cost stays bounded.
+    history_window: Option<usize>,
 
     // Config
     policy: StatePolicy,
@@ -664,7 +673,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         Metrics {
             neg_delivered: (first.get_s()) - (last.get_s()),
             neg_sent: first.get_a() - last.get_a(),
-            qdel: std::cmp::max(0.into(), (qmax as i32 - 1).into()),
+            qdel: std::cmp::max(0.into(), (qmax as RealNumInt - 1).into()),
             loss: std::cmp::max(
                 0.into(),
                 last.get_ld() - first.get_ld() - self.policy.loss_tolerance_abs,
@@ -681,7 +690,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             time_to_shrink_c,
             //loss_tol: last.get_ld() <= latest.min_c,
             //loss_tol,
-            loss_tol: (last.get_ld() - first.get_ld()) <= self.policy.loss_tolerance_abs * 1,
+            loss_tol: (last.get_ld() - first.get_ld()) <= self.policy.loss_tolerance_abs * self.lt_slack,
             time_to_shrink_c_l,
             time_to_shrink_c_h,
             time_to_c,
@@ -773,7 +782,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let needs_max_rate = actions.iter().any(|candidate| {
             matches!(
                 candidate,
-                CandidateAction::MaxAllowedRate | CandidateAction::ProbeAboveLimit
+                CandidateAction::MaxAllowedRate | CandidateAction::ProbeAboveLimit | CandidateAction::ProbeOnePacket
             )
         });
         // `compute_max_allowed_rate` enumerates network moves, so skip it
@@ -812,13 +821,14 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                     }
                     CandidateAction::AboveMaxC => {
                         let max_c = belief_bounds.max_c;
-                        max_c + std::cmp::max(max_c * RISE_STEP, 1.into())
+                        max_c + std::cmp::max(max_c * tun().rise_step, 1.into())
                     }
-                    CandidateAction::MatchDelivery => {
-                        let h = &self.history;
-                        let n = h.len();
-                        let k = (n - 1).saturating_sub(self.planner.belief_start).clamp(1, 2);
-                        (h[n - 1].get_s() - h[n - 1 - k].get_s()) / (k as RealNumInt)
+                    CandidateAction::ProbeOnePacket => max_allowed_rate.unwrap() + 1,
+                    CandidateAction::MatchDelivery => self.delivery_rate(),
+                    CandidateAction::ProbeDelivery => {
+                        let d = self.delivery_rate();
+                        let room = d * tun().recover_queue_deliveries - max_q;
+                        d + std::cmp::max(0.into(), std::cmp::min(d, room))
                     }
                 };
                 // Keep the worst-case queue within the cap: at C = min_c the
@@ -832,6 +842,15 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             .filter(|(_, rate)| *rate >= 0.into())
             .collect();
         (rates, max_allowed_rate)
+    }
+
+    /// What the link delivered per RTT over the (up to two) newest RTTs
+    /// since the belief started (`MatchDelivery`).
+    fn delivery_rate(&self) -> RealNumRep {
+        let h = &self.history;
+        let n = h.len();
+        let k = (n - 1).saturating_sub(self.planner.belief_start).clamp(1, 2);
+        (h[n - 1].get_s() - h[n - 1 - k].get_s()) / (k as RealNumInt)
     }
 
     fn compute_cca_moves(&self) -> Vec<CCMove<NM::NA>> {
@@ -1075,6 +1094,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         };
         let retain = match self.belief_history {
             None => true,
+            Some(_) if self.history_window.is_some() => true,
             Some(n) => self.app_limited_rtts.iter().rev().take(n).any(|&a| a),
         };
         (narrowed && retain).then_some(*prior)
@@ -1122,6 +1142,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             root_tie_high: false,
             spec_monotone: false,
             prune_disjoint: false,
+            lt_slack: 1.into(),
+            history_window: None,
             disjoint_stack: Vec::new(),
             policy: StatePolicy::default(),
             planner: PlannerState::default(),
@@ -1155,6 +1177,13 @@ impl CongCtrlState<NetworkModelNC> {
     /// fitting), and undoes its restart if the history is consistent.
     fn locate_change(&mut self, timestep: usize, start_before: usize, restarts_before: usize) {
         let n = self.history.len();
+        // `--history-window`: only the newest observations are checked (a
+        // change older than the window was checked when it was newer).
+        let start_before_full = start_before;
+        let start_before = match self.history_window {
+            Some(w) => std::cmp::max(start_before, n.saturating_sub(w)),
+            None => start_before,
+        };
         let consistent = |s: usize, e: usize| self.fold_history(&self.history[s..e], e - s, &None, false).is_ok();
         if !consistent(start_before, n) {
             // A burstier link than the assumed K (a confirmed K is an
@@ -1207,6 +1236,8 @@ impl CongCtrlState<NetworkModelNC> {
             // history[start..lo] is consistent, history[start..lo + 1] not.
             start = lo;
         }
+        // Consistent within the window counts as consistent since the old start.
+        let (start, start_before) = if start == start_before { (start_before_full, start_before_full) } else { (start, start_before_full) };
         self.planner.restarts = restarts_before + usize::from(start != start_before);
         if start == self.planner.belief_start {
             return;
@@ -1315,14 +1346,16 @@ impl CongCtrlState<NetworkModelNC> {
 
     /// `--distilled`: the rate `distilled_actions` picks (the highest of its
     /// actions' rates, with the planner's formulas and parameters for this
-    /// RTT), or `None` where the distilled policy defers to the search: more
-    /// than one distinct rate, `max_c` bounded, and the highest rate is the
-    /// queue cap's (`min_c + cap - max_q`).  There probing now or next RTT
-    /// sends about the same over the horizon and the choice is made by the
+    /// RTT), whether those actions are exactly the planner's candidate set,
+    /// and whether this RTT is in the cap-bound region: more than one
+    /// distinct rate, `max_c` bounded, and the highest rate is the queue
+    /// cap's (`min_c + cap - max_q`).  There probing now or next RTT sends
+    /// about the same over the horizon and the search decides on the
     /// worst-case width of C at the horizon (`c`), which no root feature
-    /// predicted (see "Distilled policy" in `CCA_DEVELOPMENT.md`).
-    /// Also whether those actions are exactly the planner's candidate set.
-    fn distilled_rate(&self) -> (Option<RealNumRep>, bool) {
+    /// predicts; in every labelled RTT but one (n2 t68, see "Distilled
+    /// policy" in `CCA_DEVELOPMENT.md`) the highest rate was optimal there
+    /// too.  The rate is `None` there only with `defer` (`--distilled-search`).
+    fn distilled_rate(&self, defer: bool) -> (Option<RealNumRep>, bool, bool) {
         let actions = distilled_actions(&self.policy.features);
         let ok = actions == self.policy.candidate_actions;
         let (rates, _) = self.candidate_rates_for(&actions);
@@ -1333,8 +1366,8 @@ impl CongCtrlState<NetworkModelNC> {
             .policy
             .queue_cap
             .is_some_and(|cap| top == std::cmp::max(0.into(), bb.min_c + cap - bb.max_q));
-        let defer = distinct.len() > 1 && cap_bound && bb.max_c < LARGEST_BW.into();
-        (if defer { None } else { Some(top) }, ok)
+        let cap_region = distinct.len() > 1 && cap_bound && bb.max_c < LARGEST_BW.into();
+        (if defer && cap_region { None } else { Some(top) }, ok, cap_region)
     }
 
     /// `--decisions`: everything the CCA knows before deciding this RTT,
@@ -1377,9 +1410,10 @@ impl CongCtrlState<NetworkModelNC> {
                 "rise_fits": pf.rise_fits, "rise_lossless": pf.rise_lossless,
                 "explore_cap": q(pf.explore_cap), "queue_high": pf.queue_high,
                 "probe_ok": pf.probe_ok, "probe_gap": pf.probe_gap,
+                "probe_due": pf.probe_due, "probe_small_too": pf.probe_small_too,
             },
             "planner": {
-                "last_probe": pl.last_probe, "last_drained": pl.last_drained,
+                "last_probe": pl.last_probe, "c_widened": pl.c_widened, "last_drained": pl.last_drained,
                 "drain_started": pl.drain_started, "app_limited": pl.app_limited,
                 "queue_floor": q(pl.queue_floor), "last_sent": q(pl.last_sent),
                 "belief_start": pl.belief_start, "restarts": pl.restarts,
@@ -1532,6 +1566,12 @@ struct Args {
     #[arg(long)]
     belief_history: Option<usize>,
 
+    /// Bound the per-RTT cost on long runs: beliefs and change detection use
+    /// only the newest N observations, and the previous belief is always
+    /// retained (until a restart).  Implies `--belief-history N`.
+    #[arg(long)]
+    history_window: Option<usize>,
+
     /// Simulated application: `backlogged`, `rate:X` (X pkts/RTT into an
     /// app buffer), `onoff:ON:OFF` (backlogged for ON RTTs, idle for OFF) or
     /// `random` (supply uniform in [0, 2 sim_c) each RTT, buffered).  The CCA
@@ -1560,6 +1600,16 @@ struct Args {
     /// Do not send above `max_c` periodically to detect a rise in C or B.
     #[arg(long)]
     no_rise_check: bool,
+    /// Do not offer a one-packet probe next to a larger Explore probe.
+    #[arg(long)]
+    no_probe_one_packet: bool,
+    /// Only match the delivery in Recover; do not probe above it.
+    #[arg(long)]
+    no_recover_probe: bool,
+    /// Override `CRUISE_QUEUE_BDP`: Cruise holds the worst-case queue at up
+    /// to this many BDPs (0: drain to `queue_target`).
+    #[arg(long)]
+    cruise_queue: Option<f64>,
     /// Let minimax choose (with `qdel`) instead of forcing drains in Explore.
     #[arg(long)]
     explore_free: bool,
@@ -1619,12 +1669,16 @@ struct Args {
     #[arg(long)]
     check_rule: bool,
     /// Take `distilled_actions`' choice (the highest of its actions' rates)
-    /// instead of searching, except in the small region where it defers to
-    /// the search (`distilled_rate`).  The CSV column `rule` is `dist-ok`,
-    /// `dist-search` (deferred) or `dist-MISMATCH` (its actions differ from
-    /// the planner's candidate set).
+    /// instead of searching, on every RTT.  The CSV column `rule` is
+    /// `dist-ok`, `dist-capbound` (the cap-bound region of `distilled_rate`),
+    /// `dist-search` (deferred, with `--distilled-search`) or
+    /// `dist-MISMATCH` (its actions differ from the planner's candidate set).
     #[arg(long)]
     distilled: bool,
+    /// With `--distilled`, search in the cap-bound region instead (where in
+    /// one labelled RTT the search preferred a lower rate).
+    #[arg(long)]
+    distilled_search: bool,
     /// Break exact ties at the root towards the highest rate (by default the
     /// search keeps the last candidate in planner order).  Every choice is
     /// still minimax-optimal; `--distilled` makes the same choice.
@@ -1640,6 +1694,20 @@ struct Args {
     /// from the parent node's (the old behaviour) instead of pruning them.
     #[arg(long)]
     no_prune_disjoint: bool,
+    /// `lt` allows this many loss budgets (default 1).  A probe's worst
+    /// case loses its budget plus what the service lag overflows after it,
+    /// and a probe at the root shows all of that within the horizon while a
+    /// later one shows less, so a deep search postpones probes on `lt`.
+    #[arg(long)]
+    lt_slack: Option<f64>,
+    /// Override a planner parameter, `NAME=VALUE` (repeatable).  NAME is a
+    /// `Tunables` field (e.g. `c_tight_ratio=1.5`, `k_hypotheses=1/4/16`)
+    /// or one of `probe_interval_rtts`, `drain_interval_rtts`,
+    /// `k_confirm_rtts`, `explore_budget_bdp`, `explore_max_queue_bdp`,
+    /// `cruise_queue_bdp`, `rise_check`, `probe_one_packet`, `recover_probe`
+    /// (0/1 for the last three).
+    #[arg(long = "param")]
+    params: Vec<String>,
 }
 
 /// `--external`: one RTT's outcome, as read from stdin.
@@ -1779,10 +1847,6 @@ enum SimChoice {
     Mixed,
 }
 
-/// A CLI fraction as an exact rational on a 1/64 grid.
-fn frac(x: f64) -> RealNumRep {
-    RealNumRep::new((x * 64.0).round() as RealNumInt, 64)
-}
 
 /// xorshift64*: deterministic simulation randomness without a dependency.
 struct SimRng(u64);
@@ -1814,7 +1878,7 @@ fn get_sim_tag(args: &Args) -> String {
     }
     if args.qe_model.unwrap_or(QE_MODEL) == QeModel::Bursty {
         // Ratios print as "1/2"; keep the tag a single path component.
-        let assumed = match K_POLICY {
+        let assumed = match tun().k_policy() {
             KPolicy::Fixed(k) => format!("{}", k),
             KPolicy::Hypotheses(ks) => ks.iter().map(|k| k.to_string()).collect::<Vec<_>>().join("-"),
         };
@@ -1925,6 +1989,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // env_logger::Builder::from_env(Env::default().default_filter_or("cc=info,network_model_nc=info")).init();
 
     let args = Args::parse();
+    // Planner parameters: `Tunables` fields now (before the first `tun()`),
+    // the strategy's below.
+    let mut tunables = Tunables::default();
+    let mut strategy_params = vec![];
+    for p in &args.params {
+        let (name, value) = p.split_once('=').ok_or(format!("--param {p}: expected NAME=VALUE"))?;
+        match name {
+            "probe_interval_rtts" | "drain_interval_rtts" | "k_confirm_rtts" | "explore_budget_bdp"
+            | "explore_max_queue_bdp" | "cruise_queue_bdp" | "rise_check" | "probe_one_packet"
+            | "recover_probe" => strategy_params.push((name, value.parse::<f64>().map_err(|e| format!("--param {p}: {e}"))?)),
+            _ => tunables.set(name, value)?,
+        }
+    }
+    set_tunables(tunables);
     info!("Using {:?}", args);
 
     let sim_tag = get_sim_tag(&args);
@@ -1982,10 +2060,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pert: BURSTY_PERT,
             }));
     }
-    let intervals = PlannerIntervals {
+    let mut intervals = PlannerIntervals {
         probe: args.probe_interval.unwrap_or(PROBE_INTERVAL_RTTS),
         drain: args.drain_interval.unwrap_or(DRAIN_INTERVAL_RTTS),
-        belief_history: args.belief_history,
+        belief_history: args.history_window.or(args.belief_history),
         strategy: BeliefStrategy {
             k_confirm_rtts: args.k_confirm.unwrap_or(K_CONFIRM_RTTS),
             k_optimistic: args.k_optimistic,
@@ -1995,8 +2073,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             explore_budget_bdp: args.explore_budget.map_or(EXPLORE_BUDGET_BDP, frac),
             explore_queue_bdp: args.explore_queue.map_or(EXPLORE_MAX_QUEUE_BDP, frac),
             rise_check: !args.no_rise_check,
+            probe_one_packet: !args.no_probe_one_packet,
+            recover_probe: !args.no_recover_probe,
+            cruise_queue_bdp: args.cruise_queue.map_or(CRUISE_QUEUE_BDP, frac),
         },
     };
+    for (name, v) in strategy_params {
+        let st = &mut intervals.strategy;
+        match name {
+            "probe_interval_rtts" => intervals.probe = v.round() as usize,
+            "drain_interval_rtts" => intervals.drain = v.round() as usize,
+            "k_confirm_rtts" => st.k_confirm_rtts = v.round() as usize,
+            "explore_budget_bdp" => st.explore_budget_bdp = frac(v),
+            "explore_max_queue_bdp" => st.explore_queue_bdp = frac(v),
+            "cruise_queue_bdp" => st.cruise_queue_bdp = frac(v),
+            "rise_check" => st.rise_check = v != 0.,
+            "probe_one_packet" => st.probe_one_packet = v != 0.,
+            "recover_probe" => st.recover_probe = v != 0.,
+            _ => unreachable!(),
+        }
+    }
 
     network_model.init();
     let mut ccs = CongCtrlState::new(network_model);
@@ -2012,6 +2108,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ccs.root_tie_high = args.tie_high;
     ccs.spec_monotone = !args.no_spec_monotone;
     ccs.prune_disjoint = !args.no_prune_disjoint;
+    ccs.lt_slack = args.lt_slack.map_or(1.into(), frac);
+    ccs.history_window = args.history_window;
 
     if args.sim {
         ccs.network_model
@@ -2084,7 +2182,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut dist_check = None;
         if args.distilled {
             assert!(!intervals.strategy.explore_free, "--distilled assumes the default planner");
-            let (rate, ok) = ccs.distilled_rate();
+            let (rate, ok, cap_region) = ccs.distilled_rate(args.distilled_search);
             if !ok {
                 warn!("t={}: distilled actions {:?} differ from the planner's {:?}", t,
                       distilled_actions(&ccs.policy.features), ccs.policy.candidate_actions);
@@ -2092,8 +2190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // `None`: the distilled policy defers to the search here.
             dist_check = Some(match (ok, rate) {
                 (false, _) => "dist-MISMATCH",
-                (true, Some(_)) => "dist-ok",
                 (true, None) => "dist-search",
+                (true, Some(_)) if cap_region => "dist-capbound",
+                (true, Some(_)) => "dist-ok",
             });
             rule = rate;
         }

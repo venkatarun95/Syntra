@@ -1162,7 +1162,7 @@ impl NetworkModelNC {
             SimPolicy::Min => min_s,
             // Round down to a 1/16 grid to keep rational denominators bounded.
             SimPolicy::Random => {
-                min_s + ((max_s - min_s) * u * 16i32).floor() / 16i32
+                min_s + ((max_s - min_s) * u * 16).floor() / 16
             }
         };
 
@@ -1547,7 +1547,7 @@ impl NetworkModelNC {
             if min_v == max_v {
                 vals.push(min_v);
             } else {
-                let n_points: RealNumRep = ((n_points) as i32).into();
+                let n_points: RealNumRep = ((n_points) as RealNumInt).into();
                 let local_points: RealNumRep = (n_points * (max_v - min_v) / length).ceil();
                 assert!(local_points.is_integer());
                 if local_points == 1.into() {
@@ -1556,7 +1556,7 @@ impl NetworkModelNC {
                     let den: RealNumRep = local_points - 1;
                     let chunk: RealNumRep = (max_v - min_v) / den;
                     for i in 0..local_points.to_integer() {
-                        let this_n_chunks: RealNumRep = (i as i32).into();
+                        let this_n_chunks: RealNumRep = (i as RealNumInt).into();
                         let this_v: RealNumRep = min_v + chunk * this_n_chunks;
                         vals.push(this_v);
                     }
@@ -1761,7 +1761,7 @@ impl NetworkModelNC {
         //     let den: RealNumRep = ((N_DISCRETE_POINTS - 1) as i32).into();
         //     let chunk: RealNumRep = (max_s - min_s) / den;
         //     for i in 0..N_DISCRETE_POINTS {
-        //         let this_n_chunks: RealNumRep = (i as i32).into();
+        //         let this_n_chunks: RealNumRep = (i as RealNumInt).into();
         //         let this_s: RealNumRep = min_s + chunk * this_n_chunks;
         //         s_vals.push(this_s);
         //     }

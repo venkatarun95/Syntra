@@ -5,7 +5,7 @@ pub mod lin;
 pub mod tree;
 // pub mod my_f64;
 
-pub type RealNumInt = i32;
+pub type RealNumInt = i64;
 pub type RealNumRep = Ratio<RealNumInt>;
 // pub type RealNumRep = my_f64::MyF64;
 
