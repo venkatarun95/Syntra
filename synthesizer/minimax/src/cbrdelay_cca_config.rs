@@ -152,7 +152,12 @@ pub enum CandidateAction {
 /// it only breaks ties the earlier ones leave.  `sent` comes last in every
 /// order: it is the one objective the adversary does not choose, so every
 /// decision has a unique optimum rather than a tie broken by the search's
-/// move order (anything after it would never matter).
+/// move order (anything after it would never matter).  The exception is
+/// `dq`: a drain is needed only when no min-RTT sample has been seen for too
+/// long (Drain), so a mode that does not list it gets it after `sent`.
+/// Otherwise it breaks the ties of a worst-case `s` (which a link that may
+/// serve a round late leaves between rates near C) toward draining, and
+/// Cruise drains below C round after round.
 pub const ALL_OBJECTIVES: &[&str] = &[
     "ld", "lt", "dq", "schadd", "ttscbadd", "scb", "c", "b", "sc", "sb", "schmul", "sclmul", "scladd",
     "ttsc", "ttscl", "ttc", "cb", "ttcb", "l", "qdel", "s", "sent",
@@ -173,12 +178,16 @@ pub const DRAIN_OBJECTIVE_ORDER: &[&str] = &["dq", "ld", "s", "l"];
 pub const OBJECTIVE_ORDER: &[&str] = PROBE_OBJECTIVE_ORDER;
 
 /// `priorities`, then every other objective of `ALL_OBJECTIVES` in its
-/// order, `sent` last.
+/// order, then `sent`, then `dq` unless `priorities` lists it.
 pub fn full_order(priorities: &[&str]) -> Vec<String> {
     let mut order: Vec<&str> = priorities.iter().copied().filter(|o| *o != "sent").collect();
-    let rest: Vec<&str> = ALL_OBJECTIVES.iter().copied().filter(|o| !order.contains(o) && *o != "sent").collect();
+    let late = |o: &str| o == "sent" || o == "dq";
+    let rest: Vec<&str> = ALL_OBJECTIVES.iter().copied().filter(|o| !order.contains(o) && !late(o)).collect();
     order.extend(rest);
     order.push("sent");
+    if !order.contains(&"dq") {
+        order.push("dq");
+    }
     order.into_iter().map(str::to_string).collect()
 }
 
