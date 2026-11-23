@@ -1084,12 +1084,70 @@ it probes, waits for the result, and probes again: the old 2-RTT probe gap,
 found by the search.  The cost in cc_sim with seven runs in parallel is
 30-55 s per RTT in startup (all four K alive), about 60 MB per process.
 
+**All objectives in every mode.**  Each mode lists its priorities and
+`full_order` appends every other objective (`ALL_OBJECTIVES`), `sent` last:
+an extra objective only breaks ties the earlier ones leave.  This changed
+Cruise: where worst-case delivery ties, `dq` now prefers a one-round drain
+and refill (rate 5 then 25-35 on C=20, B=20) over holding at C, since a
+BDP of queue keeps the link busy through the drain round.
+
 **`--replay N`**: the first N observations are replays (cc_sim re-sending a
 segment in new units); their decisions are discarded, so they are not
 searched.
 
 Evaluation: `reports/2026-11-23-search-cca/` (cc_sim focus set, depth 6,
 against Reno, Copa and the ack-window CCA).
+
+## Variable-depth search: quiescence on outstanding losses (design, not built)
+
+**Why.**  Depth 6 is needed only because a probe's loss is reported two
+rounds after it is sent: at depth 4 a leaf can hold unreported loss, which
+`ld` cannot see, so the search treats a probe at the root as free (the
+horizon effect).  Everything else the CCA decides is about as good at depth
+4, and depth 6 costs 30-55 s per RTT.  So search to depth 4 everywhere and
+extend only the leaves where loss is still outstanding, as chess
+quiescence search extends only positions with captures pending.
+
+**Outstanding risk.**  A round's worst-case loss is what it sent above the
+rate its node proved lossless: at `C = min_c`, `B = min_b` and the largest
+queue, a round sending `r` overflows by at most
+`max(0, r - (min_cb - max_q))`, the excess of `r` over the uncapped
+`MaxAllowedRate` at that node.  Record it per CCA move: a `risk_stack` in
+`CongCtrlState` next to `history_stack` (pushed in `make_move` for a CCA
+move, popped in `pop_move`), and for committed rounds in `PlannerState`
+(the last `LOSS_LAG` rounds' risk, `LOSS_LAG = 2`).  A leaf is **quiet**
+when the rounds whose loss is not yet reported (the newest `LOSS_LAG`,
+speculative or committed) carry no risk, or, the cheaper test, when even
+all of it could not change `ld`:
+`window_loss + outstanding_risk <= loss_tolerance_abs`.
+
+**Search.**  In `deepen_tree` (`minimax/src/lib.rs`), at `depth == 0`:
+if `state.quiescent()` (a new `State` method, default `true`) or the
+extension budget is spent, return `state.value()` as now.  Otherwise
+continue for one more round (2 plies) with the CCA restricted to moves that
+add no risk, i.e. `MaxAllowedRate` alone (a `quiet_only` flag that
+`compute_cca_moves` honours; `DrainQueue` could be added), and the full set
+of network replies, so the adversary reports the outstanding loss.  With
+no new risk added, quiet is reached within `LOSS_LAG` rounds: cap the
+extension at 4 plies.  The transposition table must key or depth-tag
+extended entries so a depth-0 value of a non-quiet node is not reused as
+exact.
+
+**Cost.**  The extension branches only on network replies, and only on
+paths that took a risk: in Cruise and Drain (no probe in flight) nothing
+extends and the cost is depth 4's.  A probe's subtree costs depth 4's times
+about `n^2` network replies over its extension, against depth 6's `(3n)`
+per extra round, so it is a saving only where few paths are risky.  If
+that is not enough, a static bound instead of the extension (charge
+`outstanding_risk` to `ld` at the leaf, no search) is cheap and
+conservative: it can only overstate the loss, so it never breaks the
+budget, but it may probe less than depth 6.  The hybrid extends only
+leaves whose static bound would push `ld` over the budget.
+
+**Validation.**  Log `--decisions --exact-root` at depth 6 on the focus
+set; replay the same histories with depth 4 + quiescence and require the
+same chosen rate in every RTT (or a rate with equal depth-6 value), and
+report the time per RTT of each.  Then the cc_sim focus set again.
 
 ## QE/transpilation boundary
 

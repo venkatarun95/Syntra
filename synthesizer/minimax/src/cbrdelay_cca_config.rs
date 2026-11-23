@@ -146,24 +146,41 @@ pub enum CandidateAction {
 /// To create a genuinely new objective dimension, add the corresponding
 /// metric to `cc_common::Metrics` and its comparison in `CCValue`.
 ///
-/// Each mode has its own objective (`state_policy`).
-///
+/// Every mode uses every objective; only the order differs (`state_policy`).
+/// A mode lists its priorities, and `full_order` appends every other
+/// objective in this order, before `sent`.  An extra objective never hurts:
+/// it only breaks ties the earlier ones leave.  `sent` comes last in every
+/// order: it is the one objective the adversary does not choose, so every
+/// decision has a unique optimum rather than a tie broken by the search's
+/// move order (anything after it would never matter).
+pub const ALL_OBJECTIVES: &[&str] = &[
+    "ld", "lt", "dq", "schadd", "ttscbadd", "scb", "c", "b", "sc", "sb", "schmul", "sclmul", "scladd",
+    "ttsc", "ttscl", "ttc", "cb", "ttcb", "l", "qdel", "s", "sent",
+];
+
 /// Probe: learn C and B (`schadd`, `ttscbadd`, `scb`, `c`) without loss
 /// beyond the budget (`ld` first), then deliver.
-pub const PROBE_OBJECTIVE_ORDER: &[&str] = &["ld", "schadd", "ttscbadd", "scb", "c", "l", "s", "sent"];
+pub const PROBE_OBJECTIVE_ORDER: &[&str] = &["ld", "schadd", "ttscbadd", "scb", "c", "l", "s"];
 
 /// Cruise: utilization (`s`) without loss beyond the budget.
-pub const CRUISE_OBJECTIVE_ORDER: &[&str] = &["ld", "s", "l", "sent"];
+pub const CRUISE_OBJECTIVE_ORDER: &[&str] = &["ld", "s", "l"];
 
 /// Drain: prove the queue empty within the horizon (`dq`), and otherwise
 /// deliver as much as possible.
-pub const DRAIN_OBJECTIVE_ORDER: &[&str] = &["dq", "ld", "s", "l", "sent"];
+pub const DRAIN_OBJECTIVE_ORDER: &[&str] = &["dq", "ld", "s", "l"];
 
-/// The default (and Recover's, where there is no search).  `sent` comes
-/// last in every order: it is the one objective the adversary does not
-/// choose, so every decision has a unique optimum rather than a tie broken
-/// by the search's move order.
+/// The default (and Recover's, where there is no search).
 pub const OBJECTIVE_ORDER: &[&str] = PROBE_OBJECTIVE_ORDER;
+
+/// `priorities`, then every other objective of `ALL_OBJECTIVES` in its
+/// order, `sent` last.
+pub fn full_order(priorities: &[&str]) -> Vec<String> {
+    let mut order: Vec<&str> = priorities.iter().copied().filter(|o| *o != "sent").collect();
+    let rest: Vec<&str> = ALL_OBJECTIVES.iter().copied().filter(|o| !order.contains(o) && *o != "sent").collect();
+    order.extend(rest);
+    order.push("sent");
+    order.into_iter().map(str::to_string).collect()
+}
 
 /// The number of observations accepted by one generated QE predicate.  Six
 /// transitions need seven observations.  Do not make a QE window shorter than
@@ -654,7 +671,7 @@ impl Default for StatePolicy {
             belief_history_observations: QE_WINDOW_OBSERVATIONS,
             loss_tolerance_abs: 2.into(),
             delay_tolerance_frac: 3.into(),
-            objective_order: names(OBJECTIVE_ORDER),
+            objective_order: full_order(OBJECTIVE_ORDER),
             candidate_actions: vec![CandidateAction::MaxAllowedRate],
             mode: Mode::Probe,
             queue_target: tun().drain_max_q,
@@ -662,10 +679,6 @@ impl Default for StatePolicy {
             features: PlannerFeatures::default(),
         }
     }
-}
-
-fn names(objectives: &[&str]) -> Vec<String> {
-    objectives.iter().map(|name| (*name).to_string()).collect()
 }
 
 /// `update_k`: how far two windows' C or B bounds may miss each other
@@ -1040,7 +1053,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             belief_history_observations: history_len,
             loss_tolerance_abs: tun().constant_loss_budget(),
             delay_tolerance_frac: 3.into(),
-            objective_order: names(OBJECTIVE_ORDER),
+            objective_order: full_order(OBJECTIVE_ORDER),
             candidate_actions: vec![if probe_ok { CandidateAction::ProbeDelivery } else { CandidateAction::MatchDelivery }],
             mode: Mode::Recover,
             queue_target,
@@ -1060,7 +1073,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             belief_history_observations: history_len,
             loss_tolerance_abs: tun().constant_loss_budget(),
             delay_tolerance_frac: 3.into(),
-            objective_order: names(OBJECTIVE_ORDER),
+            objective_order: full_order(OBJECTIVE_ORDER),
             candidate_actions: vec![CandidateAction::DrainQueue],
             mode,
             queue_target,
@@ -1091,7 +1104,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         belief_history_observations: history_len,
         loss_tolerance_abs: loss_budget,
         delay_tolerance_frac: 3.into(),
-        objective_order: names(objectives),
+        objective_order: full_order(objectives),
         candidate_actions,
         mode,
         queue_target,

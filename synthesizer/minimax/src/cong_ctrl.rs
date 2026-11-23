@@ -1993,6 +1993,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     set_tunables(tunables);
+    // Every mode orders all objectives (`full_order`).
+    for name in OBJECTIVE_NAMES {
+        assert!(cbrdelay_cca_config::ALL_OBJECTIVES.contains(&name), "objective {name} missing from ALL_OBJECTIVES");
+    }
     info!("Using {:?}", args);
 
     let sim_tag = get_sim_tag(&args);

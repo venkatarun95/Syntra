@@ -22,3 +22,5 @@ scenario files.
 | --- | --- |
 | `2026-11-22-held-out-viz/` | Interactive page of 7 held-out links (search, depth 4), with the distilled rules explained; `build.py` + `page.tpl.html` build it from run CSVs |
 | `2026-11-22-depth6-probes/` | Depth 6, the bursty large-buffer link, probe timing, Recover probes, one-packet probes, perfect fit |
+| `2026-11-22-cc-sim/` | The distilled CCA over cc_sim's packet-level links (all scenarios) next to Reno and Copa; why it lost on cellular links |
+| `2026-11-23-search-cca/` | The search CCA (a depth-6 search every RTT, per-mode objectives) on a focus set in cc_sim, next to Reno, Copa and the ack-window CCA |
