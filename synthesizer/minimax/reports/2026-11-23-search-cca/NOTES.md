@@ -53,8 +53,37 @@ smaller (0.5 BDP; after the step up the buffer is a quarter BDP).  Copa's
   lost; Cruise at C afterwards, sometimes a one-round drain and refill (the
   `dq` tie-break).
 
-## Minimax at depth 6
+## Minimax at depth 6 (whole run; runs finished 2026-11-23 11:54 CST, ~80 min)
 
-Pending: the runs in `/tmp/focus_d6` were started 2026-11-23 10:33 CST
-(~37 s per RTT in startup with 7 in parallel).  Fill in the table and the
-findings when they finish.
+| scenario | util | loss | q p50 / p95 ms | t90 s | after warm-up util / loss |
+| --- | --- | --- | --- | --- | --- |
+| static 0.5 BDP | 0.93 | 0.71% | 9.0 / 21.0 | 0.45 | 0.99 / 0% |
+| static 1 BDP | 0.93 | 1.07% | 33.8 / 44.7 | 0.45 | 0.98 / 0% |
+| static 4 BDP | 0.90 | 0% | 14.1 / 81.7 | 0.45 | 0.94 / 0% |
+| step down 24 to 6 | 0.82 | 3.74% | 7.8 / 87.6 | 0.84 | 0.90 / 0% |
+| step up 6 to 24 | 0.87 | 1.39% | 1.0 / 22.0 | 0.245 | 0.99 / 0% |
+| Poisson | 0.92 | 3.89% | 26.6 / 52.4 | 0.36 | 0.98 / 3.28% |
+| acks at 3 ms gaps | 0.90 | 0.09% | 14.8 / 32.2 | 0.54 | 0.97 / 0% |
+| 1 Gbit/s | 0.67 | 0.80% | 19.9 / 44.0 | 2.22 | 1.00 / 0% |
+| TMobile-LTE-short | 0.84 | 10.8% | 15.1 / 36.4 | 0.15 | 0.91 / 8.04% |
+| ATT-LTE-driving | 0.80 | 17.4% | 22.9 / 58.5 | 0.2 | 0.69 / 15.5% |
+
+Per-mode breakdown from `mmqe_trace0.jsonl` (lost packets are attributed to
+the round in which they are reported, ~2 rounds after sending):
+
+* **Constant links and the step up are lossless after startup**, and the step up
+  is the best of the five CCAs (Reno 0.74 / 0.80%, ack g=1.5 0.61 / 23.7%).
+* **Cruise sends below C.**  4 BDP: Cruise picks `DrainQueue` in most
+  rounds at 38-45 units with min C = 48, because the queue's upper bound stays
+  5-10 units and every rate ties on `ld`, `s`, `l` while `dq` breaks the tie.
+  Utilization after warm-up is 0.94.  On 1 BDP, `DrainQueue` was chosen in 23
+  of 23 Cruise rounds.  Next: `--decisions --exact-root` on these
+  histories before reordering (e.g. `dq` after a utilization objective).
+* **Cellular loss is Recover's.**  TMobile: 21 restarts, 124 of 199 rounds
+  in Recover, 1916 of 2037 lost packets reported there.  ATT: 18 restarts,
+  106 of 139 rounds, 699 of 707.  The links refute the CBR belief every 6-8
+  rounds and Recover's rule probe (~1.5x delivery every 2 rounds) meets a
+  falling rate.  Recover is the rule flagged as an open question.
+* **Step down** (one restart): 3.7% loss, mostly reported in Probe after the
+  change; Reno 2.8%, ack g=1.5 0.36%.
+* **1 Gbit/s startup** grows ~1.5x per round, so it takes 2.2 s to reach 90% (Reno 0.6 s).

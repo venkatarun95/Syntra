@@ -77,17 +77,11 @@ engine from the same path on every rescale, so a run would mix versions.
 
 ## State at handoff
 
-* **Running:** depth-6 `mmqe` on the 10 focus scenarios, `/tmp/focus_d6`,
-  started 2026-11-23 10:33 CST with the current binary (all objectives).
-  About 37 s per RTT in startup with 7 in parallel; 120-200 RTTs per run, so
-  about 1.5 h for the first seven and ~3.5 h in all.  Progress:
-  `grep -c searching /tmp/focus_d6/*/mmqe/minimax0.log`.  The per-round trace
-  `mmqe_trace0.jsonl` is buffered and only fills at the end.
-* **Done:** baselines on the focus set, `/tmp/focus_base` (numbers in the
-  report's NOTES).  `/tmp` does not survive a reboot; rerun if missing.
-* **To do when the runs finish:** build the report (command above), fill in
-  the results in `reports/2026-11-23-search-cca/NOTES.md`, commit, and
-  publish the page (Artifact) for the user.
+* **Done:** depth-6 `mmqe` on the 10 focus scenarios (`/tmp/focus_d6`,
+  finished 2026-11-23 11:54 CST, ~80 min with 7 in parallel) and baselines
+  (`/tmp/focus_base`).  Report built (`search_cca_report.html`; publishing as an Artifact needs a claude.ai login); numbers and per-mode
+  breakdown in `reports/2026-11-23-search-cca/NOTES.md`.  `/tmp` does not
+  survive a reboot; rerun if missing.
 
 ## Findings so far
 
@@ -104,20 +98,28 @@ engine from the same path on every rescale, so a run would mix versions.
 3. On a lossless link the windows bound `max_c` only around a loss, so `max_c`
    expires ~25 RTTs after the last loss and the CCA probes with the 1-packet
    budget: the agreed constant cost of looking for a rise.
-4. With all objectives in every mode, Cruise sometimes drains for one round
-   and refills (the `dq` tie-break).  Check in the focus results whether it
-   costs throughput; if it does, the objective order is what to change.
+4. With all objectives in every mode, Cruise drains below C: on 4 BDP it
+   sends 38-45 units with min C = 48 for many rounds (utilization after
+   warm-up 0.94), because the queue's upper bound stays 5-10 units and `dq`
+   breaks the tie.  Check the root values (`--decisions --exact-root`) and
+   then fix the objective order.
 5. Baselines (focus set): the ack window with g=2 loses heavily whenever the
    buffer is below about a BDP of the current rate (36% at 0.5 BDP, 47% after
    the step up, 23-24% on cellular); g=1.5 is lossless on the static links
    and 1 Gbit/s but loses 7-9% on cellular and 24% after the step up.  Copa
    sits at ~0.56 utilization (as in earlier sweeps; suspicious, not
    investigated).
+6. Focus results: lossless after startup on constant links and after the
+   step up (best of five there); cellular loss (10.8%, 17.4%) is almost all
+   in Recover (rule mode, 18-21 restarts); 1 Gbit/s startup is slow (2.2 s
+   to 90%).
 
 ## Next steps (in order)
 
-1. Finish the focus evaluation (above) and compare against the baselines and
-   against the old distilled CCA (`reports/2026-11-22-cc-sim/`, sweep4).
+1. Cruise draining below C (finding 4), then cellular: replace the Recover
+   rule (ask the user first; see open questions) and the restart rate on
+   non-CBR links.  Compare against the old distilled CCA
+   (`reports/2026-11-22-cc-sim/`, sweep4).
 2. **Variable-depth search** (design in `CCA_DEVELOPMENT.md`, "Variable-depth
    search: quiescence on outstanding losses"): depth 4 plus extension of
    leaves with unreported risk.  Validate against depth 6 decisions on the
