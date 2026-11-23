@@ -236,6 +236,13 @@ pub const UNCERTAIN_LOSS_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 /// The loss budget otherwise, in packets (`pkts_per_unit` converts it).
 pub const CONSTANT_LOSS_PKTS: RealNumRep = RealNumRep::new_raw(1, 1);
 
+/// Probe's budget once C has been tight (`max_c` expired) adds this many
+/// times the largest assumed K to the constant one (default 0: off).  A
+/// probe whose worst-case loss is one packet cannot fill a buffer larger
+/// than `min_b`, so on a buffer under a BDP it never proves a backlog and
+/// `max_c` never comes back down; K + 1 packets is the hypothesis.
+pub const KNOWN_PROBE_LOSS_K: RealNumRep = RealNumRep::new_raw(0, 1);
+
 /// Packets per unit of C, B and loss, for budgets set in packets.  A
 /// wrapper that rescales units (cc_sim's `MinimaxQe`) passes it.
 pub const PKTS_PER_UNIT: RealNumRep = RealNumRep::new_raw(1, 1);
@@ -302,6 +309,7 @@ pub struct Tunables {
     pub loss_window_rtts: usize,
     pub uncertain_loss_bdp: RealNumRep,
     pub constant_loss_pkts: RealNumRep,
+    pub known_probe_loss_k: RealNumRep,
     pub pkts_per_unit: RealNumRep,
     pub k_below_bdp: bool,
     pub carry_buffer: bool,
@@ -329,6 +337,7 @@ impl Default for Tunables {
             loss_window_rtts: LOSS_WINDOW_RTTS,
             uncertain_loss_bdp: UNCERTAIN_LOSS_BDP,
             constant_loss_pkts: CONSTANT_LOSS_PKTS,
+            known_probe_loss_k: KNOWN_PROBE_LOSS_K,
             pkts_per_unit: PKTS_PER_UNIT,
             k_below_bdp: K_BELOW_BDP,
             carry_buffer: CARRY_BUFFER,
@@ -378,6 +387,7 @@ impl Tunables {
             "loss_window_rtts" => self.loss_window_rtts = v.round() as usize,
             "uncertain_loss_bdp" => self.uncertain_loss_bdp = frac(v),
             "constant_loss_pkts" => self.constant_loss_pkts = frac(v),
+            "known_probe_loss_k" => self.known_probe_loss_k = frac(v),
             "k_below_bdp" => self.k_below_bdp = v != 0.,
             "carry_buffer" => self.carry_buffer = v != 0.,
             "drain_max_q" => self.drain_max_q = frac(v),
@@ -1096,6 +1106,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     let constant = tun().constant_loss_budget();
     let loss_budget = match mode {
         Mode::Probe if !c_known => std::cmp::max(belief.min_c * tun().uncertain_loss_bdp, constant),
+        Mode::Probe => constant + k_max * tun().known_probe_loss_k,
         _ => constant,
     };
     features.loss_budget = loss_budget;
