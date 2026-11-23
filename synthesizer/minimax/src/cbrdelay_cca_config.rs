@@ -5,7 +5,7 @@
 //! the minimax implementation remains in `cong_ctrl.rs`.  Agents changing
 //! this experiment should first read `../CCA_DEVELOPMENT.md`.
 
-use cc_common::{BeliefBounds, Observation};
+use cc_common::BeliefBounds;
 use ds::{RealNumInt, RealNumRep};
 use log::{info, warn};
 use network_model_nc::{AppSendFraction, ObservationNC};
@@ -65,32 +65,35 @@ pub const SEARCH_DEPTH: u16 = 4;
 
 /// Candidate CCA actions.  The planner (`state_policy`) selects which of
 /// them minimax may consider at each RTT; they are evaluated against the
-/// current belief and deduplicated automatically.
+/// belief at every node of the search tree and deduplicated automatically.
+/// The search picks among them; no rule does (see "Trust the planner" in
+/// `CCA_DEVELOPMENT.md`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateAction {
     /// Largest rate that keeps the one-RTT queue bound (no loss for any
-    /// (C, B) in the belief).
+    /// (C, B) in the belief), and whose worst-case queue (at `C = min_c`)
+    /// stays within `StatePolicy::queue_cap` (a BDP): a queue beyond one
+    /// BDP adds delay and no throughput.  Above the cap this drains to it.
     MaxAllowedRate,
-    /// Drain the largest possible queue at the smallest plausible capacity.
-    /// Once the queue is empty this is `min_c`: the lowest-delay rate.
+    /// `min_c`, less whatever the queue may exceed `queue_target` by: drain
+    /// the worst-case queue to its provable floor (about K under bursts) in
+    /// one RTT.
     DrainQueue,
-    /// `loss_tolerance_abs` above `MaxAllowedRate`.
+    /// Drain half of that excess: a drain spread over two RTTs.
+    DrainHalf,
+    /// `MaxAllowedRate` plus what is left of the loss budget in the loss
+    /// window (`loss_tolerance_abs` less the loss reported in the newest
+    /// `LOSS_WINDOW_RTTS`).
     ProbeAboveLimit,
-    /// `min_c`, less whatever the queue may exceed `queue_target` by: hold
-    /// the queue near the smallest provable size (about K under bursts)
-    /// rather than paying ~K packets/RTT of throughput to aim at zero.
-    HoldQueue,
+    /// `MaxAllowedRate` plus half of what is left: two such probes can be
+    /// in flight at once (a probe's loss shows about two RTTs later).
+    ProbeHalf,
     /// What the link delivered per RTT over the (up to two) newest RTTs
     /// since the belief started, or over the newest RTT if none.  Right
     /// after a change, before any QE window exists: a backlogged link keeps
     /// its queue, an idle one keeps the old rate.  Not a bound on anything.
+    /// Offered only then (`Mode::Recover`).
     MatchDelivery,
-    /// `max_c` plus `RISE_STEP` of it (at least one packet): held for a
-    /// rise check, so that a link that now serves more proves it.
-    AboveMaxC,
-    /// One packet above `MaxAllowedRate`: the smallest probe, offered next
-    /// to `ProbeAboveLimit` when the loss budget is larger.
-    ProbeOnePacket,
     /// `MatchDelivery` plus as much again as keeps the in-flight queue
     /// bound within two of it (`RECOVER_QUEUE_DELIVERIES`): Recover's probe.
     /// After a rise in C the queue bound is about one RTT of sending and
@@ -110,7 +113,10 @@ pub enum CandidateAction {
 /// * `sc`: prefer any shrinkage of the capacity interval.
 /// * `sb`: prefer an upper buffer bound below the global maximum.
 /// * `s`: maximize delivered data over the evaluated horizon.
-/// * `ld`: minimize loss exceeding `loss_tolerance_abs`.
+/// * `ld`: minimize loss exceeding `loss_tolerance_abs`.  Like `l` and `lt`,
+///   it counts the loss reported since the start of the loss window (the
+///   newest `LOSS_WINDOW_RTTS` committed RTTs, across restarts) plus the
+///   horizon.
 /// * `l`: minimize total observed loss, including loss within the tolerance.
 /// * `qdel`: minimize the largest observed queue-delay estimate (beyond the
 ///   unavoidable one-RTT baseline).
@@ -131,18 +137,33 @@ pub enum CandidateAction {
 ///   loss-tolerance unit (allowing QE numerical slack).
 /// * `scb`: prefer `min_c + min_b` not decreasing from its initial value.
 /// * `sent`: maximize the data the CCA sends over the horizon.
+/// * `dq`: minimize the smallest worst-case queue (`max_q`) reached in the
+///   horizon, counting anything at or below `queue_target` as zero: a drain
+///   that completes within the horizon, however it is spread.
 ///
 /// The `tt*` metrics use the end of the current speculative horizon as the
 /// target; if it is not reached, they receive the horizon length as a penalty.
 /// To create a genuinely new objective dimension, add the corresponding
 /// metric to `cc_common::Metrics` and its comparison in `CCValue`.
 ///
-/// `sent` comes last: with `SEARCH_DEPTH` 4 every searched decision in a
-/// 16-link sweep was an exact tie on all the others, or preferred the higher
-/// rate (see "Ties" in `CCA_DEVELOPMENT.md`).  Making that preference an
-/// objective gives every decision one optimum instead of a tie broken by the
-/// search's move order.
-pub const OBJECTIVE_ORDER: &[&str] = &["lt", "schadd", "ttscbadd", "scb", "c", "l", "sent"];
+/// Each mode has its own objective (`state_policy`).
+///
+/// Probe: learn C and B (`schadd`, `ttscbadd`, `scb`, `c`) without loss
+/// beyond the budget (`ld` first), then deliver.
+pub const PROBE_OBJECTIVE_ORDER: &[&str] = &["ld", "schadd", "ttscbadd", "scb", "c", "l", "s", "sent"];
+
+/// Cruise: utilization (`s`) without loss beyond the budget.
+pub const CRUISE_OBJECTIVE_ORDER: &[&str] = &["ld", "s", "l", "sent"];
+
+/// Drain: prove the queue empty within the horizon (`dq`), and otherwise
+/// deliver as much as possible.
+pub const DRAIN_OBJECTIVE_ORDER: &[&str] = &["dq", "ld", "s", "l", "sent"];
+
+/// The default (and Recover's, where there is no search).  `sent` comes
+/// last in every order: it is the one objective the adversary does not
+/// choose, so every decision has a unique optimum rather than a tie broken
+/// by the search's move order.
+pub const OBJECTIVE_ORDER: &[&str] = PROBE_OBJECTIVE_ORDER;
 
 /// The number of observations accepted by one generated QE predicate.  Six
 /// transitions need seven observations.  Do not make a QE window shorter than
@@ -150,41 +171,60 @@ pub const OBJECTIVE_ORDER: &[&str] = &["lt", "schadd", "ttscbadd", "scb", "c", "
 pub const QE_WINDOW_OBSERVATIONS: usize = 7;
 
 // ------------------------------------------------------------------------------------------
-// Planner constants.  These are starting points for experiments, not tuned
-// values; `--probe-interval` and `--drain-interval` override two of them.
+// Planner constants.  The planner only picks a mode (and with it the
+// objective and the candidate actions); within a mode the search decides.
+// `--param NAME=VALUE` overrides any of them.
 
 /// The capacity belief counts as tight once
-/// `max_c <= C_TIGHT_RATIO * min_c + C_TIGHT_PER_K * K`.
+/// `max_c <= C_TIGHT_RATIO * min_c + C_TIGHT_PER_K * K`.  While it is not,
+/// the CCA is in Probe.
 pub const C_TIGHT_RATIO: RealNumRep = RealNumRep::new_raw(5, 4);
 
 /// ... plus this many packets/RTT per unit of the largest assumed K.
 pub const C_TIGHT_PER_K: RealNumRep = RealNumRep::new_raw(0, 1);
 
-/// The buffer counts as small once `max_b < SMALL_BUFFER_BDP * min_c`.
-pub const SMALL_BUFFER_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
+/// C is assumed constant only for this many RTTs: `max_c` comes from the
+/// newest `C_EXPIRY_RTTS` RTTs' windows alone, while `min_c` and B are
+/// retained (`CongCtrlState::retained_prior`).  A rise in C is invisible to
+/// a sender at the old rate, so no observation contradicts an old `max_c`;
+/// letting it expire is what makes the CCA look again.  While the link is
+/// backlogged the newest windows keep `max_c` tight, so it only loosens
+/// when the CCA has not filled the link for a while.  0: never expires.
+pub const C_EXPIRY_RTTS: usize = 20;
 
-/// While exploring, every rate keeps the worst-case queue within this many
-/// BDPs (`EXPLORE_MAX_QUEUE_BDP * min_c`), and above it the CCA holds the
-/// queue there.  At `C = min_c` the delay box alone can hold one BDP, so
-/// two leave one BDP to grow into: the rate can roughly double per RTT
-/// while C is loose.  Filling a large buffer adds delay (and makes QE
-/// enumerate many unobserved losses, which is slow).
-pub const EXPLORE_MAX_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(2, 1);
+/// Every mode keeps the worst-case queue (at `C = min_c`) within this many
+/// BDPs (`min_c`), plus the queue floor or K: `MaxAllowedRate` is capped by
+/// it.  A queue beyond a BDP adds delay but no throughput.
+pub const MAX_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 
-/// An Explore probe's loss budget, in BDPs (`min_c`): the probe is this
-/// much above `MaxAllowedRate`.  Larger converges faster and loses more in
-/// the worst case.
-pub const EXPLORE_BUDGET_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
+/// The loss budget is counted over the newest this many committed RTTs
+/// (and the search horizon), across belief restarts: repeated probes are
+/// charged together, whether or not they overlap.
+pub const LOSS_WINDOW_RTTS: usize = 20;
 
-/// RTTs between probes once C is tight.
-pub const PROBE_INTERVAL_RTTS: usize = 10;
+/// The loss budget while C has not been tight since the belief (re)started
+/// (startup, or after a detected change), in BDPs (`min_c`), and at least
+/// the constant budget.
+pub const UNCERTAIN_LOSS_BDP: RealNumRep = RealNumRep::new_raw(1, 1);
 
-/// RTTs between probes while C is loose: a probe's losses are observable
-/// about two RTTs after it is sent.
-pub const EXPLORE_PROBE_GAP_RTTS: usize = 2;
+/// The loss budget otherwise, in packets (`pkts_per_unit` converts it).
+pub const CONSTANT_LOSS_PKTS: RealNumRep = RealNumRep::new_raw(1, 1);
 
-/// RTTs between probes while C is still loose but the CCA is cautious.
-pub const CAUTIOUS_EXPLORE_PROBE_GAP_RTTS: usize = 4;
+/// Packets per unit of C, B and loss, for budgets set in packets.  A
+/// wrapper that rescales units (cc_sim's `MinimaxQe`) passes it.
+pub const PKTS_PER_UNIT: RealNumRep = RealNumRep::new_raw(1, 1);
+
+/// The smallest loss budget, in units: QE works on a 1/16 grid.
+pub const MIN_LOSS_BUDGET: RealNumRep = RealNumRep::new_raw(1, 16);
+
+/// Drop every K hypothesis that is at least a BDP: K is ruled out once its
+/// windows prove `C <= K`, and `min_c` is at least the smallest assumed K.
+pub const K_BELOW_BDP: bool = true;
+
+/// Across a belief restart, keep the old belief's `min_b` (the buffer
+/// rarely changes with the rate).  A window that contradicts it overrides
+/// it, as for any conflicting bound.
+pub const CARRY_BUFFER: bool = true;
 
 /// RTTs between guaranteed queue drains (for an accurate min-RTT).  In a
 /// real deployment one step is one min-RTT, so this is ~10 s / min-RTT.
@@ -215,30 +255,9 @@ pub const APP_LIMITED_SLACK: RealNumRep = RealNumRep::new_raw(1, 16);
 /// keeps the link busy, while an idle app leaves it empty.)
 pub const INFORMATIVE_LOAD: RealNumRep = RealNumRep::new_raw(1, 2);
 
-/// A rise check sends `max_c * (1 + RISE_STEP)`.  Proving `C > max_c` from
-/// a rate `r` takes about `r / (r - max_c)` RTTs (the link may serve up to
-/// an RTT late), and if C did not rise those RTTs queue about `r`: roughly
-/// a BDP whatever the step.  A larger step only shortens the check.
-pub const RISE_STEP: RealNumRep = RealNumRep::new_raw(1, 4);
-
-/// RTTs from a change (or from C becoming tight) to the first rise check;
-/// each check that finds nothing doubles the gap, up to
-/// `RISE_MAX_INTERVAL_RTTS`.  A check that would lose packets (the proven
-/// buffer cannot hold its queue) always waits the maximum.
-pub const RISE_INTERVAL_RTTS: usize = 10;
-pub const RISE_MAX_INTERVAL_RTTS: usize = 40;
-
-/// Loss budget (packets per probe) when cautious.
-pub const CAUTIOUS_LOSS_BUDGET: RealNumRep = RealNumRep::new_raw(1, 1);
-
-/// Cruise holds the worst-case queue at up to this many BDPs (`min_c`), not
-/// at `queue_target` (`--cruise-queue`).  On a link that serves late at
-/// random, `max_q` stays well above the real queue, and draining all of it
-/// idles the link: on C 50, B 100, K 4 (random service) utilization after
-/// RTT 10 is 0.78 at 0, 0.87 at 0.5 and 0.92 at 1, for a mean worst-case
-/// queue of 20, 29 and 38 packets.  On a link that serves on time it is a
-/// real standing queue.
-pub const CRUISE_QUEUE_BDP: RealNumRep = RealNumRep::new_raw(1, 2);
+/// Recover: RTTs between probes above the delivery (`ProbeDelivery`).  A
+/// probe's losses are observable about two RTTs after it is sent.
+pub const RECOVER_PROBE_GAP_RTTS: usize = 2;
 
 /// Recover's probe (`ProbeDelivery`) keeps the belief's `max_q` (in Recover
 /// only the in-flight bound, which includes an RTT of service lag) within
@@ -247,25 +266,26 @@ pub const RECOVER_QUEUE_DELIVERIES: RealNumRep = RealNumRep::new_raw(2, 1);
 
 /// The planner constants above, as the running CCA uses them: the constants
 /// are the defaults, and `--param NAME=VALUE` (`Tunables::set`) overrides
-/// them for the process (one CCA per process).  The distilled rule was
-/// checked against the search with the defaults only.
+/// them for the process (one CCA per process).
 #[derive(Clone, Debug)]
 pub struct Tunables {
     pub c_tight_ratio: RealNumRep,
     pub c_tight_per_k: RealNumRep,
-    pub small_buffer_bdp: RealNumRep,
-    pub explore_probe_gap_rtts: usize,
-    pub cautious_explore_probe_gap_rtts: usize,
+    pub c_expiry_rtts: usize,
+    pub max_queue_bdp: RealNumRep,
+    pub loss_window_rtts: usize,
+    pub uncertain_loss_bdp: RealNumRep,
+    pub constant_loss_pkts: RealNumRep,
+    pub pkts_per_unit: RealNumRep,
+    pub k_below_bdp: bool,
+    pub carry_buffer: bool,
     pub drain_max_q: RealNumRep,
     pub queue_floor_rtts: usize,
     pub quiet_margin: RealNumRep,
     pub max_drain_rtts: usize,
     pub app_limited_slack: RealNumRep,
     pub informative_load: RealNumRep,
-    pub rise_step: RealNumRep,
-    pub rise_interval_rtts: usize,
-    pub rise_max_interval_rtts: usize,
-    pub cautious_loss_budget: RealNumRep,
+    pub recover_probe_gap_rtts: usize,
     pub recover_queue_deliveries: RealNumRep,
     pub shadow_windows: usize,
     /// `K_POLICY`'s hypotheses (`k_hypotheses=1/4/16/64`; one value is
@@ -278,19 +298,21 @@ impl Default for Tunables {
         Self {
             c_tight_ratio: C_TIGHT_RATIO,
             c_tight_per_k: C_TIGHT_PER_K,
-            small_buffer_bdp: SMALL_BUFFER_BDP,
-            explore_probe_gap_rtts: EXPLORE_PROBE_GAP_RTTS,
-            cautious_explore_probe_gap_rtts: CAUTIOUS_EXPLORE_PROBE_GAP_RTTS,
+            c_expiry_rtts: C_EXPIRY_RTTS,
+            max_queue_bdp: MAX_QUEUE_BDP,
+            loss_window_rtts: LOSS_WINDOW_RTTS,
+            uncertain_loss_bdp: UNCERTAIN_LOSS_BDP,
+            constant_loss_pkts: CONSTANT_LOSS_PKTS,
+            pkts_per_unit: PKTS_PER_UNIT,
+            k_below_bdp: K_BELOW_BDP,
+            carry_buffer: CARRY_BUFFER,
             drain_max_q: DRAIN_MAX_Q,
             queue_floor_rtts: QUEUE_FLOOR_RTTS,
             quiet_margin: QUIET_MARGIN,
             max_drain_rtts: MAX_DRAIN_RTTS,
             app_limited_slack: APP_LIMITED_SLACK,
             informative_load: INFORMATIVE_LOAD,
-            rise_step: RISE_STEP,
-            rise_interval_rtts: RISE_INTERVAL_RTTS,
-            rise_max_interval_rtts: RISE_MAX_INTERVAL_RTTS,
-            cautious_loss_budget: CAUTIOUS_LOSS_BUDGET,
+            recover_probe_gap_rtts: RECOVER_PROBE_GAP_RTTS,
             recover_queue_deliveries: RECOVER_QUEUE_DELIVERIES,
             shadow_windows: SHADOW_WINDOWS,
             k_hypotheses: match K_POLICY {
@@ -316,28 +338,40 @@ impl Tunables {
                 .collect::<Result<_, _>>()?;
             return Ok(());
         }
+        if name == "pkts_per_unit" {
+            // Exact: a power of two, possibly large.
+            self.pkts_per_unit = value.parse::<RealNumInt>().map_err(|e| format!("{name}={value}: {e}"))?.into();
+            return Ok(());
+        }
         let v: f64 = value.parse().map_err(|e| format!("{name}={value}: {e}"))?;
         match name {
             "c_tight_ratio" => self.c_tight_ratio = frac(v),
             "c_tight_per_k" => self.c_tight_per_k = frac(v),
-            "small_buffer_bdp" => self.small_buffer_bdp = frac(v),
-            "explore_probe_gap_rtts" => self.explore_probe_gap_rtts = v.round() as usize,
-            "cautious_explore_probe_gap_rtts" => self.cautious_explore_probe_gap_rtts = v.round() as usize,
+            "c_expiry_rtts" => self.c_expiry_rtts = v.round() as usize,
+            "max_queue_bdp" => self.max_queue_bdp = frac(v),
+            "loss_window_rtts" => self.loss_window_rtts = v.round() as usize,
+            "uncertain_loss_bdp" => self.uncertain_loss_bdp = frac(v),
+            "constant_loss_pkts" => self.constant_loss_pkts = frac(v),
+            "k_below_bdp" => self.k_below_bdp = v != 0.,
+            "carry_buffer" => self.carry_buffer = v != 0.,
             "drain_max_q" => self.drain_max_q = frac(v),
             "queue_floor_rtts" => self.queue_floor_rtts = v.round() as usize,
             "quiet_margin" => self.quiet_margin = frac(v),
             "max_drain_rtts" => self.max_drain_rtts = v.round() as usize,
             "app_limited_slack" => self.app_limited_slack = frac(v),
             "informative_load" => self.informative_load = frac(v),
-            "rise_step" => self.rise_step = frac(v),
-            "rise_interval_rtts" => self.rise_interval_rtts = v.round() as usize,
-            "rise_max_interval_rtts" => self.rise_max_interval_rtts = v.round() as usize,
-            "cautious_loss_budget" => self.cautious_loss_budget = frac(v),
+            "recover_probe_gap_rtts" => self.recover_probe_gap_rtts = v.round() as usize,
             "recover_queue_deliveries" => self.recover_queue_deliveries = frac(v),
             "shadow_windows" => self.shadow_windows = v.round() as usize,
             _ => return Err(format!("unknown parameter {name}")),
         }
         Ok(())
+    }
+
+    /// The constant loss budget in units: `constant_loss_pkts` packets, on
+    /// QE's grid.
+    pub fn constant_loss_budget(&self) -> RealNumRep {
+        std::cmp::max(self.constant_loss_pkts / self.pkts_per_unit, MIN_LOSS_BUDGET)
     }
 
     /// `k_hypotheses` as a `KPolicy`.  Only for the process's tunables
@@ -367,8 +401,8 @@ pub fn tun() -> &'static Tunables {
 }
 
 /// How the belief is maintained across RTTs.  These are experiment switches
-/// (`--k-confirm`, `--k-optimistic`, `--change-restart`, `--explore-free`);
-/// the defaults reproduce the original behaviour.
+/// (`--k-confirm`, `--k-optimistic`, `--change-restart`); the defaults
+/// reproduce the original behaviour.
 #[derive(Clone, Copy, Debug)]
 pub struct BeliefStrategy {
     /// `K_CONFIRM_RTTS`: informative RTTs before the smallest alive K is
@@ -384,58 +418,15 @@ pub struct BeliefStrategy {
     /// suffix of the history (`CongCtrlState::locate_change`).  On by
     /// default (`--no-change-restart`).
     pub change_restart: bool,
-    /// In Explore, do not force `DrainQueue` when the queue may exceed
-    /// `EXPLORE_MAX_QUEUE_BDP`: let minimax choose, with `qdel` among its
-    /// objectives (`EXPLORE_FREE_OBJECTIVE_ORDER`).
-    pub explore_free: bool,
-    /// The upper bound on C expires: only the newest this many observations'
-    /// windows bound `max_c` for the planner.  A rise in C is invisible to a
-    /// sender at the old rate, so no observation can ever contradict the old
-    /// `max_c`; forgetting it is the only way to let the CCA look again.
-    /// While the link stays busy the recent windows keep `max_c` tight, so
-    /// this only loosens it once the queue has emptied.
-    pub c_upper_rtts: Option<usize>,
-    /// `EXPLORE_BUDGET_BDP` and `EXPLORE_MAX_QUEUE_BDP` (`--explore-budget`,
-    /// `--explore-queue`): the exploration trade-off between convergence
-    /// speed and worst-case loss and queue.
-    pub explore_budget_bdp: RealNumRep,
-    pub explore_queue_bdp: RealNumRep,
-    /// Periodically send above `max_c` to detect a rise in C (or, when the
-    /// buffer is small, in B) (`--no-rise-check`).
-    pub rise_check: bool,
-    /// Offer `ProbeOnePacket` next to a larger Explore probe
-    /// (`--no-probe-one-packet`).
-    pub probe_one_packet: bool,
     /// Probe in Recover (`ProbeDelivery`, `--no-recover-probe`).
     pub recover_probe: bool,
-    /// Cruise holds the worst-case queue at up to this many BDPs (`min_c`)
-    /// instead of `queue_target` (`--cruise-queue`).  On a link that serves
-    /// late at random, `max_q` stays well above the real queue, and draining
-    /// it idles the link; this trades worst-case delay for utilization.
-    pub cruise_queue_bdp: RealNumRep,
 }
 
 impl Default for BeliefStrategy {
     fn default() -> Self {
-        Self {
-            k_confirm_rtts: K_CONFIRM_RTTS,
-            k_optimistic: false,
-            change_restart: true,
-            explore_free: false,
-            c_upper_rtts: None,
-            explore_budget_bdp: EXPLORE_BUDGET_BDP,
-            explore_queue_bdp: EXPLORE_MAX_QUEUE_BDP,
-            rise_check: true,
-            probe_one_packet: true,
-            recover_probe: true,
-            cruise_queue_bdp: CRUISE_QUEUE_BDP,
-        }
+        Self { k_confirm_rtts: K_CONFIRM_RTTS, k_optimistic: false, change_restart: true, recover_probe: true }
     }
 }
-
-/// `explore_free`: the objective once the queue may exceed
-/// `EXPLORE_MAX_QUEUE_BDP`, where the planner would otherwise force a drain.
-pub const EXPLORE_FREE_OBJECTIVE_ORDER: &[&str] = &["lt", "qdel", "schadd", "ttscbadd", "scb", "c", "l", "sent"];
 
 /// `change_restart`: windows a shadow belief (`KShadow`) must fit before the
 /// CCA concludes that the link changed.
@@ -489,8 +480,7 @@ pub struct StateQuantities<'a> {
     /// Use this to probe one or more history lengths before selecting policy.
     /// It uses the K set `update_k` returned for this state.
     pub belief_bounds_for_history: &'a BeliefBoundsQuery<'a>,
-    /// CLI overrides of `PROBE_INTERVAL_RTTS` / `DRAIN_INTERVAL_RTTS`.
-    pub probe_interval_rtts: usize,
+    /// CLI override of `DRAIN_INTERVAL_RTTS`.
     pub drain_interval_rtts: usize,
     /// `--belief-history`: observations whose overlapping QE windows are
     /// intersected for the belief (`None`: the whole history).
@@ -502,22 +492,19 @@ pub struct StateQuantities<'a> {
     pub newest_window_feasible: bool,
 }
 
-/// What the planner is doing this RTT.  Logged in the CSV.
+/// What the planner is doing this RTT.  Logged in the CSV.  The mode
+/// selects the objective and the candidate actions; the search decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Mode {
-    /// C is loose: let minimax choose among probing and holding.
+    /// C is loose (or its upper bound expired): learn C and B, losing at
+    /// most the loss budget.
     #[default]
-    Explore,
-    /// C is tight: hold the lowest-delay rate.
-    Cruise,
-    /// C is tight and a probe is due.
     Probe,
-    /// Hold the drain rate until the belief proves the queue is empty.
+    /// C is tight: maximize utilization.
+    Cruise,
+    /// Prove the queue empty (for a min-RTT sample), otherwise maximize
+    /// utilization.
     Drain,
-    /// C is tight: send above `max_c` for a few RTTs.  If C (or, with a
-    /// small buffer, B) rose, the history contradicts the belief and
-    /// `locate_change` restarts it; otherwise the queue built is drained.
-    RiseCheck,
     /// The link changed less than a QE window ago: match its delivery
     /// until the new link's windows exist.
     Recover,
@@ -562,14 +549,17 @@ pub struct KShadow {
 pub struct PlannerState {
     pub mode: Mode,
     /// Timestep of the most recent probe (an action above `MaxAllowedRate`
-    /// or a `Probe`-mode action).
+    /// or above the delivery).
     pub last_probe: Option<usize>,
     /// Timestep at which the C interval last grew (`min_c` fell or `max_c`
-    /// rose: a restart, a larger K, an expired `max_c`).  Probes are timed
-    /// from the later of this and `last_probe`.
+    /// rose: a restart, a larger K, an expired `max_c`).  Recover's probes
+    /// are timed from the later of this and `last_probe`.
     pub c_widened: Option<usize>,
     /// The C interval at the previous RTT.
     pub last_c_range: Option<(RealNumRep, RealNumRep)>,
+    /// `belief_start` of the belief in which C was last tight: C has been
+    /// tight since the belief (re)started if it equals `belief_start`.
+    pub c_tight_in: Option<usize>,
     /// Timestep at which the belief last proved the queue empty.
     pub last_drained: usize,
     /// The belief proves the queue is at most `DRAIN_MAX_Q + K` now: RTT
@@ -598,23 +588,6 @@ pub struct PlannerState {
     pub last_sent: RealNumRep,
     /// Times the belief was restarted because the link changed.
     pub restarts: usize,
-    /// The current rise check: its first timestep, its length in RTTs,
-    /// whether it must stay lossless, and the loss reported when it began.
-    pub rise: Option<RiseCheck>,
-    /// When the last rise check ended (or C last was loose, or the belief
-    /// restarted), and the gap to the next one.
-    pub rise_last: usize,
-    pub rise_interval: usize,
-    /// `belief_start` the rise schedule was last reset for.
-    pub rise_belief_start: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct RiseCheck {
-    pub started: usize,
-    pub rtts: usize,
-    pub lossless: bool,
-    pub loss_at_start: RealNumRep,
 }
 
 /// Settings selected once at the beginning of a state.  They remain immutable
@@ -626,20 +599,22 @@ pub struct StatePolicy {
     /// Any value at least `QE_WINDOW_OBSERVATIONS` is valid; every overlapping
     /// QE-sized window is evaluated and their bounds are intersected.
     pub belief_history_observations: usize,
+    /// The loss budget over the loss window (`LOSS_WINDOW_RTTS`).
     pub loss_tolerance_abs: RealNumRep,
     pub delay_tolerance_frac: RealNumRep,
     pub objective_order: Vec<String>,
-    /// Actions minimax may choose from.  With a single action the engine
-    /// skips the search.
+    /// Actions minimax may choose from.  With a single distinct rate the
+    /// engine skips the search.
     pub candidate_actions: Vec<CandidateAction>,
     pub mode: Mode,
-    /// Queue `HoldQueue` aims for.
+    /// The queue `DrainQueue` drains to, and below which `dq` counts a
+    /// queue as drained.
     pub queue_target: RealNumRep,
-    /// Every candidate rate is capped so that the worst-case queue (at
+    /// `MaxAllowedRate` is capped so that the worst-case queue (at
     /// `C = min_c`) stays within this.
     pub queue_cap: Option<RealNumRep>,
     /// What `state_policy` derived from the belief and its memory on the
-    /// way to `mode` (logged by `--decisions`, read by `--distilled`).
+    /// way to `mode` (logged by `--decisions` and `--external-json`).
     pub features: PlannerFeatures,
 }
 
@@ -655,9 +630,9 @@ pub struct PlannerFeatures {
     pub newest_window_feasible: bool,
     pub k_max: RealNumRep,
     pub c_tight: bool,
-    pub small_buffer: bool,
-    pub k_unconfirmed: bool,
-    pub cautious: bool,
+    /// C has been tight since the belief (re)started: the loss budget is
+    /// the constant one.
+    pub c_known: bool,
     /// RTTs since the last probe or the last growth of the C interval,
     /// whichever is later (`None`: neither happened).
     pub since_probe: Option<usize>,
@@ -665,20 +640,12 @@ pub struct PlannerFeatures {
     pub drained: bool,
     pub drain_due: bool,
     pub drain_gave_up: bool,
-    pub rise_continues: bool,
-    pub rise_due: bool,
-    pub rise_fits: bool,
-    pub rise_lossless: bool,
-    pub explore_cap: RealNumRep,
-    pub queue_high: bool,
-    /// Explore only: a probe is allowed (the probe gap has passed).
+    /// The worst-case queue cap (`MAX_QUEUE_BDP`).
+    pub queue_cap: RealNumRep,
+    pub loss_budget: RealNumRep,
+    /// Recover only: a probe is allowed (the probe gap has passed).
     pub probe_ok: bool,
     pub probe_gap: usize,
-    /// C tight: `probe_interval_rtts` have passed since the last probe.
-    pub probe_due: bool,
-    /// The Explore probe's budget exceeds one packet, so `ProbeOnePacket`
-    /// is offered too.
-    pub probe_small_too: bool,
 }
 
 impl Default for StatePolicy {
@@ -688,12 +655,8 @@ impl Default for StatePolicy {
             loss_tolerance_abs: 2.into(),
             delay_tolerance_frac: 3.into(),
             objective_order: names(OBJECTIVE_ORDER),
-            candidate_actions: vec![
-                CandidateAction::MaxAllowedRate,
-                CandidateAction::DrainQueue,
-                CandidateAction::ProbeAboveLimit,
-            ],
-            mode: Mode::Explore,
+            candidate_actions: vec![CandidateAction::MaxAllowedRate],
+            mode: Mode::Probe,
             queue_target: tun().drain_max_q,
             queue_cap: None,
             features: PlannerFeatures::default(),
@@ -833,6 +796,13 @@ pub fn update_k(
         if merged.min_b > merged.max_b {
             (merged.min_b, merged.max_b) = (next.min_b, next.max_b);
         }
+        // `K_BELOW_BDP`: bursts are assumed smaller than a BDP, so a K that
+        // the windows prove at least C (per RTT) is out.
+        if tun().k_below_bdp && merged.max_c <= (*k).into() {
+            info!("t={}: K={} ruled out (K < BDP, and C <= {})", timestep, k, merged.max_c);
+            *alive = false;
+            continue;
+        }
         *acc = Some(merged);
     }
     if let Some(k) = conflicted {
@@ -926,11 +896,10 @@ pub fn record_action(
 ) {
     planner.app_limited = sent + tun().app_limited_slack < intended;
     planner.last_sent = sent;
-    let probed = planner.mode == Mode::Probe
-        || matches!(
-            action,
-            Some(CandidateAction::ProbeAboveLimit | CandidateAction::ProbeOnePacket | CandidateAction::ProbeDelivery)
-        );
+    let probed = matches!(
+        action,
+        Some(CandidateAction::ProbeAboveLimit | CandidateAction::ProbeHalf | CandidateAction::ProbeDelivery)
+    );
     if probed && !planner.app_limited {
         planner.last_probe = Some(timestep);
     }
@@ -938,42 +907,24 @@ pub fn record_action(
 
 /// Edit this function to make the CCA state-dependent.  It is called exactly
 /// once before each minimax search, rather than at speculative tree nodes.
-/// It is the long-horizon planner: it picks a `Mode`, and the mode
-/// restricts what minimax may do over its short horizon.
+/// It is the long-horizon planner: it picks a `Mode`, and the mode picks
+/// the objective and the actions minimax chooses among.
 pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> StatePolicy {
-    // This is deliberately policy code, not an engine fallback: use the whole
-    // history (the engine caches committed windows, and C and B are static,
-    // so nothing learned is forgotten), falling back to the windows before
-    // the first inconsistent one.
+    // The newest `c_expiry_rtts` RTTs' windows (the engine caches committed
+    // windows); what older windows proved about `min_c` and B is retained by
+    // the engine, while `max_c` expires.
     let n_obs = state.history.len();
     let since_start = n_obs.saturating_sub(planner.belief_start);
-    let mut default_history_len = state
-        .belief_history
-        .map_or(since_start, |n| n.min(since_start))
-        .clamp(1, n_obs);
-    let belief = loop {
-        match (state.belief_bounds_for_history)(default_history_len) {
-            Ok(belief) => break belief,
-            // Changes are detected per K, in `update_k`.
-            Err(conflict) => {
-                break conflict.accumulated;
-            }
-        }
-    };
-    let mut belief = belief;
-    if let Some(n) = state.strategy.c_upper_rtts {
-        let recent_len = (n + QE_WINDOW_OBSERVATIONS - 1).min(default_history_len);
-        if recent_len < default_history_len {
-            let recent = match (state.belief_bounds_for_history)(recent_len) {
-                Ok(b) => b,
-                Err(conflict) => conflict.accumulated,
-            };
-            if recent.max_c > belief.max_c {
-                info!("t={}: max_c {} expired; the newest {} RTTs only bound it by {}", state.timestep, belief.max_c, n, recent.max_c);
-                belief.max_c = recent.max_c;
-            }
-        }
+    let mut history_len = state.belief_history.map_or(since_start, |n| n.min(since_start));
+    if tun().c_expiry_rtts > 0 {
+        history_len = history_len.min(tun().c_expiry_rtts + QE_WINDOW_OBSERVATIONS - 1);
     }
+    let history_len = history_len.clamp(1, n_obs);
+    let belief = match (state.belief_bounds_for_history)(history_len) {
+        Ok(belief) => belief,
+        // Changes are detected per K, in `update_k`, and in `locate_change`.
+        Err(conflict) => conflict.accumulated,
+    };
     let t = state.timestep;
     let prev_min_c = planner.last_min_c;
     planner.last_min_c = belief.min_c;
@@ -986,13 +937,12 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     // Bursts of up to K blur each window's view of C, so the achievable
     // width grows with K.
     let c_tight = belief.max_c <= belief.min_c * tun().c_tight_ratio + k_max * tun().c_tight_per_k;
-    let small_buffer = belief.max_b < belief.min_c * tun().small_buffer_bdp;
-    // Unconfirmed burstiness: more than one K is still in the belief.
-    let k_unconfirmed = planner.k.assumed.len() > 1;
-    let cautious = small_buffer || k_unconfirmed;
-    // Probes are timed from the last probe or from the last time the C
-    // interval grew, whichever is later: a wider interval is something new
-    // to learn, and no older probe tested it.
+    if c_tight {
+        planner.c_tight_in = Some(planner.belief_start);
+    }
+    let c_known = planner.c_tight_in == Some(planner.belief_start);
+    // Recover's probes are timed from the last probe or from the last time
+    // the C interval grew, whichever is later.
     if let Some((lo, hi)) = planner.last_c_range {
         if belief.min_c < lo || belief.max_c > hi {
             planner.c_widened = Some(t);
@@ -1007,9 +957,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         newest_window_feasible: state.newest_window_feasible,
         k_max,
         c_tight,
-        small_buffer,
-        k_unconfirmed,
-        cautious,
+        c_known,
         since_probe: probe_ref.map(|p| t - p),
         ..Default::default()
     };
@@ -1059,78 +1007,16 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
         warn!("t={}: drain not proven after {} RTTs (max_q={})", t, tun().max_drain_rtts, belief.max_q);
         planner.last_drained = t;
     }
-
-    // Rise checks.  A rise in C is invisible at rates up to `max_c`, and a
-    // rise in B at rates the buffer absorbed anyway, so neither ever
-    // contradicts the belief by itself: the CCA has to send above `max_c`.
-    // The schedule restarts with the belief, and while C is loose (Explore
-    // probes above `max_c` anyway).
-    if planner.belief_start != planner.rise_belief_start || !c_tight || planner.rise_interval == 0 {
-        planner.rise_belief_start = planner.belief_start;
-        planner.rise_interval = tun().rise_interval_rtts;
-        planner.rise_last = t;
-        planner.rise = None;
-    }
-    let rise_rate = belief.max_c + std::cmp::max(belief.max_c * tun().rise_step, 1.into());
-    // Lossless only if the worst-case queue (`C = min_c`) after another RTT
-    // at the rise rate fits in the smallest buffer.
-    let rise_fits = belief.max_q + rise_rate - belief.min_c <= belief.min_b;
-    let loss_now = state.history.last().map_or(0.into(), |o| o.get_ld());
-    let rise_continues = match planner.rise {
-        Some(rise) if planner.mode == Mode::RiseCheck => {
-            t < rise.started + rise.rtts
-                && if rise.lossless {
-                    rise_fits
-                } else {
-                    // Lossy: a loss means the old buffer still overflows.
-                    loss_now <= rise.loss_at_start
-                }
-        }
-        _ => false,
-    };
-    if planner.mode == Mode::RiseCheck && !rise_continues {
-        // Nothing contradicted the belief (or a restart would have reset
-        // the schedule): wait longer for the next one.
-        planner.rise_interval = std::cmp::min(planner.rise_interval * 2, tun().rise_max_interval_rtts);
-        planner.rise_last = t;
-        planner.rise = None;
-    }
-    // `r / (r - max_c)` RTTs prove `C >= max_c` only to within the service
-    // lag; one more makes the lower bound exceed `max_c`.
-    let rise_step = rise_rate - belief.max_c;
-    let rise_rtts = (rise_rate / rise_step).ceil().to_integer() as usize + 1;
-    // A lossless check must fit for all its RTTs, not just the next one:
-    // stopped when the queue no longer fits, it would never prove anything
-    // on a buffer of about a BDP.  Otherwise the check is lossy (it ends at
-    // its first loss, which only comes if C did not rise).
-    let rise_fits_all = belief.max_q + (rise_rate - belief.min_c) * (rise_rtts as RealNumInt) <= belief.min_b;
-    let rise_lossless = !cautious && rise_fits_all;
-    let rise_interval = if rise_lossless { planner.rise_interval } else { tun().rise_max_interval_rtts };
-    let rise_due = state.strategy.rise_check && c_tight && !planner.app_limited && t >= planner.rise_last + rise_interval;
     features.queue_target = queue_target;
     features.drained = drained;
     features.drain_due = drain_due;
     features.drain_gave_up = drain_gave_up;
-    features.rise_continues = rise_continues;
-    features.rise_due = rise_due;
-    features.rise_fits = rise_fits;
-    features.rise_lossless = rise_lossless;
-    features.probe_due = since_probe >= state.probe_interval_rtts;
 
-    let mode = if rise_continues {
-        Mode::RiseCheck
-    } else if planner.mode == Mode::Drain && !drained && !drain_gave_up {
+    let mode = if planner.mode == Mode::Drain && !drained && !drain_gave_up {
         Mode::Drain
     } else if drain_due && !drain_gave_up {
         Mode::Drain
     } else if !c_tight {
-        Mode::Explore
-    } else if rise_due {
-        let rtts = rise_rtts;
-        info!("t={}: rise check at {} for {} RTTs ({})", t, rise_rate, rtts, if rise_lossless { "lossless" } else { "lossy" });
-        planner.rise = Some(RiseCheck { started: t, rtts, lossless: rise_lossless, loss_at_start: loss_now });
-        Mode::RiseCheck
-    } else if since_probe >= state.probe_interval_rtts {
         Mode::Probe
     } else {
         Mode::Cruise
@@ -1140,19 +1026,19 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     // tables exist only for whole 7-observation windows, and every window
     // that reaches back past the change mixes two links, so the belief is
     // the chained C bounds alone and the queue is only bounded by what is
-    // in flight (which includes up to an RTT of service lag).  Holding the
-    // queue on that would idle the link.  Match the delivery until the new
-    // link's windows exist, and probe above it every `EXPLORE_PROBE_GAP_RTTS`
-    // (timed from the restart, which widened C): a rise in C would
-    // otherwise stay hidden until Explore.
+    // in flight (which includes up to an RTT of service lag), and the
+    // model has no network moves to search over.  Match the delivery until
+    // the new link's windows exist, and probe above it every
+    // `RECOVER_PROBE_GAP_RTTS` (timed from the restart, which widened C): a
+    // rise in C would otherwise stay hidden.
     if since_start < QE_WINDOW_OBSERVATIONS {
         planner.mode = Mode::Recover;
-        let probe_ok = state.strategy.recover_probe && since_probe >= tun().explore_probe_gap_rtts;
+        let probe_ok = state.strategy.recover_probe && since_probe >= tun().recover_probe_gap_rtts;
         features.probe_ok = probe_ok;
-        features.probe_gap = tun().explore_probe_gap_rtts;
+        features.probe_gap = tun().recover_probe_gap_rtts;
         return StatePolicy {
-            belief_history_observations: default_history_len,
-            loss_tolerance_abs: tun().cautious_loss_budget,
+            belief_history_observations: history_len,
+            loss_tolerance_abs: tun().constant_loss_budget(),
             delay_tolerance_frac: 3.into(),
             objective_order: names(OBJECTIVE_ORDER),
             candidate_actions: vec![if probe_ok { CandidateAction::ProbeDelivery } else { CandidateAction::MatchDelivery }],
@@ -1162,149 +1048,54 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
             features,
         };
     }
+    // Bursts of up to K (or the floor) are part of the worst-case queue
+    // that no rate drains, so they do not count against the cap.
+    let queue_cap = belief.min_c * tun().max_queue_bdp + std::cmp::max(planner.queue_floor, k_max);
+    features.queue_cap = queue_cap;
     if !state.newest_window_feasible {
         // No static link explains the newest window: there are no feasible
         // network moves to search over.  Drain on the (restarted) belief
         // until windows after the change exist.
         return StatePolicy {
-            belief_history_observations: default_history_len,
-            loss_tolerance_abs: tun().cautious_loss_budget,
+            belief_history_observations: history_len,
+            loss_tolerance_abs: tun().constant_loss_budget(),
             delay_tolerance_frac: 3.into(),
             objective_order: names(OBJECTIVE_ORDER),
-            candidate_actions: vec![CandidateAction::HoldQueue],
+            candidate_actions: vec![CandidateAction::DrainQueue],
             mode,
             queue_target,
-            queue_cap: None,
+            queue_cap: Some(queue_cap),
             features,
         };
     }
 
-    let aggressive_budget = std::cmp::max(belief.min_c * state.strategy.explore_budget_bdp, 2.into());
-    // While exploring, the worst-case queue is held within one BDP (or the
-    // floor): every rate is capped by it, and above it the CCA holds the
-    // queue there instead of idling.  The link stays backlogged, which is
-    // what bounds C from above.
-    // Bursts of up to K are part of the worst-case queue that no rate
-    // drains (as in `queue_target`), so they do not count against the cap.
-    let explore_cap = belief.min_c * state.strategy.explore_queue_bdp + std::cmp::max(planner.queue_floor, k_max);
-    let queue_high = belief.max_q > explore_cap;
-    features.explore_cap = explore_cap;
-    features.queue_high = queue_high;
-    let mut objective_order = names(OBJECTIVE_ORDER);
-    let mut queue_target = queue_target;
-    let mut queue_cap = None;
-    let (candidate_actions, loss_tolerance_abs) = match mode {
-        Mode::Explore if queue_high && state.strategy.explore_free => {
-            objective_order = names(EXPLORE_FREE_OBJECTIVE_ORDER);
-            let actions = vec![
-                CandidateAction::MaxAllowedRate,
-                CandidateAction::DrainQueue,
-                CandidateAction::ProbeAboveLimit,
-            ];
-            (actions, tun().cautious_loss_budget)
-        }
-        Mode::Explore if queue_high => {
-            queue_target = explore_cap;
-            (vec![CandidateAction::HoldQueue], tun().cautious_loss_budget)
-        }
-        Mode::Explore => {
-            queue_cap = Some(explore_cap);
-            // Capturing bandwidth fast matters most while C is loose; only
-            // a buffer proven small makes the CCA ration its probes.
-            // A probe's losses are reported about two RTTs later; probing
-            // again before then would spend its loss budget a second time.
-            let probe_gap = if small_buffer { tun().cautious_explore_probe_gap_rtts } else { tun().explore_probe_gap_rtts };
-            let probe_ok = since_probe >= probe_gap;
-            features.probe_ok = probe_ok;
-            features.probe_gap = probe_gap;
-            // `HoldQueue` (at the cap) rather than `DrainQueue`: idling for
-            // a whole RTT teaches nothing about C and cannot drain a floor.
-            queue_target = explore_cap;
-            let mut actions = vec![CandidateAction::MaxAllowedRate, CandidateAction::HoldQueue];
-            let budget = if small_buffer { tun().cautious_loss_budget } else { aggressive_budget };
-            // The smallest probe too, when the budget allows more: one
-            // packet above the no-loss rate risks one packet.
-            let probe_small_too = probe_ok && state.strategy.probe_one_packet && budget > 1.into();
-            features.probe_small_too = probe_small_too;
-            if probe_small_too {
-                actions.push(CandidateAction::ProbeOnePacket);
-            }
-            if probe_ok {
-                actions.push(CandidateAction::ProbeAboveLimit);
-            }
-            (actions, budget)
-        }
-        Mode::Probe => {
-            let budget = if cautious { 0.into() } else { tun().cautious_loss_budget };
-            (vec![CandidateAction::ProbeAboveLimit], budget)
-        }
-        Mode::Cruise => {
-            queue_target = std::cmp::max(queue_target, belief.min_c * state.strategy.cruise_queue_bdp);
-            (vec![CandidateAction::HoldQueue], tun().cautious_loss_budget)
-        }
-        Mode::RiseCheck => (vec![CandidateAction::AboveMaxC], tun().cautious_loss_budget),
-        // `HoldQueue` at the queue target: `DrainQueue` unless a floor is
-        // known, in which case draining below it would only idle the link.
-        Mode::Drain => (vec![CandidateAction::HoldQueue], tun().cautious_loss_budget),
+    // A BDP of loss while C is uncertain (it has not been tight since the
+    // belief started: startup, or a detected change), otherwise a constant.
+    let constant = tun().constant_loss_budget();
+    let loss_budget = match mode {
+        Mode::Probe if !c_known => std::cmp::max(belief.min_c * tun().uncertain_loss_bdp, constant),
+        _ => constant,
+    };
+    features.loss_budget = loss_budget;
+    use CandidateAction::*;
+    // Listed lowest rate first (the search breaks an exact tie towards the
+    // last; `sent` leaves no ties between distinct rates anyway).
+    let (candidate_actions, objectives) = match mode {
+        Mode::Probe => (vec![MaxAllowedRate, ProbeHalf, ProbeAboveLimit], PROBE_OBJECTIVE_ORDER),
+        Mode::Cruise => (vec![DrainQueue, MaxAllowedRate, ProbeAboveLimit], CRUISE_OBJECTIVE_ORDER),
+        Mode::Drain => (vec![DrainQueue, DrainHalf, MaxAllowedRate], DRAIN_OBJECTIVE_ORDER),
         Mode::Recover => unreachable!("Recover returns early"),
     };
 
     StatePolicy {
-        belief_history_observations: default_history_len,
-        loss_tolerance_abs,
+        belief_history_observations: history_len,
+        loss_tolerance_abs: loss_budget,
         delay_tolerance_frac: 3.into(),
-        objective_order,
+        objective_order: names(objectives),
         candidate_actions,
         mode,
         queue_target,
-        queue_cap,
+        queue_cap: Some(queue_cap),
         features,
     }
-}
-
-/// The distilled CCA (`--distilled`): this RTT's action from the planner's
-/// features alone, with no search.  Fitted to `--decisions --exact-root`
-/// traces (see "Distilled policy" in `CCA_DEVELOPMENT.md`); it must agree
-/// with `state_policy` + depth-4 minimax on every RTT of them.
-///
-/// Returns the actions whose rates the CCA compares; it sends the highest
-/// of their rates (the engine's candidate formulas, with this mode's loss
-/// budget, queue target and cap), labelled by the first action with it.
-/// Only `Explore` below its queue cap offers more than one.
-pub fn distilled_actions(f: &PlannerFeatures) -> Vec<CandidateAction> {
-    use CandidateAction::*;
-    if f.since_start < QE_WINDOW_OBSERVATIONS {
-        return vec![if f.probe_ok { ProbeDelivery } else { MatchDelivery }]; // Recover
-    }
-    if !f.newest_window_feasible {
-        return vec![HoldQueue]; // the link changed under the newest window
-    }
-    if f.rise_continues {
-        return vec![AboveMaxC]; // RiseCheck
-    }
-    let draining = f.prev_mode == Mode::Drain && !f.drained && !f.drain_gave_up;
-    if draining || (f.drain_due && !f.drain_gave_up) {
-        return vec![HoldQueue]; // Drain
-    }
-    if !f.c_tight {
-        // Explore.
-        if f.queue_high {
-            return vec![HoldQueue];
-        }
-        let mut actions = vec![MaxAllowedRate, HoldQueue];
-        if f.probe_small_too {
-            actions.push(ProbeOnePacket);
-        }
-        if f.probe_ok {
-            actions.push(ProbeAboveLimit);
-        }
-        return actions;
-    }
-    if f.rise_due {
-        return vec![AboveMaxC]; // RiseCheck
-    }
-    if f.probe_due {
-        return vec![ProbeAboveLimit]; // Probe
-    }
-    vec![HoldQueue] // Cruise
 }

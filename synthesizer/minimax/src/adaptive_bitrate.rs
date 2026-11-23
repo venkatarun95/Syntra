@@ -926,6 +926,7 @@ impl<NM: NetworkModel> AdaptiveBitrateState<NM> {
             time_to_c_b: 0,
             time_to_shrink_minc_minb_add,
             shrink_minc_minb: true,
+            drain_q: 0.into(),
         };
 
         // Metrics for abr

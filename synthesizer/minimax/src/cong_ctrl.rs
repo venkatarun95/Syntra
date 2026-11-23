@@ -23,12 +23,11 @@ use network_model_nc::{
 
 mod cbrdelay_cca_config;
 use cbrdelay_cca_config::{
-    frac,
-    tun, set_tunables, Tunables, CRUISE_QUEUE_BDP,
-    distilled_actions, explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
+    tun, set_tunables, Tunables,
+    explore_rule, record_action, state_policy, update_k, BeliefStrategy, CandidateAction, InconsistentQeWindows, KPolicy,
     PlannerState, K_CONFIRM_RTTS,
     StatePolicy, StateQuantities, APP_IS_BACKLOGGED, APP_SEND_CHOICES, BURSTY_PERT, DRAIN_INTERVAL_RTTS,
-    EXPLORE_BUDGET_BDP, EXPLORE_MAX_QUEUE_BDP, PROBE_INTERVAL_RTTS, QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
+    QE_MODEL, QE_WINDOW_OBSERVATIONS, SEARCH_DEPTH, QeModel,
 };
 
 // ------------------------------------------------------------------------------------------
@@ -145,10 +144,11 @@ impl CCValue {
             .partial_cmp(&m2.time_to_shrink_minc_minb_add);
         let scb = m2.shrink_minc_minb.partial_cmp(&m1.shrink_minc_minb);
         let sent = m1.neg_sent.partial_cmp(&m2.neg_sent);
+        let dq = m1.drain_q.partial_cmp(&m2.drain_q);
 
         let comparisons = [
             c, b, sc, sb, s, ld, l, qdel, schmul, schadd, sclmul, scladd, ttsc, lt, ttc, ttscl,
-            cb, ttcb, ttscbadd, scb, sent,
+            cb, ttcb, ttscbadd, scb, sent, dq,
         ];
         for idx in decode_objective_order(*objective_order) {
             let r = comparisons[idx];
@@ -160,9 +160,9 @@ impl CCValue {
     }
 }
 
-const OBJECTIVE_NAMES: [&str; 21] = [
+const OBJECTIVE_NAMES: [&str; 22] = [
     "c", "b", "sc", "sb", "s", "ld", "l", "qdel", "schmul", "schadd", "sclmul", "scladd", "ttsc", "lt",
-    "ttc", "ttscl", "cb", "ttcb", "ttscbadd", "scb", "sent",
+    "ttc", "ttscl", "cb", "ttcb", "ttscbadd", "scb", "sent", "dq",
 ];
 
 /// Compact, `Copy` representation required by the generic minimax value API.
@@ -651,7 +651,19 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             }
         }
 
-        let steps = self.history.len() as RealNumInt + self.history_stack.len() as RealNumInt - 1;
+        // Loss counts from the start of the loss window: the newest
+        // `loss_window_rtts` committed RTTs, whatever the belief uses.
+        let n = self.history.len();
+        let loss_base = self.history[n.saturating_sub(tun().loss_window_rtts + 1)].get_ld();
+        let window_loss = last.get_ld() - loss_base;
+        // `dq`: the smallest worst-case queue the horizon reaches, with a
+        // drained queue (at most `queue_target`) counting as zero.
+        let drain_q = self
+            .belief_bounds_stack
+            .iter()
+            .map(|bb| std::cmp::max(bb.max_q - self.policy.queue_target, 0.into()))
+            .min()
+            .unwrap_or_else(|| std::cmp::max(self.belief_bounds.max_q - self.policy.queue_target, 0.into()));
 
         //let steady_state = self.history.get(HISTORY_SIZE - 1).unwrap().get_ld() > 0.into();
         let steady_state = self
@@ -674,11 +686,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             neg_delivered: (first.get_s()) - (last.get_s()),
             neg_sent: first.get_a() - last.get_a(),
             qdel: std::cmp::max(0.into(), (qmax as RealNumInt - 1).into()),
-            loss: std::cmp::max(
-                0.into(),
-                last.get_ld() - first.get_ld() - self.policy.loss_tolerance_abs,
-            ),
-            total_loss: std::cmp::max(0.into(), last.get_ld() - first.get_ld()),
+            loss: std::cmp::max(0.into(), window_loss - self.policy.loss_tolerance_abs),
+            total_loss: std::cmp::max(0.into(), window_loss),
             // Basically is latest smaller than start:
             //shrink_c: latest.c_add_gap() < start.c_add_gap(),
             shrink_c: latest.min_c > start.min_c || latest.max_c < start.max_c,
@@ -690,7 +699,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             time_to_shrink_c,
             //loss_tol: last.get_ld() <= latest.min_c,
             //loss_tol,
-            loss_tol: (last.get_ld() - first.get_ld()) <= self.policy.loss_tolerance_abs * self.lt_slack,
+            loss_tol: window_loss <= self.policy.loss_tolerance_abs * self.lt_slack,
             time_to_shrink_c_l,
             time_to_shrink_c_h,
             time_to_c,
@@ -698,6 +707,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             time_to_c_b,
             time_to_shrink_minc_minb_add,
             shrink_minc_minb: minc_minb_sum >= start_minc_minb_sum,
+            drain_q,
         }
     }
 
@@ -782,60 +792,49 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let needs_max_rate = actions.iter().any(|candidate| {
             matches!(
                 candidate,
-                CandidateAction::MaxAllowedRate | CandidateAction::ProbeAboveLimit | CandidateAction::ProbeOnePacket
+                CandidateAction::MaxAllowedRate | CandidateAction::ProbeAboveLimit | CandidateAction::ProbeHalf
             )
         });
-        // `compute_max_allowed_rate` enumerates network moves, so skip it
-        // when only `DrainQueue` is allowed.
-        let max_allowed_rate = if needs_max_rate {
-            let rh = self.get_relevant_history(Some(QE_WINDOW_OBSERVATIONS));
-            self.network_model
-                .compute_max_allowed_rate(&rh, &self.move_cca, 0.into(), self.policy.delay_tolerance_frac, 1)
-                // The model minimizes `c + b - max_q` over sampled (C, B) of
-                // the newest window, which can miss the worst case (lowest C
-                // and B); the belief cannot.  For any feasible link,
-                // `c + b - q >= min_cb - max_q`, and `>= c >= min_c` since
-                // the queue never exceeds the buffer.
-                .map(|r| {
-                    let min_cb = std::cmp::max(belief_bounds.min_cb, belief_bounds.min_c + belief_bounds.min_b);
-                    let safe = std::cmp::max(min_cb - belief_bounds.max_q, belief_bounds.min_c);
-                    std::cmp::min(r, safe)
-                })
-        } else {
-            None
-        };
         let min_c = belief_bounds.min_c;
         let max_q = belief_bounds.max_q;
+        // The belief's own bound: for any link in it, `c + b - q >= min_cb -
+        // max_q`, and `>= c >= min_c` since the queue never exceeds the
+        // buffer.  (`compute_max_allowed_rate` minimizes over the newest
+        // window's links alone, which include links older windows ruled out,
+        // e.g. C below `min_c`, and may miss the worst one between its
+        // samples; it is no longer used.)
+        let max_allowed_rate = needs_max_rate.then(|| {
+            let min_cb = std::cmp::max(belief_bounds.min_cb, belief_bounds.min_c + belief_bounds.min_b);
+            let safe = std::cmp::max(min_cb - max_q, min_c);
+            // Keep the worst-case queue within the cap: at C = min_c the
+            // queue grows by `rate - min_c`.
+            match self.policy.queue_cap {
+                Some(cap) => std::cmp::min(safe, std::cmp::max(0.into(), min_c + cap - max_q)),
+                None => safe,
+            }
+        });
+        // What is left of the loss budget at this node: the budget less the
+        // loss reported in the loss window so far (speculative loss included).
+        let n = self.history.len();
+        let loss_base = self.history[n.saturating_sub(tun().loss_window_rtts + 1)].get_ld();
+        let spent = self.get_last_history_item().get_ld() - loss_base;
+        let budget_left = std::cmp::max(0.into(), self.policy.loss_tolerance_abs - spent);
+        let excess = std::cmp::max(0.into(), max_q - self.policy.queue_target);
         let rates = actions
             .iter()
             .map(|candidate| {
                 let rate = match candidate {
                     CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
-                    CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - max_q),
-                    CandidateAction::HoldQueue => std::cmp::max(
-                        0.into(),
-                        min_c - std::cmp::max(0.into(), max_q - self.policy.queue_target),
-                    ),
-                    CandidateAction::ProbeAboveLimit => {
-                        max_allowed_rate.unwrap() + self.policy.loss_tolerance_abs
-                    }
-                    CandidateAction::AboveMaxC => {
-                        let max_c = belief_bounds.max_c;
-                        max_c + std::cmp::max(max_c * tun().rise_step, 1.into())
-                    }
-                    CandidateAction::ProbeOnePacket => max_allowed_rate.unwrap() + 1,
+                    CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - excess),
+                    CandidateAction::DrainHalf => std::cmp::max(0.into(), min_c - excess / 2),
+                    CandidateAction::ProbeAboveLimit => max_allowed_rate.unwrap() + budget_left,
+                    CandidateAction::ProbeHalf => max_allowed_rate.unwrap() + budget_left / 2,
                     CandidateAction::MatchDelivery => self.delivery_rate(),
                     CandidateAction::ProbeDelivery => {
                         let d = self.delivery_rate();
                         let room = d * tun().recover_queue_deliveries - max_q;
                         d + std::cmp::max(0.into(), std::cmp::min(d, room))
                     }
-                };
-                // Keep the worst-case queue within the cap: at C = min_c the
-                // queue grows by `rate - min_c`.
-                let rate = match self.policy.queue_cap {
-                    Some(cap) => std::cmp::min(rate, std::cmp::max(0.into(), min_c + cap - max_q)),
-                    None => rate,
                 };
                 (*candidate, rate)
             })
@@ -912,6 +911,8 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                     infeasible: true,
                 });
             }
+            let mut fresh = fresh;
+            self.apply_k_below_bdp(&mut fresh);
             return Ok((fresh, 0));
         }
 
@@ -1038,7 +1039,23 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                 None => {}
             }
         }
-        Ok((bounds.unwrap_or(self.belief_bounds), conflicts))
+        let mut bounds = bounds.unwrap_or(self.belief_bounds);
+        self.apply_k_below_bdp(&mut bounds);
+        Ok((bounds, conflicts))
+    }
+
+    /// `K_BELOW_BDP`: every assumed K is below a BDP, so C exceeds the
+    /// smallest of them (unless the bounds already rule that out, in which
+    /// case `update_k` drops the K).
+    fn apply_k_below_bdp(&self, bounds: &mut BeliefBounds) {
+        if !tun().k_below_bdp {
+            return;
+        }
+        let Some(k) = self.qe_ks.as_ref().and_then(|ks| ks.iter().min()) else { return };
+        let k: RealNumRep = (*k).into();
+        if bounds.min_c < k && k <= bounds.max_c {
+            bounds.min_c = k;
+        }
     }
 
     fn try_compute_belief_bounds(&self, history_len: usize) -> Result<BeliefBounds, InconsistentQeWindows> {
@@ -1087,12 +1104,31 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
     /// RTTs say too little about the link to push out what older RTTs
     /// proved, so the prior is only dropped once the window holds nothing
     /// but busy RTTs.
+    ///
+    /// C is assumed constant only over `c_expiry_rtts`, so the prior never
+    /// bounds `max_c` then (the newest windows do).  After a restart the
+    /// prior carries only `min_b` (`CARRY_BUFFER`): a rate change rarely
+    /// changes the buffer, and a window that contradicts it wins.
     fn retained_prior(&self) -> Option<BeliefBounds> {
         let (ks, prior, start) = self.retained.as_ref()?;
+        let mut prior = *prior;
+        if tun().c_expiry_rtts > 0 {
+            prior.max_c = LARGEST_BW.into();
+        }
         if *start != self.planner.belief_start {
             // The belief restarted because the link changed: the older
-            // bounds describe a different link.
-            return None;
+            // bounds describe a different link, except (by assumption) B.
+            if !tun().carry_buffer {
+                return None;
+            }
+            return Some(BeliefBounds {
+                min_c: SMALLEST_BW.into(),
+                max_c: LARGEST_BW.into(),
+                min_b: prior.min_b,
+                max_b: LARGEST_BW.into(),
+                min_cb: 0.into(),
+                ..prior
+            });
         }
         let narrowed = match (ks, &self.qe_ks) {
             (Some(old), Some(new)) => new.iter().all(|k| old.contains(k)),
@@ -1103,7 +1139,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             Some(_) if self.history_window.is_some() => true,
             Some(n) => self.app_limited_rtts.iter().rev().take(n).any(|&a| a),
         };
-        (narrowed && retain).then_some(*prior)
+        (narrowed && retain).then_some(prior)
     }
 
     fn get_network_move_sim(&self, args: &Args) -> Option<CCMove<NM::NA>> {
@@ -1323,7 +1359,6 @@ impl CongCtrlState<NetworkModelNC> {
             history: &self.history,
             previous_belief: self.belief_bounds,
             belief_bounds_for_history: &belief_bounds_for_history,
-            probe_interval_rtts: intervals.probe,
             drain_interval_rtts: intervals.drain,
             belief_history: intervals.belief_history,
             strategy: intervals.strategy,
@@ -1348,32 +1383,6 @@ impl CongCtrlState<NetworkModelNC> {
         policy.objective_order = objective_order;
         self.policy = policy;
         self.planner = planner;
-    }
-
-    /// `--distilled`: the rate `distilled_actions` picks (the highest of its
-    /// actions' rates, with the planner's formulas and parameters for this
-    /// RTT), whether those actions are exactly the planner's candidate set,
-    /// and whether this RTT is in the cap-bound region: more than one
-    /// distinct rate, `max_c` bounded, and the highest rate is the queue
-    /// cap's (`min_c + cap - max_q`).  There probing now or next RTT sends
-    /// about the same over the horizon and the search decides on the
-    /// worst-case width of C at the horizon (`c`), which no root feature
-    /// predicts; in every labelled RTT but one (n2 t68, see "Distilled
-    /// policy" in `CCA_DEVELOPMENT.md`) the highest rate was optimal there
-    /// too.  The rate is `None` there only with `defer` (`--distilled-search`).
-    fn distilled_rate(&self, defer: bool) -> (Option<RealNumRep>, bool, bool) {
-        let actions = distilled_actions(&self.policy.features);
-        let ok = actions == self.policy.candidate_actions;
-        let (rates, _) = self.candidate_rates_for(&actions);
-        let distinct: Vec<RealNumRep> = rates.iter().map(|(_, r)| *r).unique().collect();
-        let top = *distinct.iter().max().expect("no distilled action has a rate");
-        let bb = self.get_latest_belief_bounds();
-        let cap_bound = self
-            .policy
-            .queue_cap
-            .is_some_and(|cap| top == std::cmp::max(0.into(), bb.min_c + cap - bb.max_q));
-        let cap_region = distinct.len() > 1 && cap_bound && bb.max_c < LARGEST_BW.into();
-        (if defer && cap_region { None } else { Some(top) }, ok, cap_region)
     }
 
     /// `--decisions`: everything the CCA knows before deciding this RTT,
@@ -1407,24 +1416,19 @@ impl CongCtrlState<NetworkModelNC> {
                 "since_start": pf.since_start,
                 "newest_window_feasible": pf.newest_window_feasible,
                 "k_max": q(pf.k_max),
-                "c_tight": pf.c_tight, "small_buffer": pf.small_buffer,
-                "k_unconfirmed": pf.k_unconfirmed, "cautious": pf.cautious,
+                "c_tight": pf.c_tight, "c_known": pf.c_known,
                 "since_probe": pf.since_probe,
                 "queue_target": q(pf.queue_target),
                 "drained": pf.drained, "drain_due": pf.drain_due, "drain_gave_up": pf.drain_gave_up,
-                "rise_continues": pf.rise_continues, "rise_due": pf.rise_due,
-                "rise_fits": pf.rise_fits, "rise_lossless": pf.rise_lossless,
-                "explore_cap": q(pf.explore_cap), "queue_high": pf.queue_high,
+                "queue_cap": q(pf.queue_cap), "loss_budget": q(pf.loss_budget),
                 "probe_ok": pf.probe_ok, "probe_gap": pf.probe_gap,
-                "probe_due": pf.probe_due, "probe_small_too": pf.probe_small_too,
             },
             "planner": {
                 "last_probe": pl.last_probe, "c_widened": pl.c_widened, "last_drained": pl.last_drained,
                 "drain_started": pl.drain_started, "app_limited": pl.app_limited,
                 "queue_floor": q(pl.queue_floor), "last_sent": q(pl.last_sent),
                 "belief_start": pl.belief_start, "restarts": pl.restarts,
-                "rise_last": pl.rise_last, "rise_interval": pl.rise_interval,
-                "rise": pl.rise.map(|r| serde_json::json!({"started": r.started, "rtts": r.rtts, "lossless": r.lossless})),
+                "c_tight_in": pl.c_tight_in,
                 "k_assumed": pl.k.assumed.clone(),
                 "k_alive": pl.k.alive.iter().filter(|(_, a)| *a).map(|(k, _)| *k).collect::<Vec<_>>(),
                 "k_stable_rtts": pl.k.stable_rtts,
@@ -1455,9 +1459,8 @@ impl CongCtrlState<NetworkModelNC> {
     }
 }
 
-/// `--probe-interval` / `--drain-interval`, passed to the planner.
+/// `--drain-interval` and the belief settings, passed to the planner.
 struct PlannerIntervals {
-    probe: usize,
     drain: usize,
     belief_history: Option<usize>,
     strategy: BeliefStrategy,
@@ -1559,10 +1562,6 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     mixed_period: u32,
 
-    /// Override `PROBE_INTERVAL_RTTS` in the config.
-    #[arg(long)]
-    probe_interval: Option<usize>,
-
     /// Override `DRAIN_INTERVAL_RTTS` in the config.
     #[arg(long)]
     drain_interval: Option<usize>,
@@ -1603,32 +1602,9 @@ struct Args {
     /// (restarting is the default).
     #[arg(long)]
     no_change_restart: bool,
-    /// Do not send above `max_c` periodically to detect a rise in C or B.
-    #[arg(long)]
-    no_rise_check: bool,
-    /// Do not offer a one-packet probe next to a larger Explore probe.
-    #[arg(long)]
-    no_probe_one_packet: bool,
     /// Only match the delivery in Recover; do not probe above it.
     #[arg(long)]
     no_recover_probe: bool,
-    /// Override `CRUISE_QUEUE_BDP`: Cruise holds the worst-case queue at up
-    /// to this many BDPs (0: drain to `queue_target`).
-    #[arg(long)]
-    cruise_queue: Option<f64>,
-    /// Let minimax choose (with `qdel`) instead of forcing drains in Explore.
-    #[arg(long)]
-    explore_free: bool,
-    /// Override `EXPLORE_BUDGET_BDP`: an Explore probe's loss budget, in
-    /// BDPs (`min_c`), e.g. 0.5.
-    #[arg(long)]
-    explore_budget: Option<f64>,
-    /// Override `EXPLORE_MAX_QUEUE_BDP`, e.g. 3.
-    #[arg(long)]
-    explore_queue: Option<f64>,
-    /// Only the newest N RTTs bound C from above for the planner.
-    #[arg(long)]
-    c_upper_rtts: Option<usize>,
     /// Write one JSON line per RTT here: the belief, planner memory and
     /// the planner's derived features (`PlannerFeatures`), mode, candidate
     /// rates (exact, as `n/d`), the chosen rate, and, where the search ran,
@@ -1679,20 +1655,14 @@ struct Args {
     /// `MISMATCH`, suffixed `-known` where the rule claims to know the search's choice).
     #[arg(long)]
     check_rule: bool,
-    /// Take `distilled_actions`' choice (the highest of its actions' rates)
-    /// instead of searching, on every RTT.  The CSV column `rule` is
-    /// `dist-ok`, `dist-capbound` (the cap-bound region of `distilled_rate`),
-    /// `dist-search` (deferred, with `--distilled-search`) or
-    /// `dist-MISMATCH` (its actions differ from the planner's candidate set).
-    #[arg(long)]
-    distilled: bool,
-    /// With `--distilled`, search in the cap-bound region instead (where in
-    /// one labelled RTT the search preferred a lower rate).
-    #[arg(long)]
-    distilled_search: bool,
+    /// `--external`: the first N observations are replays (a wrapper
+    /// re-sending a segment in new units), whose decisions are discarded:
+    /// do not search for them.
+    #[arg(long, default_value_t = 0)]
+    replay: u32,
     /// Break exact ties at the root towards the highest rate (by default the
     /// search keeps the last candidate in planner order).  Every choice is
-    /// still minimax-optimal; `--distilled` makes the same choice.
+    /// still minimax-optimal.
     #[arg(long)]
     tie_high: bool,
     /// Intersect each speculative belief only with the committed root's,
@@ -1712,11 +1682,9 @@ struct Args {
     #[arg(long)]
     lt_slack: Option<f64>,
     /// Override a planner parameter, `NAME=VALUE` (repeatable).  NAME is a
-    /// `Tunables` field (e.g. `c_tight_ratio=1.5`, `k_hypotheses=1/4/16`)
-    /// or one of `probe_interval_rtts`, `drain_interval_rtts`,
-    /// `k_confirm_rtts`, `explore_budget_bdp`, `explore_max_queue_bdp`,
-    /// `cruise_queue_bdp`, `rise_check`, `probe_one_packet`, `recover_probe`
-    /// (0/1 for the last three).
+    /// `Tunables` field (e.g. `c_tight_ratio=1.5`, `k_hypotheses=1/4/16`,
+    /// `pkts_per_unit=64`) or one of `drain_interval_rtts`,
+    /// `k_confirm_rtts`, `recover_probe` (0/1).
     #[arg(long = "param")]
     params: Vec<String>,
 }
@@ -1930,13 +1898,10 @@ fn get_sim_tag(args: &Args) -> String {
         let parts: Vec<String> = sched.iter().map(|(t, b)| format!("{t}-{b}")).collect();
         ret.push_str(&format!("_bsched{}", parts.join("-")));
     }
-    if let Some(n) = args.c_upper_rtts {
-        ret.push_str(&format!("_cup{n}"));
-    }
     if let Some(k) = args.k_confirm {
         ret.push_str(&format!("_kc{k}"));
     }
-    for (on, name) in [(args.k_optimistic, "kopt"), (args.no_change_restart, "nochg"), (args.no_rise_check, "norise"), (args.explore_free, "xfree")] {
+    for (on, name) in [(args.k_optimistic, "kopt"), (args.no_change_restart, "nochg")] {
         if on {
             ret.push_str(&format!("_{name}"));
         }
@@ -2023,9 +1988,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for p in &args.params {
         let (name, value) = p.split_once('=').ok_or(format!("--param {p}: expected NAME=VALUE"))?;
         match name {
-            "probe_interval_rtts" | "drain_interval_rtts" | "k_confirm_rtts" | "explore_budget_bdp"
-            | "explore_max_queue_bdp" | "cruise_queue_bdp" | "rise_check" | "probe_one_packet"
-            | "recover_probe" => strategy_params.push((name, value.parse::<f64>().map_err(|e| format!("--param {p}: {e}"))?)),
+            "drain_interval_rtts" | "k_confirm_rtts" | "recover_probe" => strategy_params.push((name, value.parse::<f64>().map_err(|e| format!("--param {p}: {e}"))?)),
             _ => tunables.set(name, value)?,
         }
     }
@@ -2088,34 +2051,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }));
     }
     let mut intervals = PlannerIntervals {
-        probe: args.probe_interval.unwrap_or(PROBE_INTERVAL_RTTS),
         drain: args.drain_interval.unwrap_or(DRAIN_INTERVAL_RTTS),
         belief_history: args.history_window.or(args.belief_history),
         strategy: BeliefStrategy {
             k_confirm_rtts: args.k_confirm.unwrap_or(K_CONFIRM_RTTS),
             k_optimistic: args.k_optimistic,
             change_restart: !args.no_change_restart,
-            explore_free: args.explore_free,
-            c_upper_rtts: args.c_upper_rtts,
-            explore_budget_bdp: args.explore_budget.map_or(EXPLORE_BUDGET_BDP, frac),
-            explore_queue_bdp: args.explore_queue.map_or(EXPLORE_MAX_QUEUE_BDP, frac),
-            rise_check: !args.no_rise_check,
-            probe_one_packet: !args.no_probe_one_packet,
             recover_probe: !args.no_recover_probe,
-            cruise_queue_bdp: args.cruise_queue.map_or(CRUISE_QUEUE_BDP, frac),
         },
     };
     for (name, v) in strategy_params {
         let st = &mut intervals.strategy;
         match name {
-            "probe_interval_rtts" => intervals.probe = v.round() as usize,
             "drain_interval_rtts" => intervals.drain = v.round() as usize,
             "k_confirm_rtts" => st.k_confirm_rtts = v.round() as usize,
-            "explore_budget_bdp" => st.explore_budget_bdp = frac(v),
-            "explore_max_queue_bdp" => st.explore_queue_bdp = frac(v),
-            "cruise_queue_bdp" => st.cruise_queue_bdp = frac(v),
-            "rise_check" => st.rise_check = v != 0.,
-            "probe_one_packet" => st.probe_one_packet = v != 0.,
             "recover_probe" => st.recover_probe = v != 0.,
             _ => unreachable!(),
         }
@@ -2135,7 +2084,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ccs.root_tie_high = args.tie_high;
     ccs.spec_monotone = !args.no_spec_monotone;
     ccs.prune_disjoint = !args.no_prune_disjoint;
-    ccs.lt_slack = args.lt_slack.map_or(1.into(), frac);
+    ccs.lt_slack = args.lt_slack.map_or(1.into(), cbrdelay_cca_config::frac);
     ccs.history_window = args.history_window;
 
     if args.sim {
@@ -2205,25 +2154,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect();
         let (rule_rate, rule_known) = explore_rule(&root_rates, &ccs.belief_bounds);
         let use_rule = args.explore_rule || (args.explore_rule_exact && rule_known);
-        let mut rule = use_rule.then_some(rule_rate);
-        let mut dist_check = None;
-        if args.distilled {
-            assert!(!intervals.strategy.explore_free, "--distilled assumes the default planner");
-            let (rate, ok, cap_region) = ccs.distilled_rate(args.distilled_search);
-            if !ok {
-                warn!("t={}: distilled actions {:?} differ from the planner's {:?}", t,
-                      distilled_actions(&ccs.policy.features), ccs.policy.candidate_actions);
-            }
-            // `None`: the distilled policy defers to the search here.
-            dist_check = Some(match (ok, rate) {
-                (false, _) => "dist-MISMATCH",
-                (true, None) => "dist-search",
-                (true, Some(_)) if cap_region => "dist-capbound",
-                (true, Some(_)) => "dist-ok",
-            });
-            rule = rate;
-        }
-        let use_rule = use_rule || (args.distilled && rule.is_some());
+        let rule = use_rule.then_some(rule_rate);
+        // A replayed observation's decision is discarded: take any move.
+        let replaying = args.external && t < args.replay;
+        let use_rule = use_rule || replaying;
         let searched = !args.sim_max_rate && root_moves.len() > 1 && !use_rule;
         let trace = decisions.is_some().then(|| ccs.trace_features());
         let trace_ext = (args.external && args.external_json).then(|| ccs.trace_features());
@@ -2297,7 +2231,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 format!("{}{}", verdict, if rule_known { "-known" } else { "" })
             }
-            _ => dist_check.map_or("-".to_string(), str::to_string),
+            _ => if replaying { "replay".to_string() } else { "-".to_string() },
         };
         // The CCA chose a rate; the application decides how much of it is
         // sent.  Only what is sent reaches the link and the QE history.

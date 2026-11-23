@@ -147,6 +147,10 @@ pub struct Metrics {
     pub time_to_shrink_minc_minb_add: RealNumInt,
     /// Whether the combined lower bound did not decrease from its initial value.
     pub shrink_minc_minb: bool,
+    /// The smallest worst-case queue reached in the horizon, with anything
+    /// at or below the drain target counted as zero; smaller is better.
+    #[serde(with = "serde_real")]
+    pub drain_q: RealNumRep,
 }
 
 // ------------------------------------------------------------------------------------------

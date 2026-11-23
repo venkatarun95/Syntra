@@ -188,6 +188,10 @@ owns its memory (`PlannerState`) and calls, once per committed RTT:
    the search is skipped.
 3. `record_action`, after the move is chosen (probe bookkeeping).
 
+*Superseded:* the modes below are the pre-search design; the current
+planner (Probe, Cruise, Drain, Recover, each with its own objective, and a
+search every RTT) is described in "Search CCA" below.
+
 Modes: `Explore` (C loose; minimax picks among `MaxAllowedRate`,
 `DrainQueue`, `ProbeAboveLimit`, or only `DrainQueue` once the queue may
 exceed `EXPLORE_MAX_QUEUE_BDP`), `Cruise` (C tight; `HoldQueue`, i.e.
@@ -665,6 +669,10 @@ a BDP cost about `r - B` each (C=100 B=50: 52 packets in one check).
 
 ## Distilled policy (Nov 2026)
 
+*Superseded:* `--distilled` and `distilled_actions` were removed with the
+redesign in "Search CCA" below, which searches every RTT.  This section
+records what the rule was and how it was checked.
+
 `--distilled` runs the CCA without any search: beliefs, K tracking, change
 detection and the planner's memory are computed exactly as before, and the
 action comes from `distilled_actions` in `cbrdelay_cca_config.rs`: a list of
@@ -1002,6 +1010,86 @@ minutes), and cc_sim's clock (1 us) cannot pace more than a packet per microseco
 100 Gbit/s needs packets of 12.5 kB or more.
 
 Report: `reports/2026-11-22-cc-sim/`.
+
+## Search CCA: the planner picks the objective, the search picks the rate (Nov 2026)
+
+Principle: **trust the planner.**  Hand-designed rules (probe gaps, rise
+checks, Cruise's queue target, the Explore cap) are replaced by candidate
+actions and objectives, and minimax decides.  The CCA searches every RTT
+(no distilled rule), so every decision is minimax-optimal for its mode's
+objective by construction.
+
+**Modes** (`state_policy`) only select the objective and the candidates:
+
+| mode | when | objective (`*_OBJECTIVE_ORDER`) | candidates |
+| --- | --- | --- | --- |
+| Probe | C loose (`max_c > 1.25 min_c`) | `ld`, `schadd`, `ttscbadd`, `scb`, `c`, `l`, `s`, `sent` | `MaxAllowedRate`, `ProbeHalf`, `ProbeAboveLimit` |
+| Cruise | C tight | `ld`, `s`, `l`, `sent` | `DrainQueue`, `MaxAllowedRate`, `ProbeAboveLimit` |
+| Drain | no min-RTT sample for `DRAIN_INTERVAL_RTTS` | `dq`, `ld`, `s`, `l`, `sent` | `DrainQueue`, `DrainHalf`, `MaxAllowedRate` |
+| Recover | under a QE window since a restart | (no search: no window, no network moves) | `MatchDelivery` or, every 2 RTTs, `ProbeDelivery` |
+
+`RiseCheck`, `Explore`, `HoldQueue`, `AboveMaxC` and `ProbeOnePacket` are
+gone.  `MatchDelivery`/`ProbeDelivery` are offered only in Recover, where
+no QE window exists.
+
+**Actions.**  `MaxAllowedRate` is now the belief's own bound,
+`max(min_cb - max_q, min_c)`, capped so the worst-case queue (at
+`C = min_c`) stays within `MAX_QUEUE_BDP` (one BDP) plus K or the floor: a
+queue beyond a BDP adds delay and no throughput, and above the cap it
+drains to it (which replaces `HoldQueue`).  The model's
+`compute_max_allowed_rate` is no longer used: it minimizes over the newest
+window's links alone, which include links older windows ruled out (C below
+`min_c`), so `min(model, belief)` kept Cruise below `min_c` and the link
+never provably backlogged.  `ProbeAboveLimit` is `MaxAllowedRate` plus what
+is left of the loss budget at that node of the tree, `ProbeHalf` plus half
+of it; `DrainQueue` drains `max_q` to `queue_target` in one RTT,
+`DrainHalf` half of the excess.
+
+**Loss budget over a window, across restarts.**  `ld`, `l` and `lt` count
+the loss reported since the start of the newest `LOSS_WINDOW_RTTS` (20)
+committed RTTs, plus the horizon, not since the belief started: a restart
+no longer forgives loss, and repeated or overlapping probes are charged
+together.  `ld` (loss beyond the budget, smaller is better) comes first,
+not the boolean `lt`: once the window is over budget every move tied on
+`lt`, and the search then probed freely.  The budget is a BDP (`min_c`)
+while C has not been tight since the belief started (startup or a detected
+change), otherwise `CONSTANT_LOSS_PKTS` (1 packet, via `pkts_per_unit`,
+which cc_sim passes; at least 1/16 unit).
+
+**`max_c` expires** (`C_EXPIRY_RTTS` = 20): the belief uses the newest 20
+RTTs' windows, and the retained prior keeps `min_c` and B but not `max_c`.
+C is assumed constant only that long; when nothing in the last 20 RTTs
+bounds C from above the CCA is in Probe again (with the 1-packet budget,
+since C was tight before).  On a lossless link the windows bound `max_c`
+only around a loss, so in cc_sim this happens about 25 RTTs after the last
+loss: the constant cost of looking for a rise.
+
+**K < BDP** (`K_BELOW_BDP`): a K hypothesis is ruled out once its windows
+prove `C <= K`, and `min_c` is at least the smallest assumed K.
+
+**B carried across restarts** (`CARRY_BUFFER`): after a restart the prior
+keeps the old `min_b` (a rate change rarely changes the buffer in packets);
+a window that contradicts it wins, as for any conflicting bound.
+
+**New objective `dq`**: the smallest `max_q` reached in the horizon, with
+anything at or below `queue_target` counting as zero (a drain completed
+within the horizon, however spread).
+
+**Depth 6 is required.**  A probe's loss is reported two rounds after it is
+sent.  At depth 4 (two rounds) the root probe's own loss never appears in
+the tree, so every root move tied on `ld` and the search probed every RTT:
+on a C=20, B=20 link it sent three probes in a row and lost 3 BDP in
+startup (and 2.5 BDP on cc_sim's 12 Mbit/s, 50 ms, 1 BDP link).  At depth 6
+it probes, waits for the result, and probes again: the old 2-RTT probe gap,
+found by the search.  The cost in cc_sim with seven runs in parallel is
+30-55 s per RTT in startup (all four K alive), about 60 MB per process.
+
+**`--replay N`**: the first N observations are replays (cc_sim re-sending a
+segment in new units); their decisions are discarded, so they are not
+searched.
+
+Evaluation: `reports/2026-11-23-search-cca/` (cc_sim focus set, depth 6,
+against Reno, Copa and the ack-window CCA).
 
 ## QE/transpilation boundary
 
