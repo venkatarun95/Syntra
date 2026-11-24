@@ -51,6 +51,16 @@ pub trait State: Debug + Sized {
     /// Return the state that is suitable for storage in a transition table
     fn tt_state(&self) -> Self::T;
     fn chosen_move(&self, m: &Option<Self::M>, v: &Self::V);
+
+    /// Whether a leaf's static `value` can be trusted, or something the
+    /// value cannot see is still pending (e.g. loss not yet reported), so
+    /// the search should extend it (`Search::quiesce_plies`).
+    fn quiescent(&self) -> bool {
+        true
+    }
+    /// In a quiescence extension: keep only this node's moves that add
+    /// nothing pending, so the extension settles what is already pending.
+    fn restrict_to_quiet_moves(&mut self) {}
 }
 
 pub trait Game {
@@ -99,6 +109,11 @@ pub struct Search<S: State> {
     /// Search every root move with a full window, so `root_values` are exact
     /// (not alpha-beta bounds) and ties can be told apart.  Slower.
     pub exact_root: bool,
+    /// Quiescence: a leaf that is not `quiescent` (minimizer to move) is
+    /// extended by up to this many plies, with the minimizer restricted to
+    /// quiet moves and every reply of the maximizer, until it is quiescent.
+    /// 0: off.
+    pub quiesce_plies: u16,
 }
 
 impl<S: State> Search<S> {
@@ -108,6 +123,7 @@ impl<S: State> Search<S> {
             root_depth: 0,
             root_values: Vec::new(),
             exact_root: false,
+            quiesce_plies: 0,
         }
     }
 
@@ -149,7 +165,13 @@ impl<S: State> Search<S> {
             return Some(v);
         }
         if depth == 0 {
-            let v = state.value();
+            // A leaf's extension is always run with the same budget, so its
+            // value is stored at depth 0 like a static one.
+            let v = if self.quiesce_plies > 0 && !maximize && !state.quiescent() {
+                self.quiesce(state, self.quiesce_plies, &stop_flag)?
+            } else {
+                state.value()
+            };
             if enable_tt {
                 self.tt.insert(tt_state, (None, v), depth);
             }
@@ -245,6 +267,39 @@ impl<S: State> Search<S> {
             );
         }
         return Some(value);
+    }
+
+    /// The value of a non-quiescent leaf: plain minimax (full window, no
+    /// transposition table, so the value is exact) over quiet minimizer
+    /// moves and all maximizer replies, until quiescent or `plies` run out.
+    fn quiesce(&mut self, state: &mut S, plies: u16, stop_flag: &Arc<AtomicBool>) -> Option<S::V> {
+        if stop_flag.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Some(v) = state.game_over() {
+            return Some(v);
+        }
+        let maximize = state.maximizer();
+        if !maximize {
+            if plies < 2 || state.quiescent() {
+                return Some(state.value());
+            }
+            state.restrict_to_quiet_moves();
+        }
+        let mut value = None;
+        while let Some(m) = state.best_move_guess(&self.tt) {
+            state.make_move(&m);
+            let v = self.quiesce(state, plies - 1, stop_flag);
+            state.pop_move();
+            let v = v?;
+            value = match value {
+                None => Some(v),
+                Some(best) if (maximize && v > best) || (!maximize && v < best) => Some(v),
+                keep => keep,
+            };
+        }
+        // No feasible reply: scored as a leaf, as in `deepen_tree`.
+        Some(value.unwrap_or_else(|| state.value()))
     }
 
     pub fn best_move(

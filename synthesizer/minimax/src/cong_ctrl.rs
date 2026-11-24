@@ -308,6 +308,17 @@ struct CongCtrlState<NM: NetworkModel> {
     n_nodes_explored: u32,
 
     parallel_binary_search: bool,
+
+    /// Quiescence (`--quiesce`): per CCA move, in lock step with the CCA
+    /// moves made, the cumulative arrivals after it and its risk, the most
+    /// it can lose (`rate_risk`).  Its loss is unreported until the link has
+    /// served or reported as lost everything up to those arrivals.
+    risk_stack: Vec<(RealNumRep, RealNumRep)>,
+    /// The same for committed moves whose loss may still be unreported.
+    committed_risk: Vec<(RealNumRep, RealNumRep)>,
+    /// `--charge-outstanding`: a leaf's `ld` counts every outstanding move's
+    /// risk as if it were lost (a static bound instead of `--quiesce`).
+    charge_outstanding: bool,
 }
 
 impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
@@ -373,6 +384,8 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
         debug!("Make move {:?}", m);
         match m {
             CCMove::CCA(a) => {
+                let arrivals = self.get_last_history_item().get_a() + a.rate;
+                self.risk_stack.push((arrivals, self.rate_risk(a.rate)));
                 self.move_cca = Some(*a);
                 if self.disable_pre_enumeration {
                     self.move_choices_network_stack.push(Vec::new());
@@ -403,6 +416,7 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
             // network's turn now. Implies popping CCA's move.
             debug!("Pop move: {:?}", self.move_cca);
             self.move_cca = None;
+            self.risk_stack.pop();
             self.move_choices_network_stack.pop();
             // After a CCA's make_move, we compute next move choices for the
             // network, so we pop those.
@@ -453,6 +467,21 @@ impl<NM: NetworkModel> minimax::State for CongCtrlState<NM> {
             history,
             move_cca: self.move_cca,
         }
+    }
+
+    /// Quiet unless a CCA move whose loss may still be unreported could
+    /// lose enough to change `ld`: the loss window's reported loss plus
+    /// every outstanding move's risk exceeds the budget.
+    fn quiescent(&self) -> bool {
+        let outstanding = self.outstanding_risk();
+        outstanding == 0.into() || self.window_loss() + outstanding <= self.policy.loss_tolerance_abs
+    }
+
+    /// Only `MaxAllowedRate`, the rate that risks no loss (`rate_risk` 0).
+    fn restrict_to_quiet_moves(&mut self) {
+        let (_, max_allowed) = self.candidate_rates_for(&[CandidateAction::MaxAllowedRate]);
+        let moves = self.move_choices_cca_stack.last_mut().unwrap();
+        *moves = vec![CCMove::CCA(CCAAction { rate: max_allowed.unwrap() })];
     }
 
     fn chosen_move(&self, m: &Option<CCMove<NM::NA>>, v: &CCValue) {
@@ -552,11 +581,55 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         assert!(self.move_choices_cca_stack.len() == 2);
 
         self.history.push(self.history_stack.pop().unwrap());
+        // What was actually sent (the application may have sent less).
+        let arrivals = self.history.last().unwrap().get_a();
+        self.committed_risk.extend(self.risk_stack.pop().map(|(_, risk)| (arrivals, risk)));
+        let settled = self.settled();
+        self.committed_risk.retain(|(arrivals, risk)| *arrivals > settled && *risk > 0.into());
         self.belief_bounds_stack.pop();
         self.disjoint_stack.pop();
         self.move_choices_network_stack.pop();
         self.move_choices_cca_stack.pop();
         self.move_choices_cca_stack.pop();
+    }
+
+    /// The most a round sending `rate` from this node can lose: the excess
+    /// over `MaxAllowedRate` before its queue cap.  For any link in the
+    /// belief, `C + B - q >= min_cb - max_q`, and a rate of at most C never
+    /// overflows, so sending at most `max(min_cb - max_q, min_c)` loses
+    /// nothing (up to K).
+    fn rate_risk(&self, rate: RealNumRep) -> RealNumRep {
+        let bb = self.get_latest_belief_bounds();
+        let min_cb = std::cmp::max(bb.min_cb, bb.min_c + bb.min_b);
+        let safe = std::cmp::max(min_cb - bb.max_q, bb.min_c);
+        std::cmp::max(0.into(), rate - safe)
+    }
+
+    /// The risk of every CCA move (committed or speculative) whose loss may
+    /// still be unreported at this node.
+    fn outstanding_risk(&self) -> RealNumRep {
+        let settled = self.settled();
+        self.committed_risk
+            .iter()
+            .chain(self.risk_stack.iter())
+            .filter(|(arrivals, _)| *arrivals > settled)
+            .map(|(_, risk)| *risk)
+            .fold(0.into(), |a, b| a + b)
+    }
+
+    /// Arrivals whose fate is known at this node: what the link has served
+    /// plus the reported loss.  A move's loss is reported once this reaches
+    /// the move's arrivals (the model's loss observation).
+    fn settled(&self) -> RealNumRep {
+        let last = self.get_last_history_item();
+        last.get_s() + last.get_ld()
+    }
+
+    /// Loss reported in the loss window so far (speculative loss included).
+    fn window_loss(&self) -> RealNumRep {
+        let n = self.history.len();
+        let loss_base = self.history[n.saturating_sub(tun().loss_window_rtts + 1)].get_ld();
+        self.get_last_history_item().get_ld() - loss_base
     }
 
     fn compute_metrics(&self) -> Metrics {
@@ -656,6 +729,12 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
         let n = self.history.len();
         let loss_base = self.history[n.saturating_sub(tun().loss_window_rtts + 1)].get_ld();
         let window_loss = last.get_ld() - loss_base;
+        // `ld` only: the budget must hold even if all outstanding risk is lost.
+        let budget_loss = if self.charge_outstanding && !self.risk_stack.is_empty() {
+            window_loss + self.outstanding_risk()
+        } else {
+            window_loss
+        };
         // `dq`: the smallest worst-case queue the horizon reaches, with a
         // drained queue (at most `queue_target`) counting as zero.
         let drain_q = self
@@ -686,7 +765,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             neg_delivered: (first.get_s()) - (last.get_s()),
             neg_sent: first.get_a() - last.get_a(),
             qdel: std::cmp::max(0.into(), (qmax as RealNumInt - 1).into()),
-            loss: std::cmp::max(0.into(), window_loss - self.policy.loss_tolerance_abs),
+            loss: std::cmp::max(0.into(), budget_loss - self.policy.loss_tolerance_abs),
             total_loss: std::cmp::max(0.into(), window_loss),
             // Basically is latest smaller than start:
             //shrink_c: latest.c_add_gap() < start.c_add_gap(),
@@ -1197,6 +1276,9 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
             last_action: None,
             n_nodes_explored: 0,
             parallel_binary_search: false,
+            risk_stack: Vec::new(),
+            committed_risk: Vec::new(),
+            charge_outstanding: false,
             // pool: rayon::ThreadPoolBuilder::new()
             //     .num_threads(N_THREADS)
             //     .build()
@@ -1619,6 +1701,15 @@ struct Args {
     /// Override `SEARCH_DEPTH` (plies; must be even).
     #[arg(long)]
     depth: Option<u16>,
+    /// Quiescence: extend a leaf whose outstanding (unreported) loss could
+    /// exceed the loss budget by up to this many plies (even), offering
+    /// only `MaxAllowedRate` against every network reply.  0: off.
+    #[arg(long, default_value_t = 0)]
+    quiesce: u16,
+    /// Instead of (or before) extending, charge a leaf's outstanding risk to
+    /// its loss metrics, as if all of it were lost.
+    #[arg(long)]
+    charge_outstanding: bool,
     /// The link is outside this process (e.g. a packet simulator): each RTT
     /// print `rate R` on stdout, then read the RTT's outcome from stdin as
     /// `SENT S APP_LIMITED [ROUND:L ...]`: what was sent, the cumulative
@@ -2086,6 +2177,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // cong_ctrl_state.best_move_guess(tt);
     ccs.parallel_binary_search = args.parallel;
     ccs.root_tie_high = args.tie_high;
+    ccs.charge_outstanding = args.charge_outstanding;
     ccs.spec_monotone = !args.no_spec_monotone;
     ccs.prune_disjoint = !args.no_prune_disjoint;
     ccs.lt_slack = args.lt_slack.map_or(1.into(), cbrdelay_cca_config::frac);
@@ -2181,6 +2273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // if exact, and values depend on this RTT's policy and root.
             search = minimax::Search::new();
             search.exact_root = args.exact_root;
+            search.quiesce_plies = args.quiesce;
             let (ret, _, _) = search.best_move(&mut ccs, Some(args.depth.unwrap_or(SEARCH_DEPTH)), None);
             if log_root {
                 let rate = |m: &CCMove<NetworkActionNC>| match m {
