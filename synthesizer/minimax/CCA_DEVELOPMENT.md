@@ -1098,7 +1098,19 @@ searched.
 Evaluation: `reports/2026-11-23-search-cca/` (cc_sim focus set, depth 6,
 against Reno, Copa and the ack-window CCA).
 
-## Variable-depth search: quiescence on outstanding losses (design, not built)
+## Variable-depth search: quiescence on outstanding losses
+
+**Built** (`--quiesce N`; 2026-11-24).  As designed below, except: a move's
+loss counts as outstanding until the link has served or reported as lost
+everything sent up to it (`S + L_reported >= A`, the model's loss
+observation), not for a fixed `LOSS_LAG`, because with a BDP queued the
+loss of a probe was reported 3-4 rounds after it was sent; and the
+extension is plain minimax with a full window and no transposition table.
+Results (built-in C=50, B=50 link and cc_sim): see
+`reports/2026-11-23-search-cca/NOTES.md`.  `--depth 4 --quiesce 4` is the
+setting in use.
+
+### The design
 
 **Why.**  Depth 6 is needed only because a probe's loss is reported two
 rounds after it is sent: at depth 4 a leaf can hold unreported loss, which

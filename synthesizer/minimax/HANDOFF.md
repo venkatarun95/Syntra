@@ -63,13 +63,13 @@ target/release/cbrdelay-cca --qe-model bursty --sim-c 20 --sim-b 20 --sim-k 1 \
 
 cd ~/Projects/cc_sim/.claude/worktrees/minimax-qe
 ~/.cargo/bin/cargo build --release
-MMQE_DEPTH=6 RUN_TIMEOUT=28800 python3 experiments/minimax/run.py /tmp/focus_d6 \
-  --set focus --ccas mmqe --jobs 7
+MMQE_DEPTH=4 MMQE_QUIESCE=4 RUN_TIMEOUT=43200 python3 experiments/minimax/run.py \
+  /tmp/focus_q4 --set focus --ccas mmqe --jobs 7
 python3 experiments/minimax/run.py /tmp/focus_base --set focus \
   --ccas reno,copa,ackwin2,ackwin15 --jobs 1
 
 cd ~/Projects/Syntra/.claude/worktrees/cca-applimited-beliefs/synthesizer/minimax/reports/2026-11-23-search-cca
-python3 build.py search_cca_report.html /tmp/focus_d6 /tmp/focus_base
+python3 build.py search_cca_report.html /tmp/focus_q4 /tmp/focus_base /tmp/focus_base_kb
 ```
 
 Rebuilding `cbrdelay-cca` while cc_sim runs is unsafe: cc_sim spawns a new
@@ -114,17 +114,31 @@ engine from the same path on every rescale, so a run would mix versions.
    in Recover (rule mode, 18-21 restarts); 1 Gbit/s startup is slow (2.2 s
    to 90%).
 
+7. **Quiescence** (`--quiesce N`, `minimax/src/lib.rs` `quiesce`, risk
+   tracking in `cong_ctrl.rs`): depth 4 + 4 plies keeps startup within the
+   loss budget where depth 6 did not, at ~3x depth 6's cost (the user
+   accepts 3x).  8 plies changed nothing at 7x more.  Charging outstanding
+   risk statically never learns C.
+8. **Cruise holds at `min_c`** (`HoldMinC`); draining is Drain's job only
+   (user: drain only when the queue has not been provably empty for too
+   long).  `sent` does not break ties between root moves, so anything after
+   it in the order still matters.
+9. **Probe after `max_c` expiry**: on 1 BDP the 1-packet budget blocks
+   re-proving `max_c`; putting belief narrowing first does it losslessly (see
+   the report NOTES).  Open decision for the user.
+
 ## Next steps (in order)
 
-1. Cruise draining below C (finding 4), then cellular: replace the Recover
-   rule (ask the user first; see open questions) and the restart rate on
-   non-CBR links.  Compare against the old distilled CCA
+1. Cellular: the Recover rule and the restart rate on non-CBR links.  The
+   user asked for shorter QE windows (T=1..5) so Recover can search: solves
+   run in `qe/outputs/qe/bursty_cbrdelay_T{1,2,3}` (worktree `qe/`, low
+   priority; logs `/tmp/qe_logs`).  T=1 B and Q solved, S and L fail an
+   assertion (`last_observed_s >= 0`); T=2 everything but C solved quickly,
+   its C queries were still running after 14 h.  Then: transpile
+   (`qe/scripts/transpile_bursty.sh`, add the new T) and make the Rust side
+   use windows shorter than 7 observations after a restart.  Compare against the old distilled CCA
    (`reports/2026-11-22-cc-sim/`, sweep4).
-2. **Variable-depth search** (design in `CCA_DEVELOPMENT.md`, "Variable-depth
-   search: quiescence on outstanding losses"): depth 4 plus extension of
-   leaves with unreported risk.  Validate against depth 6 decisions on the
-   focus traces, then measure the time per RTT.  This is what makes the full
-   ~70-scenario set affordable.
+2. Probe after `max_c` expiry (finding 9), and slow 1 Gbit/s startup.
 3. Full sweep (`run.py` without `--set focus`, 7 jobs) once the cost allows,
    and rebuild the report from it.
 4. Open questions to raise with the user rather than decide alone:
