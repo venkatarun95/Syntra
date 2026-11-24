@@ -81,6 +81,12 @@ pub enum CandidateAction {
     DrainQueue,
     /// Drain half of that excess: a drain spread over two RTTs.
     DrainHalf,
+    /// `min_c`: keep the queue where it is (if C is `min_c`), without
+    /// draining it.  Cruise's alternative to filling the queue: a drain
+    /// below `min_c` is needed only when the queue has not been provably
+    /// empty for too long (Drain), not whenever the worst-case queue is
+    /// above its target (the real one may be empty).
+    HoldMinC,
     /// `MaxAllowedRate` plus what is left of the loss budget in the loss
     /// window (`loss_tolerance_abs` less the loss reported in the newest
     /// `LOSS_WINDOW_RTTS`).
@@ -1115,7 +1121,7 @@ pub fn state_policy(state: &StateQuantities<'_>, planner: &mut PlannerState) -> 
     // last; `sent` leaves no ties between distinct rates anyway).
     let (candidate_actions, objectives) = match mode {
         Mode::Probe => (vec![MaxAllowedRate, ProbeHalf, ProbeAboveLimit], PROBE_OBJECTIVE_ORDER),
-        Mode::Cruise => (vec![DrainQueue, MaxAllowedRate, ProbeAboveLimit], CRUISE_OBJECTIVE_ORDER),
+        Mode::Cruise => (vec![HoldMinC, MaxAllowedRate, ProbeAboveLimit], CRUISE_OBJECTIVE_ORDER),
         Mode::Drain => (vec![DrainQueue, DrainHalf, MaxAllowedRate], DRAIN_OBJECTIVE_ORDER),
         Mode::Recover => unreachable!("Recover returns early"),
     };

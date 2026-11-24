@@ -906,6 +906,7 @@ impl<NM: NetworkModel> CongCtrlState<NM> {
                     CandidateAction::MaxAllowedRate => max_allowed_rate.unwrap(),
                     CandidateAction::DrainQueue => std::cmp::max(0.into(), min_c - excess),
                     CandidateAction::DrainHalf => std::cmp::max(0.into(), min_c - excess / 2),
+                    CandidateAction::HoldMinC => min_c,
                     CandidateAction::ProbeAboveLimit => max_allowed_rate.unwrap() + budget_left,
                     CandidateAction::ProbeHalf => max_allowed_rate.unwrap() + budget_left / 2,
                     CandidateAction::MatchDelivery => self.delivery_rate(),
@@ -2297,7 +2298,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 root_values_json = search
                     .root_values
                     .iter()
-                    .map(|(m, v)| serde_json::json!({"rate": format!("{}", rate(m)), "value": v}))
+                    .map(|(m, v)| {
+                        // A value JSON cannot hold (e.g. an infinite metric)
+                        // is logged as its debug string.
+                        let value = serde_json::to_value(v).unwrap_or_else(|_| format!("{:?}", v).into());
+                        serde_json::json!({"rate": format!("{}", rate(m)), "value": value})
+                    })
                     .collect();
             }
             ret
